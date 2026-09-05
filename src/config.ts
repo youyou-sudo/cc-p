@@ -13,10 +13,18 @@ export interface AppConfig {
 
 function candidateDirs(): string[] {
   const dirs: string[] = []
-  if (import.meta.dir && !import.meta.dir.includes('$bunfs')) {
-    dirs.push(import.meta.dir + '/..')
+  const hasDir = !!(import.meta.dir && !import.meta.dir.includes('$bunfs'))
+  if (Bun.isStandaloneExecutable) {
+    // Standalone binaries (release artifacts / Docker) prefer a real config.json
+    // next to the executable (process.cwd()), then fall back to the copy embedded
+    // via `--asset config.json` (lives at import.meta.dir).
+    dirs.push(process.cwd())
+    if (hasDir) dirs.push(import.meta.dir!)
+  } else {
+    // Source runs (bun run / bun test): project root sits one level above src/.
+    if (hasDir) dirs.push(import.meta.dir! + '/..')
+    dirs.push(process.cwd())
   }
-  dirs.push(process.cwd())
   return dirs
 }
 

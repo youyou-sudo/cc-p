@@ -1,0 +1,28 @@
+services:
+  cc-proxy:
+    image: ghcr.io/youyou-sudo/cc-p:${CC_IMAGE_TAG-902070c}
+    restart: unless-stopped
+    expose:
+      - 3050
+    environment:
+      PORT: "${PORT-3050}"
+      HOST: "${HOST-0.0.0.0}"
+      CC_API_BASE: "${CC_API_BASE-https://api.commandcode.ai}"
+      CC_API_KEY: "${CC_API_KEY-}"
+      PROJECT_SLUG: "${PROJECT_SLUG-cc-proxy}"
+      LOG_LEVEL: "${LOG_LEVEL-info}"
+      LOG_FILE: "${LOG_FILE-}"
+      CC_USE_PROVIDER_MODELS: "${CC_USE_PROVIDER_MODELS-true}"
+      CC_MODEL_REFRESH_INTERVAL_MS: "${CC_MODEL_REFRESH_INTERVAL_MS-300000}"
+      CMD_ZDR: "${CMD_ZDR-false}"
+      TZ: "${TZ-Asia/Shanghai}"
+    healthcheck:
+      test: ["CMD", "/app/server", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+networks:
+  default:
+    driver: bridge

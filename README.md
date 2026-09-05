@@ -203,6 +203,37 @@ bun build ./src/index.ts --compile --minify --outfile server
 
 `/health` returns `{"ok":true}` so `server healthcheck` works as a Docker HEALTHCHECK inside distroless.
 
+### GitHub Releases / prebuilt binaries
+
+Every push to `master` (with non-doc changes) triggers the **Release** workflow (`.github/workflows/release.yml`): it bumps the **patch** version from the latest `v*.*.*` tag (`v1.0.0` → `v1.0.1` → …), cross-compiles a standalone binary for 6 platforms with Bun (`--target`), and drafts a GitHub Release with them:
+
+| Platform | Asset |
+|----------|-------|
+| Linux x64 | `cc-p-linux-x64` |
+| Linux arm64 | `cc-p-linux-arm64` |
+| Windows x64 | `cc-p-windows-x64.exe` |
+| Windows arm64 | `cc-p-windows-arm64.exe` |
+| macOS x64 | `cc-p-darwin-x64` |
+| macOS arm64 | `cc-p-darwin-arm64` |
+
+Each binary embeds the repo's `config.json` as its default, so it listens on `0.0.0.0:3050` out of the box; place your own `config.json` / `.env` **next to the executable** (or export env vars) to override.
+
+**Version management:**
+
+- **Patch (auto):** push code to `master` → `v1.2.3` → `v1.2.4` is tagged and released. Doc-only commits (`*.md`, `docs/`) are skipped.
+- **Minor/Major (manual):** trigger **Actions → Release → Run workflow** and pick `minor` (`v1.2.3` → `v1.3.0`) or `major` (`v1.2.3` → `v2.0.0`).
+- **Exact version:** pick `custom` and type e.g. `2.0.0`.
+- Re-running a workflow over an existing tag re-uploads assets to that tag's Release instead of creating a duplicate.
+
+To build the same 6 binaries locally:
+
+```bash
+for t in bun-linux-x64 bun-linux-arm64 bun-windows-x64 bun-windows-arm64 bun-darwin-x64 bun-darwin-arm64; do
+  bun build ./src/index.ts --compile --production --minify \
+    --target "$t" --asset config.json --outfile "dist/cc-p-${t#bun-}"
+done
+```
+
 ## Testing
 
 The test suites spin up a mock Command Code upstream (no real API calls) and assert protocol conversion, streaming, error mapping, timeouts, and disconnect handling:

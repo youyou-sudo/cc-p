@@ -183,6 +183,37 @@ bun build ./src/index.ts --compile --minify --outfile server
 
 `/health` 返回 `{"ok":true}`，因此 `server healthcheck` 可在 distroless 中充当 Docker HEALTHCHECK。
 
+### GitHub Releases / 预编译二进制
+
+每次推送到 `master`（非文档改动）都会触发 **Release** 工作流（`.github/workflows/release.yml`）：自动将最新的 `v*.*.*` tag 递增**补丁版本**（`v1.0.0` → `v1.0.1` → …），用 Bun 的 `--target` 交叉编译 6 个平台的单文件二进制，并生成一个 GitHub Release 草稿：
+
+| 平台 | 产物 |
+|------|------|
+| Linux x64 | `cc-p-linux-x64` |
+| Linux arm64 | `cc-p-linux-arm64` |
+| Windows x64 | `cc-p-windows-x64.exe` |
+| Windows arm64 | `cc-p-windows-arm64.exe` |
+| macOS x64 | `cc-p-darwin-x64` |
+| macOS arm64 | `cc-p-darwin-arm64` |
+
+每个二进制都内置了仓库的 `config.json` 作为默认配置，开箱即监听 `0.0.0.0:3050`；如需覆盖，请把你的 `config.json` / `.env` 放到**可执行文件同目录**（或直接导出环境变量）。
+
+**版本管理：**
+
+- **补丁（自动）：** 推送代码到 `master` → 自动打 `v1.2.3` → `v1.2.4` tag 并发布。纯文档提交（`*.md`、`docs/`）跳过。
+- **次要/主版本（手动）：** 打开 **Actions → Release → Run workflow**，选择 `minor`（`v1.2.3` → `v1.3.0`）或 `major`（`v1.2.3` → `v2.0.0`）。
+- **指定版本：** 选择 `custom` 并输入精确版本，如 `2.0.0`。
+- 在已存在的 tag 上重新运行工作流，会向该 tag 的 Release 重新上传产物，而不是创建重复 Release。
+
+本地构建同样的 6 个二进制：
+
+```bash
+for t in bun-linux-x64 bun-linux-arm64 bun-windows-x64 bun-windows-arm64 bun-darwin-x64 bun-darwin-arm64; do
+  bun build ./src/index.ts --compile --production --minify \
+    --target "$t" --asset config.json --outfile "dist/cc-p-${t#bun-}"
+done
+```
+
 ## 测试
 
 测试套件会启动一个模拟 Command Code 上游（不产生真实 API 调用），覆盖协议转换、流式、错误映射、超时与断连处理：
