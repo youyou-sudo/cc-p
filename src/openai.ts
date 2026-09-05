@@ -253,6 +253,11 @@ export async function handleChatCompletions(request: Request, headers: Record<st
               log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message })
               state.upstreamError = mapCcEventError(event)
               break
+            case 'start':
+            case 'start-step':
+            case 'reasoning-start':
+            case 'text-start':
+            case 'finish-step':
             case 'reasoning-end':
             case 'provider-metadata':
             case 'tool-input-start':

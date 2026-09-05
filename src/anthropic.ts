@@ -584,6 +584,11 @@ export async function handleMessages(request: Request, headers: Record<string, s
               log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message })
               state.upstreamError = mapCcEventError(event)
               break
+            case 'start':
+            case 'start-step':
+            case 'reasoning-start':
+            case 'text-start':
+            case 'finish-step':
             case 'reasoning-end':
             case 'provider-metadata':
             case 'tool-input-start':
