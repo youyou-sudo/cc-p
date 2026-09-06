@@ -130,13 +130,32 @@ Precedence (low → high): **builtin defaults → `config.json` → `.env` / env
 | `HOST` | `host` | `0.0.0.0` |
 | `CC_API_BASE` | `apiBase` | `https://api.commandcode.ai` |
 | `CC_API_KEY` | `apiKey` | `""` (no fallback) |
-| `PROJECT_SLUG` | `projectSlug` | `cc-proxy` |
+| `CORS_ALLOW_ORIGIN` | `corsAllowOrigin` | auto (see below) |
 | `LOG_FILE` | `logFile` | `""` (console only) |
 | `LOG_LEVEL` | `logLevel` | `info` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` | `true` |
 | `CC_MODEL_REFRESH_INTERVAL_MS` | `modelRefreshIntervalMs` | `300000` |
 | `CMD_ZDR` | `zdr` | `false` |
 | `CC_MAX_BODY_MB` | — (env only) | `100` |
+
+> **Note on defaults:** source runs (`bun start`), Docker images, and Release
+> binaries all share one set of builtin defaults — `3050` / `0.0.0.0` — matching
+> the tracked `config.json`. `PORT` / `HOST` must be positive finite numbers;
+> an invalid value aborts startup with a clear error.
+
+### CORS
+
+`Access-Control-Allow-Origin` is auto-derived from whether you configured a
+fallback key:
+
+| `CC_API_KEY` | `CORS_ALLOW_ORIGIN` | Effect |
+|--------------|---------------------|--------|
+| empty | unset | `Allow-Origin: *` — any web page may call, but **must** send its own `user_*` key |
+| set | unset | Browser cross-origin calls are refused (returned as `null`) so arbitrary web pages can't silently drain your fallback key's quota; curl / SDKs (no `Origin` header) are unaffected |
+| any | e.g. `https://app.example.com` | Allow exactly that origin (comma-separated list also works) |
+
+Set `CORS_ALLOW_ORIGIN=*` explicitly if you truly want open browser access
+alongside a fallback key.
 
 ### API key
 

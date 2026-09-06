@@ -2,8 +2,8 @@ export interface AppConfig {
   port: number
   host: string
   apiBase: string
-  projectSlug: string
   apiKey: string
+  corsAllowOrigin: string
   logFile: string
   logLevel: string
   useProviderModels: boolean
@@ -11,13 +11,18 @@ export interface AppConfig {
   zdr: boolean
 }
 
+function die(message: string): never {
+  console.error(`[config] ${message}`)
+  process.exit(1)
+}
+
 function candidateDirs(): string[] {
   const dirs: string[] = []
   if (Bun.isStandaloneExecutable) {
     // Standalone binaries (Release artifacts / Docker): a real config.json next
     // to the executable (process.cwd()) wins; otherwise fall back to the copy
-    // embedded via `--asset config.json`, which lives at import.meta.dir
-    // (e.g. /$bunfs/root on Linux, B:\~BUN\root on Windows).
+    // embedded via `--asset config.json` (older builds), which lives at
+    // import.meta.dir (e.g. /$bunfs/root on Linux, B:\~BUN\root on Windows).
     dirs.push(process.cwd())
     if (import.meta.dir) dirs.push(import.meta.dir)
   } else {
@@ -56,7 +61,10 @@ const envString = (key: string): string | undefined => {
 
 const envNumber = (key: string): number | undefined => {
   const value = envString(key)
-  return value === undefined ? undefined : Number(value)
+  if (value === undefined) return undefined
+  const num = Number(value)
+  if (!Number.isFinite(num)) die(`Invalid numeric value for ${key}: '${value}'`)
+  return num
 }
 
 const envBool = (key: string): boolean | undefined => {
@@ -66,12 +74,14 @@ const envBool = (key: string): boolean | undefined => {
 }
 
 async function loadConfig(): Promise<AppConfig> {
+  // Builtin defaults. These match the tracked config.json (which is baked into
+  // Docker images / Release binaries), so every distribution shares one truth.
   const config: AppConfig = {
-    port: 3000,
-    host: 'localhost',
+    port: 3050,
+    host: '0.0.0.0',
     apiBase: 'https://api.commandcode.ai',
-    projectSlug: 'TMP',
     apiKey: '',
+    corsAllowOrigin: '',
     logFile: '',
     logLevel: 'info',
     useProviderModels: true,
@@ -84,11 +94,18 @@ async function loadConfig(): Promise<AppConfig> {
     Object.assign(config, fileConfig)
   }
 
+  if (!Number.isFinite(config.port) || config.port <= 0) {
+    die('config.json "port" must be a positive number')
+  }
+  if (!Number.isFinite(config.modelRefreshIntervalMs) || config.modelRefreshIntervalMs < 0) {
+    die('config.json "modelRefreshIntervalMs" must be a non-negative number')
+  }
+
   if (envNumber('PORT') !== undefined) config.port = envNumber('PORT')!
   if (envString('HOST') !== undefined) config.host = envString('HOST')!
   if (envString('CC_API_BASE') !== undefined) config.apiBase = envString('CC_API_BASE')!
   if (envString('CC_API_KEY') !== undefined) config.apiKey = envString('CC_API_KEY')!
-  if (envString('PROJECT_SLUG') !== undefined) config.projectSlug = envString('PROJECT_SLUG')!
+  if (envString('CORS_ALLOW_ORIGIN') !== undefined) config.corsAllowOrigin = envString('CORS_ALLOW_ORIGIN')!
   if (envString('LOG_FILE') !== undefined) config.logFile = envString('LOG_FILE')!
   if (envString('LOG_LEVEL') !== undefined) config.logLevel = envString('LOG_LEVEL')!
   if (envBool('CC_USE_PROVIDER_MODELS') !== undefined) config.useProviderModels = envBool('CC_USE_PROVIDER_MODELS')!

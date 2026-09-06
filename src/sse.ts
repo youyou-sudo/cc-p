@@ -1,5 +1,7 @@
 import { log } from './logger'
 import { mapCcEventError, mapFinishReason, normalizeUsage } from './errors'
+import { CcStreamParser } from './cc-events'
+import type { CcEventHooks } from './cc-events'
 
 export class SsePipeline {
   private encoder = new TextEncoder()
@@ -94,119 +96,95 @@ export function createSseTranslator(model: string, completionId: string, created
   let usage: any = null
   let toolCallIndex = 0
 
-  return {
-    lastCcEvent: '',
+  const parser = new CcStreamParser()
+  const state = {
     upstreamError: null as { status: number; body: any } | null,
-    inputTokens: 0,
-    outputTokens: 0,
-    cachedInputTokens: 0,
+  }
+  const inputTokens = { value: 0 }
+  const outputTokens = { value: 0 }
+  const cachedInputTokens = { value: 0 }
 
-    parseLine(line: string): string[] | null {
-      const trimmed = line.trim()
-      if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) return null
-
-      let event: any
-      try {
-        event = JSON.parse(trimmed)
-      } catch {
-        return null
+  const hooks: CcEventHooks = {
+    'text-delta': (event: any) => {
+      const text = event.text || event.delta || ''
+      if (!text) return
+      const delta = chunkIndex === 0 ? { role: 'assistant', content: text } : { content: text }
+      chunkIndex++
+      return makeChunk(completionId, created, model, delta, null, null)
+    },
+    'reasoning-delta': (event: any) => {
+      const text = event.text || ''
+      if (!text) return
+      const delta = chunkIndex === 0 ? { role: 'assistant', reasoning_content: text } : { reasoning_content: text }
+      chunkIndex++
+      return makeChunk(completionId, created, model, delta, null, null)
+    },
+    'tool-call': (event: any) => {
+      const id = event.toolCallId || `call_${Date.now()}_${toolCallIndex}`
+      const name = event.toolName || ''
+      const args = typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {})
+      const tcEntry = { index: toolCallIndex, id, type: 'function', function: { name, arguments: args } }
+      const delta = chunkIndex === 0
+        ? { role: 'assistant', content: null, tool_calls: [tcEntry] }
+        : { tool_calls: [tcEntry] }
+      chunkIndex++
+      toolCallIndex++
+      return makeChunk(completionId, created, model, delta, null, null)
+    },
+    'finish-step': (event: any) => {
+      if (event.finishReason) finishReason = mapFinishReason(event.finishReason)
+      if (event.usage) {
+        usage = event.usage
+        inputTokens.value = event.usage.inputTokens ?? 0
+        outputTokens.value = event.usage.outputTokens ?? 0
+        cachedInputTokens.value = event.usage.cachedInputTokens ?? 0
       }
-      if (!event.type) return null
-      this.lastCcEvent = event.type
-
-      const out: string[] = []
-
-      switch (event.type) {
-        case 'text-start':
-        case 'reasoning-start':
-        case 'start':
-        case 'start-step':
-          break
-
-        case 'text-delta': {
-          const text = event.text || event.delta || ''
-          if (!text) break
-          const delta = chunkIndex === 0 ? { role: 'assistant', content: text } : { content: text }
-          chunkIndex++
-          out.push(makeChunk(completionId, created, model, delta, null, null))
-          break
-        }
-
-        case 'reasoning-delta': {
-          const text = event.text || ''
-          if (!text) break
-          const delta = chunkIndex === 0
-            ? { role: 'assistant', reasoning_content: text }
-            : { reasoning_content: text }
-          chunkIndex++
-          out.push(makeChunk(completionId, created, model, delta, null, null))
-          break
-        }
-
-        case 'tool-call': {
-          const id = event.toolCallId || `call_${Date.now()}_${toolCallIndex}`
-          const name = event.toolName || ''
-          const args = typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {})
-          const tcEntry = { index: toolCallIndex, id, type: 'function', function: { name, arguments: args } }
-          const delta = chunkIndex === 0
-            ? { role: 'assistant', content: null, tool_calls: [tcEntry] }
-            : { tool_calls: [tcEntry] }
-          chunkIndex++
-          toolCallIndex++
-          out.push(makeChunk(completionId, created, model, delta, null, null))
-          break
-        }
-
-        case 'finish-step': {
-          if (event.finishReason) finishReason = mapFinishReason(event.finishReason)
-          if (event.usage) {
-            usage = event.usage
-            this.inputTokens = event.usage.inputTokens ?? 0
-            this.outputTokens = event.usage.outputTokens ?? 0
-            this.cachedInputTokens = event.usage.cachedInputTokens ?? 0
-          }
-          break
-        }
-
-        case 'finish': {
-          const fr = finishReason || mapFinishReason(event.finishReason || 'stop')
-          const u = event.totalUsage || usage || {}
-          normalizeUsage(u)
-          this.inputTokens = u.inputTokens ?? 0
-          this.outputTokens = u.outputTokens ?? 0
-          this.cachedInputTokens = u.cachedInputTokens ?? 0
-          const openaiUsage = {
-            prompt_tokens: u.inputTokens ?? 0,
-            completion_tokens: u.outputTokens ?? 0,
-            total_tokens: (u.inputTokens ?? 0) + (u.outputTokens ?? 0),
-            prompt_tokens_details: { cached_tokens: u.cachedInputTokens ?? 0 },
-          }
-          out.push(makeChunk(completionId, created, model, {}, fr, openaiUsage))
-          break
-        }
-
-        case 'error': {
-          const msg = event.error?.message || event.message || 'Unknown error'
-          log('warn', 'CC stream error', { message: msg })
-          this.upstreamError = mapCcEventError(event)
-          break
-        }
-
-        case 'reasoning-end':
-        case 'provider-metadata':
-        case 'tool-input-start':
-        case 'tool-input-delta':
-        case 'tool-input-end':
-        case 'tool-error':
-        case 'text-end':
-          break
-
-        default:
-          log('warn', 'Unknown CC event type', { type: event.type })
-          break
+    },
+    'finish': (event: any) => {
+      const fr = finishReason || mapFinishReason(event.finishReason || 'stop')
+      const u = event.totalUsage || usage || {}
+      normalizeUsage(u)
+      inputTokens.value = u.inputTokens ?? 0
+      outputTokens.value = u.outputTokens ?? 0
+      cachedInputTokens.value = u.cachedInputTokens ?? 0
+      const openaiUsage = {
+        prompt_tokens: u.inputTokens ?? 0,
+        completion_tokens: u.outputTokens ?? 0,
+        total_tokens: (u.inputTokens ?? 0) + (u.outputTokens ?? 0),
+        prompt_tokens_details: { cached_tokens: u.cachedInputTokens ?? 0 },
       }
+      return makeChunk(completionId, created, model, {}, fr, openaiUsage)
+    },
+    'error': (event: any) => {
+      const msg = event.error?.message || event.message || 'Unknown error'
+      log('warn', 'CC stream error', { message: msg })
+      state.upstreamError = mapCcEventError(event)
+    },
+  }
 
-      return out.length > 0 ? out : null
+  return {
+    get lastCcEvent() {
+      return parser.lastCcEvent
+    },
+    get upstreamError() {
+      return state.upstreamError
+    },
+    get inputTokens() {
+      return inputTokens.value
+    },
+    get outputTokens() {
+      return outputTokens.value
+    },
+    get cachedInputTokens() {
+      return cachedInputTokens.value
+    },
+
+    parseChunk(bytes: Uint8Array): string[] {
+      return parser.push(bytes, hooks)
+    },
+
+    flush(): string[] {
+      return parser.flush(hooks)
     },
 
     getDoneEvent(): string {

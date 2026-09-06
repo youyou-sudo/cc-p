@@ -115,59 +115,76 @@ export function getOrCreateKeyState(apiKey: string): KeyState {
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000
 const INIT_JITTER_MS = 2 * 60 * 60 * 1000
 
+const inFlightInit = new Map<string, Promise<void>>()
+
 export async function ensureInitialized(apiKey: string, signal: AbortSignal): Promise<void> {
   const state = getOrCreateKeyState(apiKey)
   const now = Date.now()
   if (now < state.nextInitAt) return
 
-  try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'x-cli-environment': 'production',
-      'Authorization': `Bearer ${apiKey}`,
-      'x-command-code-version': CC_VERSION,
-      ...(CFG.zdr ? { 'x-cmd-zdr': '1' } : {}),
-    }
-    const fingerprint = state.fingerprint ?? ({} as Fingerprint)
+  const existing = inFlightInit.get(apiKey)
+  if (existing) return existing
 
-    const record = fetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
-      method: 'POST',
-      headers,
-      signal,
-      body: JSON.stringify(fingerprint),
-    }).then((r) => {
-      if (!r.ok) log('warn', 'Fingerprint record failed', { status: r.status })
-      else log('info', 'Fingerprint recorded')
-    }).catch((e: any) => {
-      if (e.name !== 'AbortError') log('warn', 'Fingerprint record error', { error: e.message })
+  const init = doInit(apiKey, state, signal)
+    .catch((e: any) => {
+      // Never let a failed init poison callers; the key stays stale and the
+      // next request retries.
+      if (e?.name !== 'AbortError') {
+        log('warn', 'Fingerprint/lifecycle refresh error, will retry next request', { error: e?.message })
+      }
     })
-
-    const lifecycle = fetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
-      method: 'POST',
-      headers,
-      signal,
-      body: JSON.stringify({
-        eventType: 'cli_session_exists',
-        metadata: {
-          sessionId: `sess_${randHex(8)}`,
-          cliVersion: CC_VERSION,
-          mode: 'interactive',
-          os: `${fingerprint.components?.platform}-${fingerprint.components?.arch}`,
-        },
-      }),
-    }).then((r) => {
-      if (!r.ok) log('warn', 'Lifecycle event failed', { status: r.status })
-      else log('info', 'Lifecycle event sent')
-    }).catch((e: any) => {
-      if (e.name !== 'AbortError') log('warn', 'Lifecycle event error', { error: e.message })
+    .finally(() => {
+      if (inFlightInit.get(apiKey) === init) inFlightInit.delete(apiKey)
     })
+  inFlightInit.set(apiKey, init)
+  return init
+}
 
-    await Promise.all([record, lifecycle])
-
-    const jitter = Math.floor(Math.random() * INIT_JITTER_MS)
-    state.nextInitAt = Date.now() + INIT_REFRESH_MS + jitter
-    log('info', 'Fingerprint/lifecycle next refresh', { nextIn: `${(INIT_REFRESH_MS + jitter) / 3600000}h` })
-  } catch (e: any) {
-    if (e.name !== 'AbortError') log('warn', 'Fingerprint/lifecycle refresh error, will retry next request', { error: e.message })
+async function doInit(apiKey: string, state: KeyState, signal: AbortSignal): Promise<void> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'x-cli-environment': 'production',
+    'Authorization': `Bearer ${apiKey}`,
+    'x-command-code-version': CC_VERSION,
+    ...(CFG.zdr ? { 'x-cmd-zdr': '1' } : {}),
   }
+  const fingerprint = state.fingerprint ?? ({} as Fingerprint)
+
+  const record = fetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
+    method: 'POST',
+    headers,
+    signal,
+    body: JSON.stringify(fingerprint),
+  }).then((r) => {
+    if (!r.ok) log('warn', 'Fingerprint record failed', { status: r.status })
+    else log('info', 'Fingerprint recorded')
+  }).catch((e: any) => {
+    if (e.name !== 'AbortError') log('warn', 'Fingerprint record error', { error: e.message })
+  })
+
+  const lifecycle = fetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
+    method: 'POST',
+    headers,
+    signal,
+    body: JSON.stringify({
+      eventType: 'cli_session_exists',
+      metadata: {
+        sessionId: `sess_${randHex(8)}`,
+        cliVersion: CC_VERSION,
+        mode: 'interactive',
+        os: `${fingerprint.components?.platform}-${fingerprint.components?.arch}`,
+      },
+    }),
+  }).then((r) => {
+    if (!r.ok) log('warn', 'Lifecycle event failed', { status: r.status })
+    else log('info', 'Lifecycle event sent')
+  }).catch((e: any) => {
+    if (e.name !== 'AbortError') log('warn', 'Lifecycle event error', { error: e.message })
+  })
+
+  await Promise.all([record, lifecycle])
+
+  const jitter = Math.floor(Math.random() * INIT_JITTER_MS)
+  state.nextInitAt = Date.now() + INIT_REFRESH_MS + jitter
+  log('info', 'Fingerprint/lifecycle next refresh', { nextIn: `${(INIT_REFRESH_MS + jitter) / 3600000}h` })
 }

@@ -1,9 +1,12 @@
-import { getApiKey } from './auth'
-import { buildCcRequest, forwardToCC } from './cc'
-import { mapAnthropicStopReason, mapCcError, mapCcEventError, mapFinishReason, normalizeUsage } from './errors'
-import { ensureInitialized } from './fingerprint'
-import { BodyTooLargeError, SSE_HEADERS, readJsonBody, readWithTimeout, sendAnthropicError, sendJSON } from './http'
+import { authErrorMessage, getApiKey } from './auth'
+import { buildCcRequest } from './cc'
+import { CcStreamParser } from './cc-events'
+import type { CcEventHooks } from './cc-events'
+import { mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage } from './errors'
+import { SSE_HEADERS, readWithTimeout, sendAnthropicError, sendJSON } from './http'
 import { log } from './logger'
+import { callUpstream, createUpstreamFlow, readRequestJson } from './proxy-handler'
+import type { JsonParseErrorKind } from './proxy-handler'
 import { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, runtimeState, timeoutMessage } from './runtime'
 import { SsePipeline } from './sse'
 import { bytesToBase64, sha256bytes, uuid } from './util'
@@ -248,114 +251,82 @@ export async function* createAnthropicSseTranslator(
   })}\n\n`
 
   const reader = response.body!.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
+  const parser = new CcStreamParser()
+
+  const hooks: CcEventHooks = {
+    'reasoning-delta': (event: any) => {
+      const text = event.text || ''
+      if (!text) return
+      const open = startThinkingBlock()
+      currentThinkingText += text
+      return open + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'thinking_delta', thinking: text } })}\n\n`
+    },
+
+    'text-delta': (event: any) => {
+      const text = event.text || ''
+      const open = startTextBlock()
+      outputTokens += 1
+      return open + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'text_delta', text } })}\n\n`
+    },
+
+    'tool-call': (event: any) => {
+      const out: string[] = []
+      const close = closeBlock()
+      if (close) out.push(close)
+
+      const id = event.toolCallId || `toolu_${uuid().slice(0, 12)}`
+      const name = event.toolName || ''
+      const input = typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {})
+
+      const tcIndex = nextBlockIndex++
+      out.push(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: tcIndex, content_block: { type: 'tool_use', id, name, input: {} } })}\n\n`)
+      out.push(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: tcIndex, delta: { type: 'input_json_delta', partial_json: input } })}\n\n`)
+      out.push(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: tcIndex })}\n\n`)
+      outputTokens += 20
+      return out
+    },
+
+    'finish-step': handleFinishStep,
+    'finish': handleFinishStep,
+
+    'error': (event: any) => {
+      hasError = true
+      const upstreamError = mapCcEventError(event)
+      ctx.upstreamError = upstreamError
+      return `event: error\ndata: ${JSON.stringify({ type: 'error', error: upstreamError.body.error })}\n\n`
+    },
+  }
+
+  function handleFinishStep(event: any): void {
+    if (event.finishReason) stopReason = mapAnthropicStopReason(mapFinishReason(event.finishReason))
+    const u = event.totalUsage || event.usage
+    if (u) {
+      normalizeUsage(u)
+      inputTokens = u.inputTokens ?? inputTokens
+      outputTokens = u.outputTokens ?? outputTokens
+      cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens
+      cacheWriteTokens = u.inputTokenDetails?.cacheWriteTokens ?? cacheWriteTokens
+    } else {
+      inputTokens = 0
+      outputTokens = 0
+      cachedInputTokens = 0
+      cacheWriteTokens = 0
+    }
+    ctx.inputTokens = inputTokens
+    ctx.outputTokens = outputTokens
+    ctx.cachedInputTokens = cachedInputTokens
+  }
 
   try {
     while (true) {
       const { done, value } = await readWithTimeout(reader.read(), STREAM_IDLE_TIMEOUT_MS, 'STREAM_IDLE_TIMEOUT')
       if (done) break
       ctx.bytesReceived += value.byteLength
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || ''
-
-      for (const line of lines) {
-        const trimmed = line.trim()
-        if (!trimmed || trimmed === '[DONE]') continue
-        let event: any
-        try { event = JSON.parse(trimmed) } catch { continue }
-        if (!event.type) continue
-        ctx.lastCcEvent = event.type
-
-        switch (event.type) {
-          case 'start':
-          case 'start-step':
-          case 'text-start':
-          case 'reasoning-start':
-            break
-
-          case 'reasoning-delta': {
-            const text = event.text || ''
-            if (!text) break
-            const open = startThinkingBlock()
-            currentThinkingText += text
-            yield open + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'thinking_delta', thinking: text } })}\n\n`
-            break
-          }
-
-          case 'text-delta': {
-            const text = event.text || ''
-            const open = startTextBlock()
-            yield open + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'text_delta', text } })}\n\n`
-            outputTokens += 1
-            break
-          }
-
-          case 'tool-call': {
-            const close = closeBlock()
-            if (close) yield close
-
-            const id = event.toolCallId || `toolu_${uuid().slice(0, 12)}`
-            const name = event.toolName || ''
-            const input = typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {})
-
-            const tcIndex = nextBlockIndex++
-            yield `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: tcIndex, content_block: { type: 'tool_use', id, name, input: {} } })}\n\n`
-            yield `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: tcIndex, delta: { type: 'input_json_delta', partial_json: input } })}\n\n`
-            yield `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: tcIndex })}\n\n`
-            outputTokens += 20
-            break
-          }
-
-          case 'finish-step':
-          case 'finish': {
-            if (event.finishReason) stopReason = mapAnthropicStopReason(mapFinishReason(event.finishReason))
-            const u = event.totalUsage || event.usage
-            if (u) {
-              normalizeUsage(u)
-              inputTokens = u.inputTokens ?? inputTokens
-              outputTokens = u.outputTokens ?? outputTokens
-              cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens
-              cacheWriteTokens = u.inputTokenDetails?.cacheWriteTokens ?? cacheWriteTokens
-              ctx.inputTokens = inputTokens
-              ctx.outputTokens = outputTokens
-              ctx.cachedInputTokens = cachedInputTokens
-            } else {
-              inputTokens = 0
-              outputTokens = 0
-              cachedInputTokens = 0
-              cacheWriteTokens = 0
-              ctx.inputTokens = 0
-              ctx.outputTokens = 0
-              ctx.cachedInputTokens = 0
-            }
-            break
-          }
-
-          case 'error': {
-            hasError = true
-            const upstreamError = mapCcEventError(event)
-            ctx.upstreamError = upstreamError
-            yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: upstreamError.body.error })}\n\n`
-            break
-          }
-
-          case 'reasoning-end':
-          case 'provider-metadata':
-          case 'tool-input-start':
-          case 'tool-input-delta':
-          case 'tool-input-end':
-          case 'tool-error':
-          case 'text-end':
-            break
-
-          default:
-            log('warn', 'Unknown CC event type', { type: event.type })
-            break
-        }
-      }
+      const out = parser.push(value, hooks)
+      ctx.lastCcEvent = parser.lastCcEvent
+      for (const s of out) yield s
     }
+    for (const s of parser.flush(hooks)) yield s
 
     if (!hasError) {
       const close = closeBlock()
@@ -378,20 +349,18 @@ export async function* createAnthropicSseTranslator(
   }
 }
 
+function buildAnthropicError(kind: JsonParseErrorKind, message: string): Response {
+  return sendAnthropicError(kind === 'too-large' ? 413 : 400, 'invalid_request_error', message)
+}
+
 export async function handleMessages(request: Request, headers: Record<string, string | undefined>): Promise<Response> {
-  let anthropicReq: any
-  try {
-    anthropicReq = await readJsonBody(request)
-  } catch (e: any) {
-    if (e instanceof BodyTooLargeError) {
-      return sendAnthropicError(413, 'invalid_request_error', e.message)
-    }
-    return sendAnthropicError(400, 'invalid_request_error', 'Invalid JSON body')
-  }
+  const parsed = await readRequestJson<any>(request, buildAnthropicError)
+  if (!parsed.ok) return parsed.response
+  const anthropicReq = parsed.value
 
   const apiKey = getApiKey(headers)
   if (!apiKey) {
-    return sendJSON(401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } })
+    return sendJSON(401, { type: 'error', error: { type: 'authentication_error', message: authErrorMessage(headers) } })
   }
 
   const stream = anthropicReq.stream === true
@@ -400,29 +369,26 @@ export async function handleMessages(request: Request, headers: Record<string, s
   const openaiReq = convertAnthropicToOpenAI(anthropicReq)
   const ccBody = buildCcRequest(openaiReq)
 
-  const abortController = new AbortController()
-  let aborted = false
+  const flow = createUpstreamFlow(request)
+  const abortController = flow.controller
+  const aborted = () => flow.aborted
   const startTime = Date.now()
   let messageId = ''
   let bytesReceived = 0
   let lastCcEvent = ''
   let fullText = ''
 
-  request.signal.addEventListener('abort', () => {
-    aborted = true
-    try { abortController.abort() } catch {}
-  }, { once: true })
-
   try {
-    await ensureInitialized(apiKey, abortController.signal)
-    const ccResponse = await forwardToCC(ccBody, apiKey, headers, abortController.signal)
-
-    if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '')
-      log('error', 'CC API error (Anthropic)', { status: ccResponse.status })
-      const mapped = mapCcError(ccResponse.status, errorText)
-      return sendAnthropicError(mapped.status, mapped.body.error.type, mapped.body.error.message)
-    }
+    const upstream = await callUpstream({
+      apiKey,
+      headers,
+      ccBody,
+      signal: flow.signal,
+      label: 'CC API error (Anthropic)',
+      onCcError: (mapped) => sendAnthropicError(mapped.status, mapped.body.error.type, mapped.body.error.message),
+    })
+    if (!upstream.ok) return upstream.value
+    const ccResponse = upstream.response
 
     if (stream) {
       const pipeline = new SsePipeline(false)
@@ -446,18 +412,15 @@ export async function handleMessages(request: Request, headers: Record<string, s
           streaming: true,
           elapsedMs: Date.now() - startTime,
         })
-        if (!abortController.signal.aborted) {
-          try { abortController.abort() } catch {}
-        }
       }
-      request.signal.addEventListener('abort', onClientAbort, { once: true })
+      flow.setGracefulClose(onClientAbort)
 
       const pump = async (): Promise<void> => {
         try {
           messageId = 'msg_' + uuid().slice(0, 12)
           const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx)
           for await (const event of generator) {
-            if (aborted) break
+            if (aborted()) break
             if (!pipeline.started) {
               pipeline.emit([event])
               if (event.includes('"text_delta"') || event.includes('"tool_use"')) {
@@ -468,7 +431,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
             }
           }
 
-          if (!aborted) {
+          if (!aborted()) {
             runtimeState.consecutiveTimeouts = 0
             if (ctx.upstreamError) {
               state.upstreamError = ctx.upstreamError
@@ -480,7 +443,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
             }
           }
         } catch (e: any) {
-          if (aborted) {
+          if (aborted()) {
           } else if (e?.message === 'STREAM_IDLE_TIMEOUT') {
             log('warn', 'Stream idle timeout', {
               path: '/v1/messages',
@@ -522,7 +485,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
       ])
 
       if (outcome === 'terminal') {
-        request.signal.removeEventListener('abort', onClientAbort)
+        flow.setGracefulClose(null)
         if (state.upstreamError) {
           return sendAnthropicError(state.upstreamError.status, state.upstreamError.body.error.type, state.upstreamError.body.error.message)
         }
@@ -548,75 +511,46 @@ export async function handleMessages(request: Request, headers: Record<string, s
     const state = { upstreamError: null as { status: number; body: any } | null }
 
     const reader = ccResponse.body!.getReader()
-    const decoder = new TextDecoder()
-    let buf = ''
-
-    const processLines = () => {
-      const lines = buf.split('\n')
-      buf = lines.pop() || ''
-      for (const line of lines) {
-        const trimmed = line.trim()
-        if (!trimmed || trimmed === '[DONE]') continue
-        try {
-          const event = JSON.parse(trimmed)
-          switch (event.type) {
-            case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break
-            case 'reasoning-delta': lastCcEvent = event.type; thinkingText += event.text || ''; break
-            case 'tool-call':
-              lastCcEvent = event.type
-              toolCalls = toolCalls || []
-              toolCalls.push({
-                id: event.toolCallId || ('call_' + uuid().slice(0, 8)),
-                type: 'function',
-                function: {
-                  name: event.toolName || '',
-                  arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
-                },
-              })
-              break
-            case 'finish':
-              lastCcEvent = event.type
-              finishReason = mapFinishReason(event.finishReason || 'stop')
-              if (event.totalUsage) usage = event.totalUsage
-              break
-            case 'error':
-              lastCcEvent = event.type
-              log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message })
-              state.upstreamError = mapCcEventError(event)
-              break
-            case 'start':
-            case 'start-step':
-            case 'reasoning-start':
-            case 'text-start':
-            case 'finish-step':
-            case 'reasoning-end':
-            case 'provider-metadata':
-            case 'tool-input-start':
-            case 'tool-input-delta':
-            case 'tool-input-end':
-            case 'tool-error':
-            case 'text-end':
-              break
-            default:
-              log('warn', 'Unknown CC event type', { type: event.type })
-              break
-          }
-        } catch {}
-      }
+    const parser = new CcStreamParser()
+    const hooks: CcEventHooks = {
+      'text-delta': (event: any) => { fullText += event.text || '' },
+      'reasoning-delta': (event: any) => { thinkingText += event.text || '' },
+      'tool-call': (event: any) => {
+        toolCalls = toolCalls || []
+        toolCalls.push({
+          id: event.toolCallId || ('call_' + uuid().slice(0, 8)),
+          type: 'function',
+          function: {
+            name: event.toolName || '',
+            arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
+          },
+        })
+      },
+      'finish': (event: any) => {
+        finishReason = mapFinishReason(event.finishReason || 'stop')
+        if (event.totalUsage) usage = event.totalUsage
+      },
+      'error': (event: any) => {
+        log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message })
+        state.upstreamError = mapCcEventError(event)
+      },
+    }
+    const processBytes = (bytes: Uint8Array): void => {
+      parser.push(bytes, hooks)
+      if (parser.lastCcEvent) lastCcEvent = parser.lastCcEvent
     }
 
     try {
       while (true) {
-        if (aborted) break
+        if (aborted()) break
         const { done, value } = await readWithTimeout(reader.read(), NONSTREAM_IDLE_TIMEOUT_MS, 'STREAM_IDLE_TIMEOUT')
         if (done) break
         bytesReceived += value.byteLength
-        buf += decoder.decode(value, { stream: true })
-        processLines()
+        processBytes(value)
       }
-      processLines()
+      parser.flush(hooks)
     } catch (e: any) {
-      if (aborted) {
+      if (aborted()) {
         return new Response(null, { status: 499 })
       }
       if (e?.message === 'STREAM_IDLE_TIMEOUT') {
@@ -641,7 +575,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
       return sendAnthropicError(502, 'proxy_error', `Upstream error: ${e?.message}`, { retryAfter: 10 })
     }
 
-    if (aborted) {
+    if (aborted()) {
       return new Response(null, { status: 499 })
     }
 
@@ -657,7 +591,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
     runtimeState.consecutiveTimeouts = 0
     return sendJSON(200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText))
   } catch (e: any) {
-    if (aborted || abortController.signal.aborted) {
+    if (aborted() || abortController.signal.aborted) {
       log('warn', 'Request cancelled (client disconnected before CC response)', {
         path: '/v1/messages',
         model,

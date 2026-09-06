@@ -107,16 +107,19 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Build standalone executable
+        # No --asset config.json: the binary ships with builtin defaults only
+        # (port 3050 / 0.0.0.0, matching the tracked config.json). Users put a
+        # real config.json / .env next to the binary if they want overrides —
+        # this also guarantees no key can ever be baked into a public artifact.
         run: |
           bun build ./src/index.ts \
             --compile --production --minify \
             --target ${{ matrix.target }} \
-            --asset config.json \
             --outfile dist/${{ matrix.artifact }}
 
       - name: Smoke test compiled binary
         # Boot the linux-x64 binary (native arch for this runner) in an empty dir
-        # and hit /health (serves on port 3050 from the embedded config.json).
+        # and hit /health (serves on port 3050, the builtin default).
         if: matrix.smoke
         run: |
           set -euo pipefail
@@ -247,8 +250,8 @@ jobs:
           : > notes.md
           printf '## Install\n\n' >> notes.md
           printf 'Single-file executables (cross-compiled with Bun). Run one next to\n' >> notes.md
-          printf 'your own \`config.json\` / \`.env\`; an embedded default \`config.json\`\n' >> notes.md
-          printf 'is used when neither is present.\n\n' >> notes.md
+          printf 'your own \`config.json\` / \`.env\`; builtin defaults (port 3050 on\n' >> notes.md
+          printf '0.0.0.0) apply when neither is present.\n\n' >> notes.md
           printf '| Platform | Asset | SHA-256 |\n|---|---|---|\n' >> notes.md
           (cd dist && for f in *; do
              case "$f" in

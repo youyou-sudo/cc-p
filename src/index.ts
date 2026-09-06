@@ -55,6 +55,11 @@ export function startServer() {
     url: `http://${CFG.host}:${CFG.port}`,
     api: CFG.apiBase,
     models: MODELS.length,
+    cors: CFG.apiKey
+      ? `restricted (CC_API_KEY fallback set; browser calls only from ${CFG.corsAllowOrigin || 'no origin (CORS disabled)'})`
+      : CFG.corsAllowOrigin
+        ? `allowed from ${CFG.corsAllowOrigin}`
+        : 'open (no CC_API_KEY fallback; per-request keys only)',
     session: '12h + 1h jitter, per API key',
     zdr: CFG.zdr
       ? 'enabled (x-cmd-zdr: 1 on generation/init requests)'

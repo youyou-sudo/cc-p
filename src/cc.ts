@@ -4,7 +4,7 @@ import { CC_VERSION } from './version'
 import { fakeProjectSlug, generateTraceparent, getDateStr, getEnvironment, tryParseJSON } from './util'
 
 export function buildCcRequest(openaiReq: any): any {
-  const { model, messages, max_tokens, temperature, tools, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq
+  const { model, messages, max_tokens, temperature, tools, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key, top_p, stop, user, seed } = openaiReq
 
   const systemMsgs = messages.filter((m: any) => m.role === 'system' || m.role === 'developer')
   const systemPrompt = systemMsgs.map((m: any) => {
@@ -138,6 +138,18 @@ export function buildCcRequest(openaiReq: any): any {
   }
   if (parallel_tool_calls !== undefined) {
     ;(body.params as any).parallel_tool_calls = parallel_tool_calls
+  }
+  if (top_p !== undefined) {
+    ;(body.params as any).top_p = top_p
+  }
+  if (stop !== undefined) {
+    ;(body.params as any).stop = stop
+  }
+  if (user !== undefined) {
+    ;(body.params as any).user = user
+  }
+  if (seed !== undefined) {
+    ;(body.params as any).seed = seed
   }
 
   return body

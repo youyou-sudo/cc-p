@@ -135,13 +135,29 @@ Bun 启动时自动加载 `.env`。空值 = 沿用 `config.json`；真实 shell 
 | `HOST` | `host` | `0.0.0.0` |
 | `CC_API_BASE` | `apiBase` | `https://api.commandcode.ai` |
 | `CC_API_KEY` | `apiKey` | `""`（无兜底） |
-| `PROJECT_SLUG` | `projectSlug` | `cc-proxy` |
+| `CORS_ALLOW_ORIGIN` | `corsAllowOrigin` | 自动（见下方） |
 | `LOG_FILE` | `logFile` | `""`（仅控制台） |
 | `LOG_LEVEL` | `logLevel` | `info` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` | `true` |
 | `CC_MODEL_REFRESH_INTERVAL_MS` | `modelRefreshIntervalMs` | `300000` |
 | `CMD_ZDR` | `zdr` | `false` |
 | `CC_MAX_BODY_MB` | ——（仅环境变量） | `100` |
+
+> **默认值说明：** 源码运行（`bun start`）、Docker 镜像、Release 二进制共用同一套
+> 内置默认值——`3050` / `0.0.0.0`，与入库的 `config.json` 一致。`PORT` / `HOST`
+> 必须是正有限数值，非法值会在启动时报错退出。
+
+### CORS
+
+`Access-Control-Allow-Origin` 是否配置兜底 Key 自动决定：
+
+| `CC_API_KEY` | `CORS_ALLOW_ORIGIN` | 效果 |
+|--------------|---------------------|------|
+| 空 | 未设置 | `Allow-Origin: *`——任意网页可调用，但**必须**自带 `user_*` Key |
+| 已设置 | 未设置 | 拒绝浏览器跨域调用（返回 `null`），防止任意网页静默消耗你兜底 Key 的额度；curl / SDK（不带 `Origin` 头）不受影响 |
+| 任意 | 如 `https://app.example.com` | 只允许该来源（也支持逗号分隔列表） |
+
+若你真要在有兜底 Key 的同时开放浏览器访问，可显式设 `CORS_ALLOW_ORIGIN=*`。
 
 ### API Key
 

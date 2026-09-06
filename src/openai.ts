@@ -1,9 +1,12 @@
-import { getApiKey } from './auth'
-import { buildCcRequest, forwardToCC } from './cc'
-import { mapCcError, mapCcEventError, mapFinishReason, normalizeUsage } from './errors'
-import { ensureInitialized } from './fingerprint'
-import { BodyTooLargeError, SSE_HEADERS, readJsonBody, readWithTimeout, sendJSON } from './http'
+import { authErrorMessage, getApiKey } from './auth'
+import { buildCcRequest } from './cc'
+import { CcStreamParser } from './cc-events'
+import type { CcEventHooks } from './cc-events'
+import { mapCcEventError, mapFinishReason, normalizeUsage } from './errors'
+import { SSE_HEADERS, readWithTimeout, sendJSON } from './http'
 import { log } from './logger'
+import { callUpstream, createUpstreamFlow, readRequestJson } from './proxy-handler'
+import type { JsonParseErrorKind } from './proxy-handler'
 import { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, runtimeState, timeoutMessage } from './runtime'
 import { createSseTranslator, SsePipeline } from './sse'
 import { nowUnix, uuid } from './util'
@@ -13,6 +16,12 @@ interface TerminalState {
   timedOut: boolean
   zeroOutput: boolean
   errorMsg: string
+}
+
+function buildError(kind: JsonParseErrorKind, message: string): Response {
+  return sendJSON(kind === 'too-large' ? 413 : 400, {
+    error: { message, type: 'invalid_request_error' },
+  })
 }
 
 function zeroUsageChunk(completionId: string, created: number, model: string): string {
@@ -27,19 +36,13 @@ function zeroUsageChunk(completionId: string, created: number, model: string): s
 }
 
 export async function handleChatCompletions(request: Request, headers: Record<string, string | undefined>): Promise<Response> {
-  let openaiReq: any
-  try {
-    openaiReq = await readJsonBody(request)
-  } catch (e: any) {
-    if (e instanceof BodyTooLargeError) {
-      return sendJSON(413, { error: { message: e.message, type: 'invalid_request_error' } })
-    }
-    return sendJSON(400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } })
-  }
+  const parsed = await readRequestJson<any>(request, buildError)
+  if (!parsed.ok) return parsed.response
+  const openaiReq = parsed.value
 
   const apiKey = getApiKey(headers)
   if (!apiKey) {
-    return sendJSON(401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } })
+    return sendJSON(401, { error: { message: authErrorMessage(headers), type: 'auth_error' } })
   }
 
   const stream = openaiReq.stream === true
@@ -48,29 +51,26 @@ export async function handleChatCompletions(request: Request, headers: Record<st
   const created = nowUnix()
 
   const ccBody = buildCcRequest(openaiReq)
-
-  const abortController = new AbortController()
-  let aborted = false
+  const flow = createUpstreamFlow(request)
+  const abortController = flow.controller
+  const aborted = () => flow.aborted
   const startTime = Date.now()
   let bytesReceived = 0
   let lastCcEvent = ''
   let fullText = ''
 
-  request.signal.addEventListener('abort', () => {
-    aborted = true
-    try { abortController.abort() } catch {}
-  }, { once: true })
-
   try {
-    await ensureInitialized(apiKey, abortController.signal)
-    const ccResponse = await forwardToCC(ccBody, apiKey, headers, abortController.signal, openaiReq.prompt_cache_key)
-
-    if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '')
-      log('error', 'CC API error', { status: ccResponse.status })
-      const mapped = mapCcError(ccResponse.status, errorText)
-      return sendJSON(mapped.status, mapped.body)
-    }
+    const upstream = await callUpstream({
+      apiKey,
+      headers,
+      ccBody,
+      signal: flow.signal,
+      promptCacheKey: openaiReq.prompt_cache_key,
+      label: 'CC API error',
+      onCcError: (mapped) => sendJSON(mapped.status, mapped.body),
+    })
+    if (!upstream.ok) return upstream.value
+    const ccResponse = upstream.response
 
     if (stream) {
       const translator = createSseTranslator(model, completionId, created)
@@ -94,44 +94,33 @@ export async function handleChatCompletions(request: Request, headers: Record<st
           outputTokens: translator.outputTokens,
           cachedInputTokens: translator.cachedInputTokens,
         })
-        if (!abortController.signal.aborted) {
-          pipeline.terminateWith([zeroUsageChunk(completionId, created, model), 'data: [DONE]\n\n'])
-          try { abortController.abort() } catch {}
-        }
+        pipeline.terminateWith([zeroUsageChunk(completionId, created, model), 'data: [DONE]\n\n'])
       }
-      request.signal.addEventListener('abort', onClientAbort, { once: true })
+      flow.setGracefulClose(onClientAbort)
 
       const pump = async (): Promise<void> => {
         const reader = ccResponse.body!.getReader()
-        const decoder = new TextDecoder()
-        let buffer = ''
         try {
           while (true) {
-            if (aborted) break
+            if (aborted()) break
             const { done, value } = await readWithTimeout(reader.read(), STREAM_IDLE_TIMEOUT_MS, 'STREAM_IDLE_TIMEOUT')
             if (done) break
             bytesReceived += value.byteLength
 
-            buffer += decoder.decode(value, { stream: true })
-            const lines = buffer.split('\n')
-            buffer = lines.pop() || ''
-
-            let hadOutput = false
-            for (const line of lines) {
-              const events = translator.parseLine(line)
-              if (events) {
-                pipeline.emit(events)
-                hadOutput = true
-              }
+            const events = translator.parseChunk(value)
+            if (events.length > 0) {
+              pipeline.emit(events)
               if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent
+            } else {
+              pipeline.emitKeepalive()
             }
-            if (!hadOutput) pipeline.emitKeepalive()
           }
 
-          if (!aborted) {
-            if (buffer.trim()) {
-              const events = translator.parseLine(buffer)
-              if (events) pipeline.emit(events)
+          if (!aborted()) {
+            const flushed = translator.flush()
+            if (flushed.length > 0) {
+              pipeline.emit(flushed)
+              if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent
             }
             if (translator.upstreamError) {
               state.upstreamError = translator.upstreamError
@@ -150,7 +139,7 @@ export async function handleChatCompletions(request: Request, headers: Record<st
             }
           }
         } catch (e: any) {
-          if (aborted) {
+          if (aborted()) {
             reader.cancel().catch(() => {})
           } else if (e?.message === 'STREAM_IDLE_TIMEOUT') {
             log('warn', 'Stream idle timeout', {
@@ -194,7 +183,7 @@ export async function handleChatCompletions(request: Request, headers: Record<st
       ])
 
       if (outcome === 'terminal') {
-        request.signal.removeEventListener('abort', onClientAbort)
+        flow.setGracefulClose(null)
         if (state.upstreamError) {
           return sendJSON(state.upstreamError.status, state.upstreamError.body)
         }
@@ -217,75 +206,46 @@ export async function handleChatCompletions(request: Request, headers: Record<st
     const state = { upstreamError: null as { status: number; body: any } | null }
 
     const reader = ccResponse.body!.getReader()
-    const decoder = new TextDecoder()
-    let buf = ''
-
-    const processLines = () => {
-      const lines = buf.split('\n')
-      buf = lines.pop() || ''
-      for (const line of lines) {
-        const trimmed = line.trim()
-        if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) continue
-        try {
-          const event = JSON.parse(trimmed)
-          switch (event.type) {
-            case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break
-            case 'reasoning-delta': lastCcEvent = event.type; reasoningContent += event.text || ''; break
-            case 'tool-call':
-              lastCcEvent = event.type
-              toolCalls = toolCalls || []
-              toolCalls.push({
-                id: event.toolCallId || ('call_' + uuid().slice(0, 8)),
-                type: 'function',
-                function: {
-                  name: event.toolName || '',
-                  arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
-                },
-              })
-              break
-            case 'finish':
-              lastCcEvent = event.type
-              finishReason = mapFinishReason(event.finishReason || 'stop')
-              if (event.totalUsage) usage = event.totalUsage
-              break
-            case 'error':
-              lastCcEvent = event.type
-              log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message })
-              state.upstreamError = mapCcEventError(event)
-              break
-            case 'start':
-            case 'start-step':
-            case 'reasoning-start':
-            case 'text-start':
-            case 'finish-step':
-            case 'reasoning-end':
-            case 'provider-metadata':
-            case 'tool-input-start':
-            case 'tool-input-delta':
-            case 'tool-input-end':
-            case 'tool-error':
-            case 'text-end':
-              break
-            default:
-              log('warn', 'Unknown CC event type', { type: event.type })
-              break
-          }
-        } catch {}
-      }
+    const parser = new CcStreamParser()
+    const hooks: CcEventHooks = {
+      'text-delta': (event: any) => { fullText += event.text || '' },
+      'reasoning-delta': (event: any) => { reasoningContent += event.text || '' },
+      'tool-call': (event: any) => {
+        toolCalls = toolCalls || []
+        toolCalls.push({
+          id: event.toolCallId || ('call_' + uuid().slice(0, 8)),
+          type: 'function',
+          function: {
+            name: event.toolName || '',
+            arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
+          },
+        })
+      },
+      'finish': (event: any) => {
+        finishReason = mapFinishReason(event.finishReason || 'stop')
+        if (event.totalUsage) usage = event.totalUsage
+      },
+      'error': (event: any) => {
+        log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message })
+        state.upstreamError = mapCcEventError(event)
+      },
+    }
+    const processBytes = (bytes: Uint8Array): void => {
+      parser.push(bytes, hooks)
+      if (parser.lastCcEvent) lastCcEvent = parser.lastCcEvent
     }
 
     try {
       while (true) {
-        if (aborted) break
+        if (aborted()) break
         const { done, value } = await readWithTimeout(reader.read(), NONSTREAM_IDLE_TIMEOUT_MS, 'STREAM_IDLE_TIMEOUT')
         if (done) break
         bytesReceived += value.byteLength
-        buf += decoder.decode(value, { stream: true })
-        processLines()
+        processBytes(value)
       }
-      processLines()
+      parser.flush(hooks)
     } catch (e: any) {
-      if (aborted) {
+      if (aborted()) {
         return new Response(null, { status: 499 })
       }
       if (e?.message === 'STREAM_IDLE_TIMEOUT') {
@@ -310,7 +270,7 @@ export async function handleChatCompletions(request: Request, headers: Record<st
       return sendJSON(502, { error: { message: `Upstream error: ${e?.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 })
     }
 
-    if (aborted) {
+    if (aborted()) {
       return new Response(null, { status: 499 })
     }
 
@@ -350,7 +310,7 @@ export async function handleChatCompletions(request: Request, headers: Record<st
       })(),
     })
   } catch (e: any) {
-    if (aborted || abortController.signal.aborted) {
+    if (aborted() || abortController.signal.aborted) {
       log('warn', 'Request cancelled (client disconnected before CC response)', {
         path: '/v1/chat/completions',
         model,

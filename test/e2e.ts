@@ -84,6 +84,12 @@ Bun.serve({
             { type: 'error', error: { message: '<429> slow down' } },
             { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0 } },
           ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        case 'mock/params':
+          return new Response(ndjson([
+            { type: 'start' },
+            { type: 'text-delta', text: 'params-ok' },
+            { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0 } },
+          ]), { headers: { 'content-type': 'application/x-ndjson' } })
         default:
           return new Response(ndjson([
             { type: 'start' },
@@ -265,6 +271,52 @@ console.log('--- openai reasoning ---')
   const body = await r.json()
   check('reasoning_content captured', body.choices?.[0]?.message?.reasoning_content === 'thinking hard' && body.choices?.[0]?.message?.content === 'Answer', body.choices?.[0]?.message)
   check('stop finish', body.choices?.[0]?.finish_reason === 'stop')
+}
+
+console.log('--- param passthrough ---')
+{
+  const before = (await statsFetch()).generate
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({
+      model: 'mock/params',
+      messages: [{ role: 'user', content: 'hi' }],
+      top_p: 0.9,
+      stop: ['END', '\n\n'],
+      user: 'u_abc',
+      seed: 42,
+    }),
+  })
+  const body = await r.json()
+  check('params passthrough 200', r.status === 200 && body.choices?.[0]?.message?.content === 'params-ok', body)
+  const s = await statsFetch()
+  check('generate incremented', s.generate === before + 1)
+  const b = s.lastGenerateBody
+  check('top_p passed through', b.params.top_p === 0.9, b.params)
+  check('stop passed through as array', Array.isArray(b.params.stop) && b.params.stop[0] === 'END' && b.params.stop[1] === '\n\n', b.params.stop)
+  check('user passed through', b.params.user === 'u_abc', b.params.user)
+  check('seed passed through', b.params.seed === 42, b.params.seed)
+}
+{
+  const before = (await statsFetch()).generate
+  const r = await fetch(BASE + '/v1/messages', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
+    body: JSON.stringify({
+      model: 'mock/params', max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }],
+      top_p: 0.5,
+      stop_sequences: ['STOP'],
+      metadata: { user_id: 'u_xyz' },
+    }),
+  })
+  const body = await r.json()
+  check('anthropic params passthrough 200', r.status === 200, body)
+  const s = await statsFetch()
+  check('anthropic generate incremented', s.generate === before + 1)
+  const b = s.lastGenerateBody
+  check('anthropic top_p → CC top_p', b.params.top_p === 0.5, b.params)
+  check('anthropic stop_sequences → CC stop', Array.isArray(b.params.stop) && b.params.stop[0] === 'STOP', b.params.stop)
+  check('anthropic metadata.user_id → CC user', b.params.user === 'u_xyz', b.params.user)
 }
 
 console.log('--- zero output / upstream errors ---')

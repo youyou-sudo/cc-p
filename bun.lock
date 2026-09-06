@@ -3,12 +3,12 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "elysia",
+      "name": "commandcode-proxy-elysia",
       "dependencies": {
         "elysia": "^1.4.30",
       },
       "devDependencies": {
-        "bun-types": "latest",
+        "bun-types": "1.4.2",
         "typescript": "^5.7.2",
       },
     },

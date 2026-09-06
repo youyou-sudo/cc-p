@@ -1,7 +1,18 @@
-import { MAX_BODY_SIZE } from './config'
+import { CFG, MAX_BODY_SIZE } from './config'
+
+// Default CORS policy. `*` (any web page may call the proxy) is fine when no
+// `CC_API_KEY` fallback is set — every request must still present its own key.
+// Once a fallback key is configured, the proxy becomes fully open to keyless
+// browser calls from any origin, so unless the operator opts in via
+// `CORS_ALLOW_ORIGIN`, we refuse browser cross-origin calls entirely
+// (curl / SDKs are unaffected — they do not send an Origin header).
+function corsAllowOrigin(): string {
+  if (CFG.corsAllowOrigin) return CFG.corsAllowOrigin
+  return CFG.apiKey ? 'null' : '*'
+}
 
 export const CORS_HEADERS: Record<string, string> = {
-  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Origin': corsAllowOrigin(),
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': '*',
 }
