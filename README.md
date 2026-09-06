@@ -1,263 +1,264 @@
-# Command Code Proxy (Elysia + Bun)
+# cc-p — Command Code Proxy
 
 > [中文文档](README_zh.md)
 
-Elysia/Bun port of [commandcode-proxy](../commandcode-proxy) — a reverse proxy that converts the Command Code API into OpenAI / Anthropic compatible endpoints.
+A reverse proxy that exposes the Command Code API as **OpenAI Chat Completions** and **Anthropic Messages** compatible endpoints.
 
-Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
+Built by observing official CLI traffic to faithfully replicate the upstream protocol — device fingerprint, lifecycle events, session headers, versioning, and tracing.
 
-**Features**: OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
+Stack: **Bun + Elysia + TypeScript**. Single-file binary via `bun build --compile`, distroless Docker image.
+
+## Features
+
+- **Dual protocol**: `POST /v1/chat/completions` (OpenAI) + `POST /v1/messages` (Anthropic)
+- **Streaming & non-streaming**, tool calling, multimodal images, `reasoning_effort` / `thinking`
+- **Dynamic models**: `GET /v1/models` from Provider API (5 min cache) with builtin fallback
+- **CLI emulation**: per-key device fingerprint (8h + 2h jitter), lifecycle `cli_session_exists`, per-key session (12h + 1h jitter), `x-command-code-version` from npm (24h refresh), `traceparent`, `x-project-slug`
+- **Resilience**: zero-output → `429` retryable, idle timeout (30s stream / 90s non-stream) → `429`, disconnect aborts upstream
+- **Auth flexibility**: per-request `Bearer user_*` / `x-api-key`, optional `CC_API_KEY` fallback for self-host
+- **Ops ready**: `GET /health`, `server healthcheck` CLI, Docker HEALTHCHECK, privacy-aware logs (no keys, bodies, or stacks)
 
 ## Quick Start
 
-Requires [Bun](https://bun.sh) 1.1+.
+No runtime needed — download the single-file binary for your platform from
+[GitHub Releases](https://github.com/youyou-sudo/cc-p/releases) and run it:
+
+| OS | Arch | Asset |
+|----|------|-------|
+| Linux | x64 / arm64 | `cc-p-linux-x64`, `cc-p-linux-arm64` |
+| Windows | x64 / arm64 | `cc-p-windows-x64.exe`, `cc-p-windows-arm64.exe` |
+| macOS | x64 / arm64 | `cc-p-darwin-x64`, `cc-p-darwin-arm64` |
 
 ```bash
-bun install
-bun start        # Start (listens on http://0.0.0.0:3050 per .env / config.json)
-bun run dev      # Watch mode (auto-reload on file changes)
+# Linux / macOS
+chmod +x cc-p-linux-x64
+CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64   # listens on http://0.0.0.0:3050
 ```
 
-Settings live in `.env` (see [Configuration](#configuration)); fill in your `CC_API_KEY` there or pass it per request.
+```powershell
+# Windows (PowerShell)
+$env:CC_API_KEY="user_xxxxxxxxx"; .\cc-p-windows-x64.exe
+```
+
+Prefer a file over env vars? Put a `config.json` / `.env` next to the binary
+(see [Configuration](#configuration)) — the binary reads them from its working
+directory on top of the embedded defaults. Verify with:
 
 ```bash
+curl http://127.0.0.1:3050/health
+# {"ok":true}
+
 curl http://127.0.0.1:3050/v1/chat/completions \
   -H "Authorization: Bearer user_xxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-## File Structure
+> `CC_API_KEY` is optional: it acts as a fallback when a request carries no key
+> (handy for self-host). Omit it and every request must send its own
+> `Authorization: Bearer user_xxx` / `x-api-key`. Details in [API key](#api-key).
 
-```
-elysia/
-├── .env                   # Local settings & secrets (git-ignored, CC_API_KEY here)
-├── config.json            # Non-sensitive defaults (tracked)
-├── package.json           # bun start / bun run dev / tests
-├── src/
-│   ├── index.ts           # Elysia app: routes, CORS, error mapping, startup
-│   ├── config.ts         # Bun.file + env overrides (Bun auto-loads .env), body limit
-│   ├── logger.ts         # Log helper (console + optional file)
-│   ├── util.ts           # Hashing, ids, project slug, traceparent
-│   ├── http.ts           # JSON/SSE response helpers, body limit reader
-│   ├── runtime.ts        # Timeout constants + consecutive timeout state
-│   ├── version.ts        # Dynamic CC version from npm registry
-│   ├── session.ts        # Per-key sessions (12h + 1h jitter)
-│   ├── fingerprint.ts    # Device fingerprint pool + init pre-requests
-│   ├── auth.ts           # API key extraction (Bearer / x-api-key) + CC_API_KEY fallback
-│   ├── errors.ts         # CC status/error mapping, finish reasons, usage
-│   ├── models.ts         # Model list + Provider API cache
-│   ├── cc.ts             # CC request building + forwarding
-│   ├── sse.ts            # SSE pipeline + CC NDJSON → OpenAI chunks
-│   ├── openai.ts         # POST /v1/chat/completions
-│   └── anthropic.ts      # POST /v1/messages (protocol conversion)
-├── test/
-│   ├── e2e.ts            # 66-assertion integration suite (mock upstream)
-│   └── timeouts.ts       # Idle timeout + client disconnect suite
-├── Dockerfile            # Build: bun --compile single binary → distroless runtime
-├── docker-compose.yml    # Container orchestration
-└── tsconfig.json
+### Use with SDKs
+
+```python
+# OpenAI SDK
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:3050/v1", api_key="user_xxxxxxxxx")
+resp = client.chat.completions.create(
+    model="deepseek/deepseek-v4-flash",
+    messages=[{"role": "user", "content": "hi"}],
+    stream=True,
+)
 ```
 
-## Configuration
-
-Configuration is read from three sources, lowest to highest precedence:
-
-1. built-in defaults
-2. `config.json` (non-sensitive defaults, tracked in git)
-3. **`.env`** (created from the shipped template) or real shell environment variables
-
-`.env` is loaded automatically by Bun at startup (both `bun run` and the compiled binary). It is git-ignored, so it is the right place for secrets like `CC_API_KEY`. A `.env` file is included with every option commented and ready to fill in:
-
-```bash
-cp .env .env.example    # (optional) keep a template
-# edit .env, e.g.
-#   CC_API_KEY=user_xxxxxxxxx
-bun start
+```python
+# Anthropic SDK
+import anthropic
+client = anthropic.Anthropic(base_url="http://127.0.0.1:3050", api_key="user_xxxxxxxxx")
+msg = client.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "hi"}],
+)
 ```
 
-An empty value in `.env` means "keep the default from config.json"; values set here (or exported in the shell) override `config.json`. Real shell variables always win over the `.env` file.
+Any OpenAI-compatible tool (Claude Code, Cline, Roo, NextChat, etc.) works by pointing `base_url` at `/v1` and using a `user_*` key.
 
-### Environment Variables
+## API Reference
 
-| Variable | Overrides `config.json` |
-|----------|--------------------------|
-| `PORT` | `port` (repo config.json ships with `3050`) |
-| `HOST` | `host` (`0.0.0.0`) |
-| `CC_API_BASE` | `apiBase` (`https://api.commandcode.ai`) |
-| `CC_API_KEY` | `apiKey` — **fallback CC API key** |
-| `PROJECT_SLUG` | `projectSlug` (`cc-proxy`) |
-| `LOG_FILE` | `logFile` (empty = console only) |
-| `LOG_LEVEL` | `logLevel` (`info`) |
-| `CC_USE_PROVIDER_MODELS` | `useProviderModels` (`true`) |
-| `CC_MODEL_REFRESH_INTERVAL_MS` | `modelRefreshIntervalMs` (`300000`) |
-| `CMD_ZDR` | `zdr` (`1`/`true` to enable) |
-| `CC_MAX_BODY_MB` | Request body limit in MB (default `100`); oversized requests are rejected with `HTTP 413` |
-
-### API Key
-
-An API key is normally sent **per request** via `Authorization: Bearer user_xxx` (OpenAI SDKs) or `x-api-key` (Anthropic SDKs). Keys must start with `user_`.
-
-If a request carries no usable key, the proxy falls back to the key configured in `CC_API_KEY` (`.env`) — a convenience for local/self-hosted use. Set it to a real key and clients no longer need to pass one:
-
-```bash
-CC_API_KEY=user_xxxxxxxxx bun start
-```
-
-Leaving `CC_API_KEY=` empty disables the fallback and requests without a key are rejected with `401`. A client-supplied key always takes precedence over the fallback.
-
-## API Endpoints
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | `OK` (plain text) |
+| `GET` | `/health` | `{"ok":true}` |
+| `GET` | `/v1/models` | OpenAI-style model list |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
+| `POST` | `/v1/messages` | Anthropic Messages |
 
 ### `POST /v1/chat/completions`
 
-OpenAI Chat Completions compatible. Supports streaming, non-streaming, tool calling, multimodal image input, and reasoning effort.
-
-```json
-{
-  "model": "deepseek/deepseek-v4-flash",
-  "messages": [{ "role": "user", "content": "hello" }],
-  "stream": true
-}
-```
-
-Streaming responses are SSE (`data: {...}` chunks with `finish_reason` + `usage`, terminated by `data: [DONE]`). Non-streaming responses return a full `chat.completion` object with `prompt_tokens_details.cached_tokens`.
+Standard OpenAI schema. `stream: true` returns SSE (`data: {...}` chunks + `data: [DONE]`); otherwise a full `chat.completion` object with `prompt_tokens_details.cached_tokens`. Images via `content: [{type:"image_url", image_url:{url}}]` are forwarded as CC `image` parts. `reasoning_effort` is passed through; reasoning also surfaces as `reasoning_content` deltas.
 
 ### `POST /v1/messages`
 
-Anthropic Messages API compatible endpoint. Supports streaming (message_start / content_block_* / message_delta / message_stop), non-streaming, tool calling, and `thinking` blocks with signatures.
+Anthropic schema with automatic conversion:
 
-| Concept | Anthropic Format | Conversion |
-|---------|-----------------|------------|
-| System prompt | Top-level `system` field | Auto-converted to OpenAI `system` message |
-| Tool results | `tool_result` blocks in `user` messages | Auto-converted to `role: "tool"` |
-| Tool definitions | `input_schema` | Auto-mapped to `parameters` |
-| `tool_choice` | `{type:"auto"/"any"/"tool"}` | `any`→`required`, `tool`→function object |
-| Reasoning | `thinking.budget_tokens` | Auto-mapped to `reasoning_effort` (≥10000→high, ≥5000→medium, ≥2000→low) |
-| Stop reason | `end_turn`/`max_tokens`/`tool_use` | Auto-mapped from CC finish reasons |
+| Anthropic | Handling |
+|-----------|----------|
+| `system` (string / blocks) | → OpenAI `system` message |
+| `tool_result` in `user` blocks | → `role: "tool"` messages |
+| `tools[].input_schema` | → `parameters` |
+| `tool_choice: auto / any / tool / none` | → `auto / required / {function} / none` |
+| `thinking.budget_tokens` | → `reasoning_effort` (≥10000 high, ≥5000 medium, ≥2000 low) |
+| `thinking.type: adaptive` | → `reasoning_effort: effort` |
+| CC `finishReason` | → `end_turn / max_tokens / tool_use` |
+
+Streaming emits `message_start / content_block_* / message_delta / message_stop`; `thinking` blocks get a synthetic `signature` so strict SDKs validate.
 
 ### `GET /v1/models`
 
-Returns available model list. Fetched dynamically from Provider API (5 min cache), falls back to hardcoded list on failure.
+Tries `GET {CC_API_BASE}/provider/v1/models` with your key (10s timeout); caches for `CC_MODEL_REFRESH_INTERVAL_MS`. Falls back to the builtin list in `src/models.ts` on any failure. Set `CC_USE_PROVIDER_MODELS=false` to always use the builtin list.
 
-### `GET /health`
+## Configuration
 
-Health check. Returns JSON `{"ok":true}` (consumed by the bundled `server healthcheck` CLI / Docker HEALTHCHECK).
+Precedence (low → high): **builtin defaults → `config.json` → `.env` / environment**. Bun auto-loads `.env`. An empty value means "keep `config.json`"; real shell vars beat `.env`.
 
-## Error Codes
+`config.json` holds non-sensitive defaults (tracked in git). `.env` holds secrets (git-ignored).
 
-| HTTP Status | Description |
-|-------------|-------------|
-| 400 | Invalid request format |
-| 401 | API Key missing / invalid format / rejected (`user_` prefix required) |
-| 413 | Request body exceeds the size limit |
-| 429 | Zero output tokens, or idle timeout (30s streaming / 90s non-streaming) — SDK auto-retry with `Retry-After`; after 3 consecutive timeouts a "reduce context" hint is returned |
-| 502 | CC upstream error |
+| Variable | `config.json` key | Default |
+|----------|-------------------|---------|
+| `PORT` | `port` | `3050` |
+| `HOST` | `host` | `0.0.0.0` |
+| `CC_API_BASE` | `apiBase` | `https://api.commandcode.ai` |
+| `CC_API_KEY` | `apiKey` | `""` (no fallback) |
+| `PROJECT_SLUG` | `projectSlug` | `cc-proxy` |
+| `LOG_FILE` | `logFile` | `""` (console only) |
+| `LOG_LEVEL` | `logLevel` | `info` |
+| `CC_USE_PROVIDER_MODELS` | `useProviderModels` | `true` |
+| `CC_MODEL_REFRESH_INTERVAL_MS` | `modelRefreshIntervalMs` | `300000` |
+| `CMD_ZDR` | `zdr` | `false` |
+| `CC_MAX_BODY_MB` | — (env only) | `100` |
 
-## Anti-Detection
+### API key
 
-Same mechanisms as the original, re-implemented on Bun:
-
-| Mechanism | Implementation |
-|-----------|---------------|
-| **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; random fingerprint pool, SHA-256 hashed, per-key binding, refreshed every 8h + 2h jitter |
-| **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`) sent in parallel with fingerprint on session init |
-| **Per-Key Session** | One session per API key, 12h expiry + 1h random jitter |
-| **Version** | `x-command-code-version` auto-fetched from npm registry (24h refresh) |
-| **CLI Envelope** | config/memory/taste/skills/permissionMode/params |
-| **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **Project Slug** | `x-project-slug` generated from session ID (CLI-compatible format) |
-| **Zero-Output Guard** | outputTokens=0 → 429 `rate_limit_error` (SDK auto-retry, anti false billing) |
-| **Upstream Abort** | `AbortController` wired to the client `Request` signal + all error paths |
-| **Privacy Logging** | No API key fragments, no error bodies, no stack traces in logs |
-
-## Docker Deployment
-
-The app is compiled into a **single executable** (`bun build --compile`) and runs on a distroless base image (no shell, no package manager). It exposes a `healthcheck` CLI subcommand for container health checks.
-
-The image does not bake in a `.env` file. `docker compose` injects your local `.env` via `env_file` (fallback key and other settings are read from the container environment), or pass variables explicitly:
+Per-request key first: `Authorization: Bearer user_xxx` or `x-api-key: user_xxx` (must match `user_[A-Za-z0-9_-]+`). If missing/invalid, the proxy falls back to `CC_API_KEY`:
 
 ```bash
-docker compose up -d                # listens on 0.0.0.0:3050
+CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64
+```
+
+Leave it empty to disable the fallback — keyless requests get `401`. A client-supplied key always wins. Per-request `x-cmd-zdr: 1` header enables the ZDR route for that call even when `CMD_ZDR` is off.
+
+Oversized bodies (> `CC_MAX_BODY_MB`) are rejected with `413`.
+
+## Errors & Retries
+
+| Status | When | Client action |
+|--------|------|---------------|
+| `400` | Bad JSON / invalid request shape | Fix request |
+| `401` | Missing key, bad `user_` format, or upstream 401/403 | Check key |
+| `413` | Body over size limit | Shrink payload |
+| `429` | Zero output tokens (`retry_after: 10`), idle timeout (`retry_after: 5`) | SDK auto-retries via `Retry-After`; after 3 consecutive timeouts the message suggests reducing context |
+| `502/503` | Upstream CC error (mapped from CC status/event) | Retry / backoff |
+
+Upstream mapping (`src/errors.ts`): CC `402/429` → `429`, `401/403` → `401`, `400/422` → `400`, `500/502` → `502`, `503` → `503`. CC `tool-calls` is normalized to OpenAI `tool_calls` and Anthropic `tool_use` on both stream and non-stream paths.
+
+Client disconnects (`request.signal`) abort the upstream `fetch` immediately; unfinished streams are closed without leaking sockets.
+
+## How It Emulates the CLI
+
+Per API key, before the first upstream call (and every ~8h after):
+
+1. `POST /alpha/fingerprint/record` — random but plausible fingerprint (SHA-256 hashed machine/MAC/user/hostname IDs, CPU pool, memory, timezone, `win32/x64`), bound to the key.
+2. `POST /alpha/lifecycle-events` (`cli_session_exists`) — sent in parallel with the fingerprint.
+
+Each `POST /alpha/generate` then carries `Authorization`, `x-cli-environment: production`, `x-command-code-version` (npm `command-code@latest`, refreshed daily), `x-session-id` (12h per-key session, reusable via `x-session-id` / `prompt_cache_key` headers), `x-project-slug`, `traceparent` (W3C), and optional `x-cmd-zdr: 1`.
+
+## Project Structure
+
+```
+.
+├── config.json            # Non-sensitive defaults (tracked)
+├── .env.example           # Template for local secrets (copy to .env)
+├── src/
+│   ├── index.ts           # Routes, CORS, error mapping, startup, healthcheck CLI
+│   ├── config.ts          # config.json + env resolution, body-limit
+│   ├── openai.ts          # POST /v1/chat/completions (stream + non-stream)
+│   ├── anthropic.ts       # POST /v1/messages + Anthropic↔OpenAI conversion
+│   ├── cc.ts              # CC request building + forwarding (/alpha/generate)
+│   ├── sse.ts             # SSE pipeline + CC NDJSON → OpenAI chunks
+│   ├── fingerprint.ts     # Fingerprint pool + init pre-requests (per key)
+│   ├── session.ts         # Per-key sessions + hourly cleanup
+│   ├── models.ts          # Model list + Provider API cache
+│   ├── errors.ts          # Status/error/finish-reason/usage mapping
+│   ├── http.ts            # JSON/SSE helpers, body reader, timeout reader
+│   ├── auth.ts            # Bearer / x-api-key extraction + fallback
+│   ├── runtime.ts         # Idle timeouts + consecutive-timeout counter
+│   ├── version.ts         # CC version from npm registry
+│   ├── util.ts            # IDs, hashing, slug, traceparent
+│   └── logger.ts          # Console (+ optional file) logger
+├── test/
+│   ├── e2e.ts             # Integration suite against a mock upstream
+│   └── timeouts.ts        # Idle-timeout + disconnect suite (~35s)
+├── Dockerfile             # bun --compile → distroless
+├── docker-compose.yml     # Local run (uses .env)
+├── docker-compose.prod.yml# Prod run (ghcr.io image, env-driven)
+└── .github/workflows/
+    ├── release.yml        # Tag + cross-compile 6 binaries → draft Release
+    └── deploy.yml         # Prod deploy
+```
+
+## Docker
+
+Prefer containers? The image is the same single binary on distroless (no shell).
+Only `config.json` is baked in; secrets come from the environment:
+
+```bash
+# Local container (injects ./.env via env_file)
+docker compose up -d
 PROXY_PORT=13050 docker compose up -d
+
+# Manual
+docker build -t commandcode-proxy:latest .
+docker run -d -p 3050:3050 --env-file .env commandcode-proxy:latest
 ```
 
-Or build manually (pass secrets with `-e`/`--env-file`, never bake them into the image):
+Health check runs the embedded CLI (`exit 0` iff `GET /health` → `{"ok":true}`):
 
 ```bash
-docker build -t commandcode-proxy-elysia:latest .
-docker run -d -p 3050:3050 --env-file .env commandcode-proxy-elysia:latest
+/app/server healthcheck
 ```
 
-Inside the container only `config.json` is provided (`.env` stays on the host / is injected as environment variables). Runtime config is resolved from `process.cwd()` (`/app`) — see `src/config.ts` `candidateDirs`.
+## Development
 
-### Single binary / healthcheck
-
-Run or build the app standalone without Docker:
+Requires [Bun](https://bun.sh) 1.1+. Source runs and tests use `bun run` scripts:
 
 ```bash
-bun run src/index.ts              # start (dev, watch via bun run dev)
-bun build ./src/index.ts --compile --minify --outfile server
-./server                          # start
-./server healthcheck              # exit 0 if /health returns {"ok":true}, exit 1 otherwise
+bun install
+cp .env.example .env   # fill in CC_API_KEY (optional)
+bun start              # run from source → http://0.0.0.0:3050
+bun run dev            # watch mode (auto-reload)
 ```
 
-`/health` returns `{"ok":true}` so `server healthcheck` works as a Docker HEALTHCHECK inside distroless.
-
-### GitHub Releases / prebuilt binaries
-
-Every push to `master` (with non-doc changes) triggers the **Release** workflow (`.github/workflows/release.yml`): it bumps the **patch** version from the latest `v*.*.*` tag (`v1.0.0` → `v1.0.1` → …), cross-compiles a standalone binary for 6 platforms with Bun (`--target`), and drafts a GitHub Release with them:
-
-| Platform | Asset |
-|----------|-------|
-| Linux x64 | `cc-p-linux-x64` |
-| Linux arm64 | `cc-p-linux-arm64` |
-| Windows x64 | `cc-p-windows-x64.exe` |
-| Windows arm64 | `cc-p-windows-arm64.exe` |
-| macOS x64 | `cc-p-darwin-x64` |
-| macOS arm64 | `cc-p-darwin-arm64` |
-
-Each binary embeds the repo's `config.json` as its default, so it listens on `0.0.0.0:3050` out of the box; place your own `config.json` / `.env` **next to the executable** (or export env vars) to override.
-
-**Version management:**
-
-- **Patch (auto):** push code to `master` → `v1.2.3` → `v1.2.4` is tagged and released. Doc-only commits (`*.md`, `docs/`) are skipped.
-- **Minor/Major (manual):** trigger **Actions → Release → Run workflow** and pick `minor` (`v1.2.3` → `v1.3.0`) or `major` (`v1.2.3` → `v2.0.0`).
-- **Exact version:** pick `custom` and type e.g. `2.0.0`.
-- Re-running a workflow over an existing tag re-uploads assets to that tag's Release instead of creating a duplicate.
-
-To build the same 6 binaries locally:
+Mock upstream — no real API calls:
 
 ```bash
-for t in bun-linux-x64 bun-linux-arm64 bun-windows-x64 bun-windows-arm64 bun-darwin-x64 bun-darwin-arm64; do
-  bun build ./src/index.ts --compile --production --minify \
-    --target "$t" --asset config.json --outfile "dist/cc-p-${t#bun-}"
-done
+bun run test            # e2e suite (protocol, streaming, errors)
+bun run test:timeouts   # idle timeout + client disconnect
+bunx tsc --noEmit       # typecheck (also runs in CI)
 ```
 
-## Testing
-
-The test suites spin up a mock Command Code upstream (no real API calls) and assert protocol conversion, streaming, error mapping, timeouts, and disconnect handling:
+Build the binary yourself:
 
 ```bash
-bun test            # 66-assertion e2e suite
-bun run test:timeouts   # idle timeout (takes ~35s) + disconnect suite
+bun build ./src/index.ts --compile --minify --outfile server && ./server
+./server healthcheck
 ```
 
-## Porting Notes (vs. Node single-file original)
-
-- Single 2000-line `proxy.mjs` split into focused modules under `src/`.
-- `http.createServer` + manual routing → Elysia routes; Node `res` streaming → `ReadableStream` responses with a deferred-headers pipeline (JSON errors are still returned when nothing was streamed yet).
-- Client disconnect detection uses Bun's `request.signal` (fires on hangup) instead of `res.on('close')`.
-- Body-size limiting re-implemented in `readJsonBody` (content-length fast path + streamed counting with keep-alive drain, matching the original 413 behavior).
-- Node `crypto`/`fs` replaced with `Bun.CryptoHasher`/Web Crypto/`node:fs/promises`.
-- **Bug fix**: the original's Anthropic *streaming* path mapped CC's hyphenated `tool-calls` finish reason straight to `mapAnthropicStopReason` (which only knows `tool_calls`), so streaming tool calls reported `stop_reason: end_turn`. The port normalizes the reason first (`tool-calls` → `tool_calls` → `tool_use`), matching the documented behavior and the non-streaming path.
+Pushes to `master` (non-doc changes) trigger the **Release** workflow: typecheck +
+e2e tests, patch-bump from the latest `v*.*.*` tag, cross-compile the 6
+platform binaries, and draft a GitHub Release with SHA-256 checksums. Manual
+`minor` / `major` / `custom` bumps via **Actions → Release → Run workflow**.
 
 ## Disclaimer
 
-This project is for **educational and research purposes** only.
-
-- **Unofficial**: This project is not affiliated with Command Code in any way.
-- **Personal Use**: Users assume all responsibility. Please comply with the [Command Code Terms of Service](https://commandcode.ai/tos).
-- **API Key**: This project does not collect, upload, or leak your API Key. The key is sent per request via the `Authorization: Bearer <key>` or `x-api-key` header and is never logged.
-- **Compliance**: The protocol is based on passive observation of local CLI network traffic.
-- **Account Risk**: Keep usage frequency consistent with normal CLI usage. Extremely high concurrent calls may trigger risk controls.
+For **educational and research purposes** only. Not affiliated with Command Code. You are responsible for complying with the [Command Code Terms of Service](https://commandcode.ai/tos). Keys are sent per request via headers and never logged. Keep call frequency within normal CLI usage to avoid risk controls.

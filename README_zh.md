@@ -1,243 +1,278 @@
-# Command Code Proxy（Elysia + Bun 版）
+# cc-p — Command Code Proxy
 
-commandcode-proxy 的 Elysia/Bun 移植版 —— 将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反向代理。
+> [English](README.md)
 
-基于对官方 CLI 网络流量的抓包分析构建，精确复刻 Command Code API 请求协议，包括设备指纹与生命周期预请求。
+把 Command Code API 暴露为 **OpenAI Chat Completions** 与 **Anthropic Messages** 兼容接口的反向代理。
 
-**功能**：OpenAI Chat Completions + Anthropic Messages API | 流式 / 非流式 | 工具调用（tool_use） | 多模态图片输入 | reasoning effort | 动态模型列表 | 缓存命中统计 | 设备指纹伪装（按 Key 绑定、自动刷新） | `x-api-key` 认证（Anthropic SDK） | 客户端断连检测并中止上游 | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私安全日志
+通过观察官方 CLI 流量，忠实复刻上游协议——设备指纹、生命周期事件、会话头、版本号与链路追踪。
+
+技术栈：**Bun + Elysia + TypeScript**。`bun build --compile` 打出单文件二进制，Docker 用 distroless 镜像。
+
+## 功能
+
+- **双协议**：`POST /v1/chat/completions`（OpenAI）+ `POST /v1/messages`（Anthropic）
+- **流式 / 非流式**、工具调用、多模态图片、`reasoning_effort` / `thinking`
+- **动态模型**：`GET /v1/models` 从 Provider API 获取（5 分钟缓存），失败回退内置列表
+- **CLI 仿真**：按 Key 的设备指纹（8h + 2h 抖动）、`cli_session_exists` 生命周期事件、按 Key 会话（12h + 1h 抖动）、`x-command-code-version` 取自 npm（每天刷新）、`traceparent`、`x-project-slug`
+- **容错**：零输出 → 可重试 `429`，空闲超时（流式 30s / 非流式 90s）→ `429`，断连立刻中止上游
+- **认证灵活**：按请求的 `Bearer user_*` / `x-api-key`，自托管可选 `CC_API_KEY` 兜底
+- **开箱可运维**：`GET /health`、`server healthcheck` CLI、Docker HEALTHCHECK、隐私日志（不记 Key、包体与堆栈）
 
 ## 快速开始
 
-需要 [Bun](https://bun.sh) 1.1+。
+无需安装运行时——去 [GitHub Releases](https://github.com/youyou-sudo/cc-p/releases) 下载对应平台的单文件二进制，直接运行：
+
+| 系统 | 架构 | 文件名 |
+|------|------|--------|
+| Linux | x64 / arm64 | `cc-p-linux-x64`、`cc-p-linux-arm64` |
+| Windows | x64 / arm64 | `cc-p-windows-x64.exe`、`cc-p-windows-arm64.exe` |
+| macOS | x64 / arm64 | `cc-p-darwin-x64`、`cc-p-darwin-arm64` |
 
 ```bash
-bun install
-bun start        # 启动（按 .env / config.json 监听，默认 http://0.0.0.0:3050）
-bun run dev      # 监听模式（文件变更自动重载）
+# Linux / macOS
+chmod +x cc-p-linux-x64
+CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64   # 监听 http://0.0.0.0:3050
 ```
 
-参数在 `.env` 中配置（见[配置](#配置)）：在此填写你的 `CC_API_KEY`，或按请求传入。
+```powershell
+# Windows (PowerShell)
+$env:CC_API_KEY="user_xxxxxxxxx"; .\cc-p-windows-x64.exe
+```
+
+不想用环境变量？把 `config.json` / `.env` 放到二进制**同目录**即可
+（见[配置](#配置)）——二进制会在内嵌默认值之上读取它们。验证：
 
 ```bash
+curl http://127.0.0.1:3050/health
+# {"ok":true}
+
 curl http://127.0.0.1:3050/v1/chat/completions \
   -H "Authorization: Bearer user_xxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-## 文件结构
+> `CC_API_KEY` 可选：仅在请求没带 Key 时兜底（自托管省事）。不填则每个请求
+> 都必须自带 `Authorization: Bearer user_xxx` / `x-api-key`。详见 [API Key](#api-key)。
 
-```
-elysia/
-├── .env                   # 本地配置与密钥（已 git 忽略，CC_API_KEY 写这里）
-├── config.json           # 非敏感默认值（入库跟踪）
-├── package.json          # bun start / bun run dev / 测试脚本
-├── src/
-│   ├── index.ts          # Elysia 应用：路由、CORS、错误映射、启动
-│   ├── config.ts         # Bun.file + 环境变量覆写（Bun 自动加载 .env）、请求体上限
-│   ├── logger.ts         # 日志（控制台 + 可选文件）
-│   ├── util.ts           # 哈希、ID、项目 slug、traceparent
-│   ├── http.ts           # JSON/SSE 响应工具、请求体限长读取
-│   ├── runtime.ts        # 超时常量 + 连续超时计数
-│   ├── version.ts        # 从 npm registry 拉取 CC 版本号
-│   ├── session.ts        # 按 Key 会话（12h + 1h 抖动）
-│   ├── fingerprint.ts    # 设备指纹池 + 初始化预请求
-│   ├── auth.ts           # API Key 提取（Bearer / x-api-key）+ CC_API_KEY 兜底
-│   ├── errors.ts         # CC 状态码/错误映射、finish reason、usage
-│   ├── models.ts         # 模型列表 + Provider API 缓存
-│   ├── cc.ts             # CC 请求体构建 + 转发
-│   ├── sse.ts            # SSE 管道 + CC NDJSON → OpenAI chunk
-│   ├── openai.ts         # POST /v1/chat/completions
-│   └── anthropic.ts      # POST /v1/messages（协议转换）
-├── test/
-│   ├── e2e.ts            # 66 项断言的集成测试（mock 上游）
-│   └── timeouts.ts       # 空闲超时 + 客户端断连测试
-├── Dockerfile            # 构建：bun --compile 单二进制 → distroless 运行
-├── docker-compose.yml    # 容器编排
-└── tsconfig.json
+### 接入 SDK
+
+```python
+# OpenAI SDK
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:3050/v1", api_key="user_xxxxxxxxx")
+resp = client.chat.completions.create(
+    model="deepseek/deepseek-v4-flash",
+    messages=[{"role": "user", "content": "hi"}],
+    stream=True,
+)
 ```
 
-## 配置
-
-配置按以下优先级（低 → 高）读取：
-
-1. 内置默认值
-2. `config.json`（非敏感默认值，入库跟踪）
-3. **`.env`**（随仓库附带的模板）或真实 shell 环境变量
-
-`.env` 会在启动时由 Bun 自动加载（`bun run` 与编译后的二进制均如此），已被 git 忽略，因此是放 `CC_API_KEY` 等密钥的正确位置。仓库已附带一个带注释、可直接填写的 `.env`：
-
-```bash
-# 编辑 .env，例如：
-#   CC_API_KEY=user_xxxxxxxxx
-bun start
+```python
+# Anthropic SDK
+import anthropic
+client = anthropic.Anthropic(base_url="http://127.0.0.1:3050", api_key="user_xxxxxxxxx")
+msg = client.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "hi"}],
+)
 ```
 
-`.env` 中留空的项 = 采用 config.json 默认值；填写的项（或 shell 中 export 的变量）覆盖 config.json。真实 shell 环境变量优先级高于 `.env` 文件。
+任何 OpenAI 兼容客户端（Claude Code、Cline、Roo、NextChat 等）只要把 `base_url`
+指向 `/v1` 并使用 `user_*` Key 即可。
 
-### 环境变量
+## API 参考
 
-| 变量 | 覆写 config.json |
-|------|------------------|
-| `PORT` | `port`（仓库 config.json 自带 `3050`） |
-| `HOST` | `host`（`0.0.0.0`） |
-| `CC_API_BASE` | `apiBase`（`https://api.commandcode.ai`） |
-| `CC_API_KEY` | `apiKey` —— **兜底 CC API Key** |
-| `PROJECT_SLUG` | `projectSlug`（`cc-proxy`） |
-| `LOG_FILE` | `logFile`（空 = 仅控制台） |
-| `LOG_LEVEL` | `logLevel`（`info`） |
-| `CC_USE_PROVIDER_MODELS` | `useProviderModels`（`true`） |
-| `CC_MODEL_REFRESH_INTERVAL_MS` | `modelRefreshIntervalMs`（`300000`） |
-| `CMD_ZDR` | `zdr`（`1`/`true` 启用） |
-| `CC_MAX_BODY_MB` | 请求体上限（MB，默认 `100`），超限返回 `HTTP 413` |
-
-### API Key
-
-API Key 通常随每个请求通过 `Authorization: Bearer user_xxx`（OpenAI SDK）或 `x-api-key`（Anthropic SDK）传入，且必须以 `user_` 开头。
-
-若请求未携带可用 Key，代理会回退到 `CC_API_KEY`（`.env`）中配置的 Key —— 便于本地/自托管使用。填入真实 Key 后客户端无需再传：
-
-```bash
-CC_API_KEY=user_xxxxxxxxx bun start
-```
-
-`CC_API_KEY=` 留空 = 不启用兜底，无 Key 的请求返回 `401`。请求自带的 Key 始终优先于兜底 Key。
-
-## API 端点
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/` | `OK`（纯文本） |
+| `GET` | `/health` | `{"ok":true}` |
+| `GET` | `/v1/models` | OpenAI 风格模型列表 |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
+| `POST` | `/v1/messages` | Anthropic Messages |
 
 ### `POST /v1/chat/completions`
 
-OpenAI Chat Completions 兼容。支持流式、非流式、工具调用、多模态图片输入、reasoning effort。
-
-```json
-{
-  "model": "deepseek/deepseek-v4-flash",
-  "messages": [{ "role": "user", "content": "hello" }],
-  "stream": true
-}
-```
-
-流式响应为 SSE（`data: {...}` chunk，携带 `finish_reason` + `usage`，以 `data: [DONE]` 结束）。非流式返回完整 `chat.completion` 对象，`prompt_tokens_details.cached_tokens` 反映缓存命中。
+标准 OpenAI 结构。`stream: true` 返回 SSE（`data: {...}` + `data: [DONE]`），否则返回完整
+`chat.completion` 对象（含 `prompt_tokens_details.cached_tokens`）。图片经
+`content: [{type:"image_url", image_url:{url}}]` 以 CC `image` 分片转发。
+`reasoning_effort` 透传，推理内容同时以 `reasoning_content` 增量下发。
 
 ### `POST /v1/messages`
 
-Anthropic Messages API 兼容端点。支持流式（message_start / content_block_* / message_delta / message_stop）、非流式、工具调用、带签名的 `thinking` 块。
+Anthropic 结构，自动转换：
 
-| 概念 | Anthropic 格式 | 转换 |
-|------|----------------|------|
-| 系统提示 | 顶层 `system` 字段 | 自动转为 OpenAI `system` 消息 |
-| 工具结果 | `user` 消息中的 `tool_result` 块 | 自动转为 `role: "tool"` |
-| 工具定义 | `input_schema` | 自动映射为 `parameters` |
-| `tool_choice` | `{type:"auto"/"any"/"tool"}` | `any`→`required`，`tool`→function 对象 |
-| 推理 | `thinking.budget_tokens` | 自动映射 `reasoning_effort`（≥10000→high，≥5000→medium，≥2000→low） |
-| 停止原因 | `end_turn`/`max_tokens`/`tool_use` | 由 CC finish reason 映射 |
+| Anthropic | 处理 |
+|-----------|------|
+| `system`（字符串 / blocks） | → OpenAI `system` 消息 |
+| `user` 块中的 `tool_result` | → `role: "tool"` 消息 |
+| `tools[].input_schema` | → `parameters` |
+| `tool_choice: auto / any / tool / none` | → `auto / required / {function} / none` |
+| `thinking.budget_tokens` | → `reasoning_effort`（≥10000 high，≥5000 medium，≥2000 low） |
+| `thinking.type: adaptive` | → `reasoning_effort: effort` |
+| CC `finishReason` | → `end_turn / max_tokens / tool_use` |
+
+流式输出 `message_start / content_block_* / message_delta / message_stop`；
+`thinking` 块会带一个合成 `signature`，满足严格 SDK 的校验。
 
 ### `GET /v1/models`
 
-返回可用模型列表。优先从 Provider API 动态获取（5 分钟缓存），失败时回退到内置列表。
+用你的 Key 请求 `GET {CC_API_BASE}/provider/v1/models`（10s 超时），按
+`CC_MODEL_REFRESH_INTERVAL_MS` 缓存。任何失败都回退到 `src/models.ts` 内置列表。
+`CC_USE_PROVIDER_MODELS=false` 则始终用内置列表。
 
-### `GET /health`
+## 配置
 
-健康检查，返回 JSON `{"ok":true}`（供内置 `server healthcheck` CLI / Docker HEALTHCHECK 使用）。
+优先级（低 → 高）：**内置默认值 → `config.json` → `.env` / 环境变量**。
+Bun 启动时自动加载 `.env`。空值 = 沿用 `config.json`；真实 shell 变量优先于 `.env`。
 
-## 错误码
+`config.json` 放非敏感默认值（入库跟踪），`.env` 放密钥（git 忽略）。
 
-| HTTP 状态码 | 说明 |
-|-------------|------|
-| 400 | 请求格式错误 |
-| 401 | API Key 缺失 / 格式非法 / 被拒绝（需 `user_` 前缀） |
-| 413 | 请求体超过大小上限 |
-| 429 | 零输出 token 或空闲超时（流式 30s / 非流式 90s）——SDK 会按 `Retry-After` 自动重试；连续 3 次超时后返回"压缩上下文"提示 |
-| 502 | CC 上游错误 |
+| 变量 | `config.json` 键 | 默认值 |
+|------|------------------|--------|
+| `PORT` | `port` | `3050` |
+| `HOST` | `host` | `0.0.0.0` |
+| `CC_API_BASE` | `apiBase` | `https://api.commandcode.ai` |
+| `CC_API_KEY` | `apiKey` | `""`（无兜底） |
+| `PROJECT_SLUG` | `projectSlug` | `cc-proxy` |
+| `LOG_FILE` | `logFile` | `""`（仅控制台） |
+| `LOG_LEVEL` | `logLevel` | `info` |
+| `CC_USE_PROVIDER_MODELS` | `useProviderModels` | `true` |
+| `CC_MODEL_REFRESH_INTERVAL_MS` | `modelRefreshIntervalMs` | `300000` |
+| `CMD_ZDR` | `zdr` | `false` |
+| `CC_MAX_BODY_MB` | ——（仅环境变量） | `100` |
 
-## Docker 部署
+### API Key
 
-应用会先被 `bun build --compile` 编译成**单个可执行文件**，再在 distroless 基础镜像上运行（无 shell、无包管理器）。内置 `healthcheck` CLI 子命令用于容器健康检查。
-
-镜像内不内置 `.env` 文件。`docker compose` 通过 `env_file` 注入你本地的 `.env`（兜底 Key 等参数从容器环境读取），或显式传参：
+优先用请求自带的 Key：`Authorization: Bearer user_xxx` 或 `x-api-key: user_xxx`
+（须匹配 `user_[A-Za-z0-9_-]+`）。缺失/非法时回退到 `CC_API_KEY`：
 
 ```bash
-docker compose up -d                # 监听 0.0.0.0:3050
+CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64
+```
+
+留空 = 关闭兜底，无 Key 请求返回 `401`。请求自带的 Key 永远优先。
+即使 `CMD_ZDR` 未开启，单个请求带 `x-cmd-zdr: 1` 头也可走 ZDR 路由。
+
+超限包体（> `CC_MAX_BODY_MB`）直接 `413` 拒绝。
+
+## 错误与重试
+
+| 状态码 | 场景 | 客户端动作 |
+|--------|------|------------|
+| `400` | JSON 非法 / 请求结构错误 | 修正请求 |
+| `401` | 缺 Key、`user_` 格式错误、上游 401/403 | 检查 Key |
+| `413` | 包体超限 | 缩小请求体 |
+| `429` | 零输出（`retry_after: 10`）、空闲超时（`retry_after: 5`） | SDK 按 `Retry-After` 自动重试；连续 3 次超时后提示压缩上下文 |
+| `502/503` | CC 上游错误（由 CC 状态/事件映射） | 重试 / 退避 |
+
+上游映射（`src/errors.ts`）：CC `402/429` → `429`，`401/403` → `401`，
+`400/422` → `400`，`500/502` → `502`，`503` → `503`。CC 的 `tool-calls`
+在流式与非流式路径统一归一化为 OpenAI `tool_calls` / Anthropic `tool_use`。
+
+客户端断开（`request.signal`）会立刻 abort 上游 `fetch`，未完成的流直接关闭，不泄漏连接。
+
+## CLI 仿真原理
+
+按 API Key，在首次调用上游前（之后约每 8h）执行：
+
+1. `POST /alpha/fingerprint/record` ——随机但合理的可信指纹（SHA-256 哈希的机器/MAC/用户/主机名、CPU 池、内存、时区、`win32/x64`），与 Key 绑定。
+2. `POST /alpha/lifecycle-events`（`cli_session_exists`）——与指纹并行发送。
+
+每次 `POST /alpha/generate` 携带 `Authorization`、`x-cli-environment: production`、
+`x-command-code-version`（npm `command-code@latest`，每天刷新）、`x-session-id`
+（按 Key 12h 会话，可经 `x-session-id` / `prompt_cache_key` 复用）、`x-project-slug`、
+`traceparent`（W3C），以及可选的 `x-cmd-zdr: 1`。
+
+## 项目结构
+
+```
+.
+├── config.json            # 非敏感默认值（入库跟踪）
+├── .env.example           # 本地密钥模板（复制为 .env）
+├── src/
+│   ├── index.ts           # 路由、CORS、错误映射、启动、healthcheck CLI
+│   ├── config.ts          # config.json + 环境变量解析、包体上限
+│   ├── openai.ts          # POST /v1/chat/completions（流式 + 非流式）
+│   ├── anthropic.ts       # POST /v1/messages + Anthropic↔OpenAI 转换
+│   ├── cc.ts              # CC 请求构建 + 转发（/alpha/generate）
+│   ├── sse.ts             # SSE 管道 + CC NDJSON → OpenAI chunk
+│   ├── fingerprint.ts     # 指纹池 + 初始化预请求（按 Key）
+│   ├── session.ts         # 按 Key 会话 + 每小时清理
+│   ├── models.ts          # 模型列表 + Provider API 缓存
+│   ├── errors.ts          # 状态码/错误/finish reason/usage 映射
+│   ├── http.ts            # JSON/SSE 工具、包体读取、超时读取
+│   ├── auth.ts            # Bearer / x-api-key 提取 + 兜底
+│   ├── runtime.ts         # 空闲超时 + 连续超时计数
+│   ├── version.ts         # 从 npm registry 取 CC 版本号
+│   ├── util.ts            # ID、哈希、slug、traceparent
+│   └── logger.ts          # 控制台（+ 可选文件）日志
+├── test/
+│   ├── e2e.ts             # 对 mock 上游的集成测试
+│   └── timeouts.ts        # 空闲超时 + 断连测试（约 35s）
+├── Dockerfile             # bun --compile → distroless
+├── docker-compose.yml     # 本地运行（用 .env）
+├── docker-compose.prod.yml# 生产运行（ghcr.io 镜像，环境变量驱动）
+└── .github/workflows/
+    ├── release.yml        # 打 tag + 交叉编译 6 个二进制 → Release 草稿
+    └── deploy.yml         # 生产部署
+```
+
+## Docker
+
+想用容器？镜像就是跑在 distroless 上的同一个单二进制（无 shell）。
+只内置 `config.json`，密钥全部走环境变量：
+
+```bash
+# 本地容器（通过 env_file 注入 ./.env）
+docker compose up -d
 PROXY_PORT=13050 docker compose up -d
+
+# 手动
+docker build -t commandcode-proxy:latest .
+docker run -d -p 3050:3050 --env-file .env commandcode-proxy:latest
 ```
 
-或手动构建（密钥用 `-e`/`--env-file` 传入，切勿打进镜像）：
+健康检查用内嵌 CLI（`GET /health` 返回 `{"ok":true}` 时退出码为 0）：
 
 ```bash
-docker build -t commandcode-proxy-elysia:latest .
-docker run -d -p 3050:3050 --env-file .env commandcode-proxy-elysia:latest
+/app/server healthcheck
 ```
 
-容器内只提供 `config.json`（`.env` 留在宿主机 / 通过环境变量注入）。运行时配置从 `process.cwd()`（`/app`）解析——见 `src/config.ts` 的 `candidateDirs`。
+## 开发
 
-### 单二进制 / healthcheck
-
-脱离 Docker 直接运行或构建：
+需要 [Bun](https://bun.sh) 1.1+。源码运行与测试才用 `bun run` 脚本：
 
 ```bash
-bun run src/index.ts              # 启动（开发用 bun run dev 监听）
-bun build ./src/index.ts --compile --minify --outfile server
-./server                          # 启动
-./server healthcheck              # /health 返回 {"ok":true} 时退出码 0，否则 1
+bun install
+cp .env.example .env   # 填入 CC_API_KEY（可选）
+bun start              # 从源码运行 → http://0.0.0.0:3050
+bun run dev            # 监听模式（自动重载）
 ```
 
-`/health` 返回 `{"ok":true}`，因此 `server healthcheck` 可在 distroless 中充当 Docker HEALTHCHECK。
-
-### GitHub Releases / 预编译二进制
-
-每次推送到 `master`（非文档改动）都会触发 **Release** 工作流（`.github/workflows/release.yml`）：自动将最新的 `v*.*.*` tag 递增**补丁版本**（`v1.0.0` → `v1.0.1` → …），用 Bun 的 `--target` 交叉编译 6 个平台的单文件二进制，并生成一个 GitHub Release 草稿：
-
-| 平台 | 产物 |
-|------|------|
-| Linux x64 | `cc-p-linux-x64` |
-| Linux arm64 | `cc-p-linux-arm64` |
-| Windows x64 | `cc-p-windows-x64.exe` |
-| Windows arm64 | `cc-p-windows-arm64.exe` |
-| macOS x64 | `cc-p-darwin-x64` |
-| macOS arm64 | `cc-p-darwin-arm64` |
-
-每个二进制都内置了仓库的 `config.json` 作为默认配置，开箱即监听 `0.0.0.0:3050`；如需覆盖，请把你的 `config.json` / `.env` 放到**可执行文件同目录**（或直接导出环境变量）。
-
-**版本管理：**
-
-- **补丁（自动）：** 推送代码到 `master` → 自动打 `v1.2.3` → `v1.2.4` tag 并发布。纯文档提交（`*.md`、`docs/`）跳过。
-- **次要/主版本（手动）：** 打开 **Actions → Release → Run workflow**，选择 `minor`（`v1.2.3` → `v1.3.0`）或 `major`（`v1.2.3` → `v2.0.0`）。
-- **指定版本：** 选择 `custom` 并输入精确版本，如 `2.0.0`。
-- 在已存在的 tag 上重新运行工作流，会向该 tag 的 Release 重新上传产物，而不是创建重复 Release。
-
-本地构建同样的 6 个二进制：
+Mock 上游，无真实 API 调用：
 
 ```bash
-for t in bun-linux-x64 bun-linux-arm64 bun-windows-x64 bun-windows-arm64 bun-darwin-x64 bun-darwin-arm64; do
-  bun build ./src/index.ts --compile --production --minify \
-    --target "$t" --asset config.json --outfile "dist/cc-p-${t#bun-}"
-done
+bun run test            # e2e（协议、流式、错误）
+bun run test:timeouts   # 空闲超时 + 客户端断连
+bunx tsc --noEmit       # 类型检查（CI 同样会跑）
 ```
 
-## 测试
-
-测试套件会启动一个模拟 Command Code 上游（不产生真实 API 调用），覆盖协议转换、流式、错误映射、超时与断连处理：
+自己打二进制：
 
 ```bash
-bun test                 # 66 项断言的 e2e 套件
-bun run test:timeouts    # 空闲超时（约 35 秒）+ 断连套件
+bun build ./src/index.ts --compile --minify --outfile server && ./server
+./server healthcheck
 ```
 
-## 移植说明（相对 Node 单文件原版）
-
-- 2000 行单文件 `proxy.mjs` 拆分为 `src/` 下的职责单一模块。
-- `http.createServer` + 手写路由 → Elysia 路由；Node `res` 流式写 → `ReadableStream` 响应 + 延迟发头管道（尚未输出内容时仍可返回 JSON 错误让 SDK 重试）。
-- 客户端断连检测使用 Bun 的 `request.signal`（挂断时触发），替代 `res.on('close')`。
-- 请求体限长在 `readJsonBody` 重新实现（content-length 快速路径 + 流式计数 + keep-alive 排空，保持原 413 行为）。
-- Node `crypto`/`fs` 替换为 `Bun.CryptoHasher`/Web Crypto/`node:fs/promises`。
-- **Bug 修复**：原版 Anthropic *流式* 路径把 CC 的连字符 `tool-calls` finish reason 直接传给 `mapAnthropicStopReason`（其只识别 `tool_calls`），导致流式工具调用上报 `stop_reason: end_turn`。移植版先做归一化（`tool-calls` → `tool_calls` → `tool_use`），与文档及非流式路径一致。
+推送到 `master`（非文档改动）会触发 **Release** 工作流：类型检查 + e2e 测试、
+按最新 `v*.*.*` tag 递增补丁版本、交叉编译 6 个平台二进制、生成带 SHA-256
+校验的 GitHub Release 草稿。`minor` / `major` / `custom` 通过
+**Actions → Release → Run workflow** 手动触发。
 
 ## 免责声明
 
-本项目仅供**学习和研究**用途。
-
-- **非官方**：本项目与 Command Code 无任何关联。
-- **个人使用**：使用者自行承担所有责任，请遵守 [Command Code 服务条款](https://commandcode.ai/tos)。
-- **API Key**：本项目不收集、不上传、不泄露你的 API Key。Key 通过 `Authorization: Bearer <key>` 或 `x-api-key` 请求头按请求传入，不会被记录日志。
-- **合规性**：协议基于对本地 CLI 网络流量的被动观察，未对服务器进行任何未授权访问、破解或篡改。
-- **账号风险**：请保持与正常 CLI 使用一致的调用频率，极高并发可能触发风控。
+本项目仅供**学习和研究**用途，与 Command Code 无任何关联。使用即表示你会遵守
+[Command Code 服务条款](https://commandcode.ai/tos)。Key 经请求头按次传入，
+不会被记录日志。请保持与正常 CLI 一致的调用频率，避免触发风控。
