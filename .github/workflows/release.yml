@@ -4,7 +4,7 @@ name: Release
 #
 # - On every push to master: bumps the *patch* version (v1.0.0 -> v1.0.1 -> ...)
 #   using the latest reachable `v*.*.*` tag as base, then creates that tag and
-#   drafts a Release with the 6 cross-compiled binaries.
+#   publishes a Release with the 6 cross-compiled binaries.
 # - Manual "Run workflow" for major/minor releases: pick minor/major (auto
 #   bumps the middle/leading digit) or custom (type an exact version like 2.0.0).
 # - To skip a release, push a commit whose only changes are docs / *.md.
@@ -272,7 +272,7 @@ jobs:
         shell: bash
         run: (cd dist && sha256sum * > SHA256SUMS.txt)
 
-      - name: Create or update draft release
+      - name: Create or update release
         id: gh_release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -284,9 +284,8 @@ jobs:
             echo "Release for $TAG exists - updating its assets."
             gh release upload "$TAG" dist/* --clobber
           else
-            echo "Creating draft release $TAG."
+            echo "Creating release $TAG."
             gh release create "$TAG" dist/* \
-              --draft \
               --title "$TAG" \
               --notes-file notes.md
           fi
