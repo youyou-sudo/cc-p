@@ -56,7 +56,6 @@ export class BodyTooLargeError extends Error {
 }
 
 const DRAIN_LIMIT = 32 * 1024 * 1024
-const sharedDecoder = new TextDecoder()
 
 export async function readJsonBody(request: Request): Promise<any> {
   const contentLength = Number(request.headers.get('content-length') ?? '')
@@ -68,6 +67,7 @@ export async function readJsonBody(request: Request): Promise<any> {
   if (!reader) throw new Error('Invalid JSON')
 
   const chunks: Uint8Array[] = []
+  const decoder = new TextDecoder()
   let totalSize = 0
   let tooLarge = false
   let drained = 0
@@ -93,7 +93,7 @@ export async function readJsonBody(request: Request): Promise<any> {
   }
   if (tooLarge) throw new BodyTooLargeError()
 
-  const text = chunks.map((c) => sharedDecoder.decode(c, { stream: true })).join('') + sharedDecoder.decode()
+  const text = chunks.map((c) => decoder.decode(c, { stream: true })).join('') + decoder.decode()
   try {
     return JSON.parse(text)
   } catch {
