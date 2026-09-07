@@ -41,10 +41,13 @@ export const MODELS: ModelEntry[] = [
 
 let dynamicModels: ModelEntry[] | null = null
 let modelsLastFetch = 0
-let inFlightModelsFetch: Promise<ModelEntry[]> | null = null
 
-async function doFetchModels(apiKey?: string | null): Promise<ModelEntry[]> {
+export async function fetchModels(apiKey?: string | null): Promise<ModelEntry[]> {
   const now = Date.now()
+  if (dynamicModels && now - modelsLastFetch < CFG.modelRefreshIntervalMs) {
+    return dynamicModels
+  }
+
   try {
     if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled')
 
@@ -73,19 +76,6 @@ async function doFetchModels(apiKey?: string | null): Promise<ModelEntry[]> {
   }
 
   return MODELS
-}
-
-export function fetchModels(apiKey?: string | null): Promise<ModelEntry[]> {
-  const now = Date.now()
-  if (dynamicModels && now - modelsLastFetch < CFG.modelRefreshIntervalMs) {
-    return Promise.resolve(dynamicModels)
-  }
-  if (!inFlightModelsFetch) {
-    inFlightModelsFetch = doFetchModels(apiKey).finally(() => {
-      inFlightModelsFetch = null
-    })
-  }
-  return inFlightModelsFetch
 }
 
 export async function handleModels(headers: Record<string, string | undefined>): Promise<Response> {

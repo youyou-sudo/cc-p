@@ -7,7 +7,7 @@ import { SSE_HEADERS, readWithTimeout, sendJSON } from './http'
 import { log } from './logger'
 import { callUpstream, createUpstreamFlow, readRequestJson } from './proxy-handler'
 import type { JsonParseErrorKind } from './proxy-handler'
-import { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, recordRequestSuccess, recordRequestTimeout, timeoutMessage } from './runtime'
+import { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, runtimeState, timeoutMessage } from './runtime'
 import { createSseTranslator, SsePipeline } from './sse'
 import { nowUnix, uuid } from './util'
 
@@ -134,7 +134,7 @@ export async function handleChatCompletions(request: Request, headers: Record<st
                 pipeline.writeNow(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })}\n\n`)
               }
             } else {
-              recordRequestSuccess(apiKey)
+              runtimeState.consecutiveTimeouts = 0
               pipeline.emit([translator.getDoneEvent()])
             }
           }
@@ -157,10 +157,10 @@ export async function handleChatCompletions(request: Request, headers: Record<st
             })
             reader.cancel().catch(() => {})
             try { abortController.abort() } catch {}
-            recordRequestTimeout(apiKey)
+            runtimeState.consecutiveTimeouts++
             state.timedOut = true
             if (pipeline.started) {
-              pipeline.writeNow(`data: ${JSON.stringify({ error: { message: timeoutMessage(apiKey), type: 'rate_limit_error' }, retry_after: 5 })}\n\n`)
+              pipeline.writeNow(`data: ${JSON.stringify({ error: { message: timeoutMessage(), type: 'rate_limit_error' }, retry_after: 5 })}\n\n`)
             }
           } else {
             state.errorMsg = e?.message ?? String(e)
@@ -188,7 +188,7 @@ export async function handleChatCompletions(request: Request, headers: Record<st
           return sendJSON(state.upstreamError.status, state.upstreamError.body)
         }
         if (state.timedOut) {
-          return sendJSON(429, { error: { message: timeoutMessage(apiKey), type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 })
+          return sendJSON(429, { error: { message: timeoutMessage(), type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 })
         }
         if (state.zeroOutput || !state.errorMsg) {
           return sendJSON(429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })
@@ -262,8 +262,8 @@ export async function handleChatCompletions(request: Request, headers: Record<st
         })
         reader.cancel().catch(() => {})
         try { abortController.abort() } catch {}
-        recordRequestTimeout(apiKey)
-        return sendJSON(429, { error: { message: timeoutMessage(apiKey), type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 })
+        runtimeState.consecutiveTimeouts++
+        return sendJSON(429, { error: { message: timeoutMessage(), type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 })
       }
       log('error', 'Upstream error', { message: e?.message })
       try { abortController.abort() } catch {}
@@ -283,7 +283,7 @@ export async function handleChatCompletions(request: Request, headers: Record<st
       return sendJSON(429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })
     }
 
-    recordRequestSuccess(apiKey)
+    runtimeState.consecutiveTimeouts = 0
     return sendJSON(200, {
       id: completionId,
       object: 'chat.completion',

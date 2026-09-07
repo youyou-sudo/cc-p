@@ -5,7 +5,6 @@ import { log } from './logger'
 import { handleMessages } from './anthropic'
 import { handleModels, MODELS } from './models'
 import { handleChatCompletions } from './openai'
-import { startKeyStateCleanup } from './fingerprint'
 import { startSessionCleanup } from './session'
 import { startVersionRefresh } from './version'
 
@@ -19,7 +18,6 @@ function jsonResponse(status: number, body: any): Response {
 export function startServer() {
   startVersionRefresh()
   startSessionCleanup()
-  startKeyStateCleanup()
 
   const app = new Elysia()
     .onRequest(({ request, set }) => {

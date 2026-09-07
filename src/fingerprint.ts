@@ -95,56 +95,21 @@ export function generateFingerprint(): Fingerprint {
 export interface KeyState {
   fingerprint: Fingerprint
   nextInitAt: number
-  lastUsedAt: number
 }
-
-const KEY_STATE_TTL_MS = 24 * 60 * 60 * 1000
-const KEY_STATE_MAX_ENTRIES = 10_000
 
 export const keyStateStore = new Map<string, KeyState>()
 
 export function getOrCreateKeyState(apiKey: string): KeyState {
-  const now = Date.now()
   let state = keyStateStore.get(apiKey)
   if (!state) {
     state = {
       fingerprint: generateFingerprint(),
       nextInitAt: 0,
-      lastUsedAt: now,
     }
     keyStateStore.set(apiKey, state)
     log('info', 'Fingerprint generated for key', { keyPrefix: apiKey.slice(0, 8) })
-    return state
   }
-  state.lastUsedAt = now
-  keyStateStore.delete(apiKey)
-  keyStateStore.set(apiKey, state)
   return state
-}
-
-export function pruneKeyStates(): number {
-  const now = Date.now()
-  let removed = 0
-  for (const [key, state] of keyStateStore) {
-    if (now - state.lastUsedAt > KEY_STATE_TTL_MS) {
-      keyStateStore.delete(key)
-      removed++
-    }
-  }
-  while (keyStateStore.size > KEY_STATE_MAX_ENTRIES) {
-    const oldest = keyStateStore.keys().next().value
-    if (oldest === undefined) break
-    keyStateStore.delete(oldest)
-    removed++
-  }
-  return removed
-}
-
-export function startKeyStateCleanup(): void {
-  setInterval(() => {
-    const removed = pruneKeyStates()
-    if (removed > 0) log('info', 'Key state cleanup', { removed, remaining: keyStateStore.size })
-  }, 60 * 60 * 1000)
 }
 
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000

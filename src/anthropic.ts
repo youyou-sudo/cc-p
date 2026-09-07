@@ -7,18 +7,12 @@ import { SSE_HEADERS, readWithTimeout, sendAnthropicError, sendJSON } from './ht
 import { log } from './logger'
 import { callUpstream, createUpstreamFlow, readRequestJson } from './proxy-handler'
 import type { JsonParseErrorKind } from './proxy-handler'
-import { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, recordRequestSuccess, recordRequestTimeout, timeoutMessage } from './runtime'
+import { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, runtimeState, timeoutMessage } from './runtime'
 import { SsePipeline } from './sse'
 import { bytesToBase64, sha256bytes, uuid } from './util'
 
-const PLACEHOLDER_THINKING_SIGNATURE = (() => {
-  const seed = sha256bytes('dsh-proxy-thinking').slice(0, 64)
-  return bytesToBase64(new Uint8Array([0x12, seed.length, ...seed]))
-})()
-
 export function fakeThinkingSignature(thinkingText: string): string {
-  if (!thinkingText) return PLACEHOLDER_THINKING_SIGNATURE
-  const seed = sha256bytes(thinkingText).slice(0, 64)
+  const seed = sha256bytes(thinkingText || 'dsh-proxy-thinking').slice(0, 64)
   const raw = new Uint8Array([0x12, seed.length, ...seed])
   return bytesToBase64(raw)
 }
@@ -50,9 +44,6 @@ export function convertAnthropicToOpenAI(anthropicReq: any): any {
       const toolCalls: any[] = []
       const blocks = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content || '' }]
       for (const block of blocks) {
-        if (block.type === 'thinking' || block.type === 'redacted_thinking') {
-          continue
-        }
         if (block.type === 'text') {
           textContent += block.text || ''
         } else if (block.type === 'tool_use') {
@@ -77,9 +68,6 @@ export function convertAnthropicToOpenAI(anthropicReq: any): any {
         textContent = msg.content
       } else if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
-          if (block.type === 'thinking' || block.type === 'redacted_thinking') {
-            continue
-          }
           if (block.type === 'text') {
             textContent += block.text || ''
           } else if (block.type === 'tool_result') {
@@ -444,7 +432,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
           }
 
           if (!aborted()) {
-            recordRequestSuccess(apiKey)
+            runtimeState.consecutiveTimeouts = 0
             if (ctx.upstreamError) {
               state.upstreamError = ctx.upstreamError
             } else if (ctx.outputTokens === 0) {
@@ -471,10 +459,10 @@ export async function handleMessages(request: Request, headers: Record<string, s
               cachedInputTokens: ctx.cachedInputTokens,
             })
             try { abortController.abort() } catch {}
-            recordRequestTimeout(apiKey)
+            runtimeState.consecutiveTimeouts++
             state.timedOut = true
             if (pipeline.started) {
-              pipeline.writeNow(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMessage(apiKey) }, retry_after: 5 })}\n\n`)
+              pipeline.writeNow(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMessage() }, retry_after: 5 })}\n\n`)
             }
           } else {
             state.errorMsg = e?.message ?? String(e)
@@ -502,7 +490,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
           return sendAnthropicError(state.upstreamError.status, state.upstreamError.body.error.type, state.upstreamError.body.error.message)
         }
         if (state.timedOut) {
-          return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(apiKey))
+          return sendAnthropicError(429, 'rate_limit_error', timeoutMessage())
         }
         if (state.zeroOutput) {
           return sendAnthropicError(429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', { retryAfter: 10 })
@@ -579,8 +567,8 @@ export async function handleMessages(request: Request, headers: Record<string, s
         })
         reader.cancel().catch(() => {})
         try { abortController.abort() } catch {}
-        recordRequestTimeout(apiKey)
-        return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(apiKey), { retryAfter: 5, headerOnly: true })
+        runtimeState.consecutiveTimeouts++
+        return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(), { retryAfter: 5, headerOnly: true })
       }
       log('error', 'Upstream error', { message: e?.message })
       try { abortController.abort() } catch {}
@@ -600,7 +588,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
       return sendAnthropicError(429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', { retryAfter: 10 })
     }
 
-    recordRequestSuccess(apiKey)
+    runtimeState.consecutiveTimeouts = 0
     return sendJSON(200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText))
   } catch (e: any) {
     if (aborted() || abortController.signal.aborted) {
