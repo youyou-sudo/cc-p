@@ -250,7 +250,7 @@ jobs:
           : > notes.md
           printf '## Install\n\n' >> notes.md
           printf 'Single-file executables (cross-compiled with Bun). Run one next to\n' >> notes.md
-          printf 'your own \`config.json\` / \`.env\`; builtin defaults (port 3050 on\n' >> notes.md
+          printf 'your own `config.json` / `.env`; builtin defaults (port 3050 on\n' >> notes.md
           printf '0.0.0.0) apply when neither is present.\n\n' >> notes.md
           printf '| Platform | Asset | SHA-256 |\n|---|---|---|\n' >> notes.md
           (cd dist && for f in *; do
@@ -266,7 +266,7 @@ jobs:
              printf '| %-9s | \`%s\` | \`%s\` |\n' "$os $arch" "$f" "$(sha256sum "$f" | cut -d' ' -f1)"
            done >> ../notes.md)
           printf '\nVerify any download with:\n\n' >> notes.md
-          printf '\`\`\`sh\nsha256sum -c SHA256SUMS.txt\n\`\`\`\n' >> notes.md
+          printf '```sh\nsha256sum -c SHA256SUMS.txt\n```\n' >> notes.md
 
       - name: Checksums
         shell: bash
