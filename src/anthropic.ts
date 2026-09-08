@@ -7,7 +7,7 @@ import { SSE_HEADERS, readWithTimeout, sendAnthropicError, sendJSON } from './ht
 import { log } from './logger'
 import { callUpstream, createUpstreamFlow, readRequestJson } from './proxy-handler'
 import type { JsonParseErrorKind } from './proxy-handler'
-import { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, runtimeState, timeoutMessage } from './runtime'
+import { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, recordTimeout, recordTimeoutSuccess, timeoutMessage } from './runtime'
 import { SsePipeline } from './sse'
 import { bytesToBase64, sha256bytes, uuid } from './util'
 
@@ -333,7 +333,7 @@ export async function* createAnthropicSseTranslator(
       if (close) yield close
 
       if (outputTokens === 0) {
-        yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Empty response from upstream (zero output tokens)' }, retry_after: 10 })}\n\n`
+        yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: 'Empty response from upstream (zero output tokens)' }, retry_after: 10 })}\n\n`
       } else {
         yield `event: message_delta\ndata: ${JSON.stringify({
           type: 'message_delta',
@@ -423,7 +423,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
             if (aborted()) break
             if (!pipeline.started) {
               pipeline.emit([event])
-              if (event.includes('"text_delta"') || event.includes('"tool_use"')) {
+              if (event.includes('"text_delta"') || event.includes('"tool_use"') || event.includes('"thinking_delta"')) {
                 pipeline.start()
               }
             } else {
@@ -432,7 +432,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
           }
 
           if (!aborted()) {
-            runtimeState.consecutiveTimeouts = 0
+            recordTimeoutSuccess(apiKey)
             if (ctx.upstreamError) {
               state.upstreamError = ctx.upstreamError
             } else if (ctx.outputTokens === 0) {
@@ -459,10 +459,10 @@ export async function handleMessages(request: Request, headers: Record<string, s
               cachedInputTokens: ctx.cachedInputTokens,
             })
             try { abortController.abort() } catch {}
-            runtimeState.consecutiveTimeouts++
+            recordTimeout(apiKey)
             state.timedOut = true
             if (pipeline.started) {
-              pipeline.writeNow(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMessage() }, retry_after: 5 })}\n\n`)
+              pipeline.writeNow(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMessage(apiKey) }, retry_after: 5 })}\n\n`)
             }
           } else {
             state.errorMsg = e?.message ?? String(e)
@@ -490,7 +490,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
           return sendAnthropicError(state.upstreamError.status, state.upstreamError.body.error.type, state.upstreamError.body.error.message)
         }
         if (state.timedOut) {
-          return sendAnthropicError(429, 'rate_limit_error', timeoutMessage())
+          return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(apiKey))
         }
         if (state.zeroOutput) {
           return sendAnthropicError(429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', { retryAfter: 10 })
@@ -567,8 +567,8 @@ export async function handleMessages(request: Request, headers: Record<string, s
         })
         reader.cancel().catch(() => {})
         try { abortController.abort() } catch {}
-        runtimeState.consecutiveTimeouts++
-        return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(), { retryAfter: 5, headerOnly: true })
+        recordTimeout(apiKey)
+        return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(apiKey), { retryAfter: 5, headerOnly: true })
       }
       log('error', 'Upstream error', { message: e?.message })
       try { abortController.abort() } catch {}
@@ -588,7 +588,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
       return sendAnthropicError(429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', { retryAfter: 10 })
     }
 
-    runtimeState.consecutiveTimeouts = 0
+    recordTimeoutSuccess(apiKey)
     return sendJSON(200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText))
   } catch (e: any) {
     if (aborted() || abortController.signal.aborted) {

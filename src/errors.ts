@@ -1,7 +1,7 @@
 export const CC_STATUS_MAP: Record<number, { status: number; type: string }> = {
   400: { status: 400, type: 'invalid_request_error' },
   401: { status: 401, type: 'authentication_error' },
-  402: { status: 429, type: 'rate_limit_error' },
+  402: { status: 402, type: 'payment_required' },
   403: { status: 401, type: 'authentication_error' },
   404: { status: 404, type: 'not_found' },
   422: { status: 400, type: 'invalid_request_error' },

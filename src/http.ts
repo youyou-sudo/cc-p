@@ -58,7 +58,7 @@ export class BodyTooLargeError extends Error {
 const DRAIN_LIMIT = 32 * 1024 * 1024
 const sharedDecoder = new TextDecoder()
 
-export async function readJsonBody(request: Request): Promise<any> {
+export async function readJsonBody(request: Request, timeoutMs: number = 30000): Promise<any> {
   const contentLength = Number(request.headers.get('content-length') ?? '')
   if (Number.isFinite(contentLength) && contentLength > MAX_BODY_SIZE) {
     throw new BodyTooLargeError()
@@ -72,8 +72,27 @@ export async function readJsonBody(request: Request): Promise<any> {
   let tooLarge = false
   let drained = 0
 
+  const readWithTimeout = async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
+    return Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('READ_TIMEOUT')), timeoutMs))
+    ])
+  }
+
   while (true) {
-    const { done, value } = await reader.read()
+    let done: boolean
+    let value: Uint8Array
+    try {
+      const result = await readWithTimeout()
+      done = result.done
+      value = result.value
+    } catch (e: any) {
+      if (e.message === 'READ_TIMEOUT') {
+        try { reader.cancel() } catch {}
+        throw new Error('Request read timeout')
+      }
+      throw e
+    }
     if (done) break
     if (tooLarge) {
       drained += value.byteLength
