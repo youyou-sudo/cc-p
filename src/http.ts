@@ -72,28 +72,19 @@ export async function readJsonBody(request: Request, timeoutMs: number = 30000):
   let tooLarge = false
   let drained = 0
 
-  const readWithTimeout = async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
-    return Promise.race([
-      reader.read(),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('READ_TIMEOUT')), timeoutMs))
-    ])
-  }
-
   while (true) {
-    let done: boolean
-    let value: Uint8Array
+    let result: { done: boolean; value?: Uint8Array }
     try {
-      const result = await readWithTimeout()
-      done = result.done
-      value = result.value
+      result = await readWithTimeout(reader.read(), timeoutMs, 'READ_BODY_TIMEOUT')
     } catch (e: any) {
-      if (e.message === 'READ_TIMEOUT') {
+      if (e.message === 'READ_BODY_TIMEOUT') {
         try { reader.cancel() } catch {}
         throw new Error('Request read timeout')
       }
       throw e
     }
-    if (done) break
+    if (result.done) break
+    const value = result.value!
     if (tooLarge) {
       drained += value.byteLength
       if (drained > DRAIN_LIMIT) {
