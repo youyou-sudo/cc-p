@@ -69,7 +69,7 @@ export function buildCcRequest(openaiReq: any): any {
         content: [{
           type: 'tool-result',
           toolCallId: msg.tool_call_id,
-          toolName: toolNameMap[msg.tool_call_id] || msg.name || '',
+          toolName: msg.name || toolNameMap[msg.tool_call_id] || msg.tool_call_id || 'unknown_tool',
           output: { type: 'text', value: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) },
         }],
       }

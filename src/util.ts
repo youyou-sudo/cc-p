@@ -38,7 +38,7 @@ export function getDateStr(): string {
 }
 
 export function getEnvironment(): string {
-  return `${process.platform}-${process.arch}, Node.js ${process.versions.node}`
+  return 'win32-x64, Node.js 22.10.0'
 }
 
 export function tryParseJSON(str: string): any {

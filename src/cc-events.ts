@@ -34,6 +34,7 @@ export class CcStreamParser {
   unknownEvent: string | null = null
 
   private buffer = ''
+  private static readonly MAX_LINE_LENGTH = 64 * 1024
 
   constructor(private readonly decoder = new TextDecoder()) {}
 
@@ -41,6 +42,10 @@ export class CcStreamParser {
    *  fragments (SSE strings / lines) are returned in order. */
   push(bytes: Uint8Array, hooks: CcEventHooks): string[] {
     this.buffer += this.decoder.decode(bytes, { stream: true })
+    if (this.buffer.length > CcStreamParser.MAX_LINE_LENGTH) {
+      this.buffer = ''
+      return []
+    }
     const lines = this.buffer.split('\n')
     this.buffer = lines.pop() || ''
     const out: string[] = []
