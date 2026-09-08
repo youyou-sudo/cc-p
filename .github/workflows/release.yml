@@ -248,69 +248,62 @@ jobs:
         shell: bash
         run: |
           : > notes.md
-          printf '## What\'s Changed\\n\\n' >> notes.md
 
           # Generate changelog from commits since last tag
-          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          if [ -z "$LAST_TAG" ]; then
-            COMMITS=$(git log --pretty=format:"- %s (%h)" --no-merges)
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -n "$LAST_TAG" ]; then
+            git log "$LAST_TAG"..HEAD --pretty=format:"%s %h" --no-merges > /tmp/changelog.txt
           else
-            COMMITS=$(git log "$LAST_TAG"..HEAD --pretty=format:"- %s (%h)" --no-merges)
+            git log --pretty=format:"%s %h" --no-merges > /tmp/changelog.txt
           fi
 
           # Categorize commits
-          FEATURES=$(echo "$COMMITS" | grep -iE "^(- )?(feat|feature)" || true)
-          FIXES=$(echo "$COMMITS" | grep -iE "^(- )?(fix|bugfix|hotfix)" || true)
-          DOCS=$(echo "$COMMITS" | grep -iE "^(- )?(docs|doc)" || true)
-          REFACTOR=$(echo "$COMMITS" | grep -iE "^(- )?(refactor|refact)" || true)
-          SECURITY=$(echo "$COMMITS" | grep -iE "^(- )?(security|sec)" || true)
-          PERF=$(echo "$COMMITS" | grep -iE "^(- )?(perf|performance)" || true)
-          OTHER=$(echo "$COMMITS" | grep -ivE "^(- )?(feat|feature|fix|bugfix|hotfix|docs|doc|refactor|refact|security|sec|perf|performance)" || true)
+          FEATURES=$(grep -iE "(feat|feature)" /tmp/changelog.txt || true)
+          FIXES=$(grep -iE "(fix|bugfix|hotfix)" /tmp/changelog.txt || true)
+          DOCS=$(grep -iE "(docs|doc)" /tmp/changelog.txt || true)
+          REFACTOR=$(grep -iE "(refactor|refact)" /tmp/changelog.txt || true)
+          SECURITY=$(grep -iE "(security|sec)" /tmp/changelog.txt || true)
+          PERF=$(grep -iE "(perf|performance)" /tmp/changelog.txt || true)
+          OTHER=$(grep -ivE "(feat|feature|fix|bugfix|hotfix|docs|doc|refactor|refact|security|sec|perf|performance)" /tmp/changelog.txt || true)
 
-          if [ -n "$SECURITY" ]; then
-            printf '### :lock: Security\\n\\n' >> notes.md
-            printf '%s\\n\\n' "$SECURITY" >> notes.md
-          fi
+          writeSection() {
+            if [ -n "$2" ]; then
+              echo "### $1" >> notes.md
+              echo "$2" >> notes.md
+              echo "" >> notes.md
+            fi
+          }
 
-          if [ -n "$FEATURES" ]; then
-            printf '### :sparkles: New Features\\n\\n' >> notes.md
-            printf '%s\\n\\n' "$FEATURES" >> notes.md
-          fi
+          writeSection "Security" "$SECURITY"
+          writeSection "New Features" "$FEATURES"
+          writeSection "Bug Fixes" "$FIXES"
+          writeSection "Performance" "$PERF"
+          writeSection "Refactoring" "$REFACTOR"
+          writeSection "Documentation" "$DOCS"
+          writeSection "Other Changes" "$OTHER"
 
-          if [ -n "$FIXES" ]; then
-            printf '### :bug: Bug Fixes\\n\\n' >> notes.md
-            printf '%s\\n\\n' "$FIXES" >> notes.md
-          fi
+          # Write notes using heredoc to avoid escaping issues
+          cat > notes.md << 'NOTES_EOF'
+## What's Changed
 
-          if [ -n "$PERF" ]; then
-            printf ':zap: Performance\\n\\n' >> notes.md
-            printf '%s\\n\\n' "$PERF" >> notes.md
-          fi
+NOTES_EOF
 
-          if [ -n "$REFACTOR" ]; then
-            printf '### :recycle: Refactoring\\n\\n' >> notes.md
-            printf '%s\\n\\n' "$REFACTOR" >> notes.md
-          fi
+          # Installation section (heredoc avoids parenthesis/quote issues)
+          cat >> notes.md << 'INSTALL_EOF'
+## Installation
 
-          if [ -n "$DOCS" ]; then
-            printf '### :books: Documentation\\n\\n' >> notes.md
-            printf '%s\\n\\n' "$DOCS" >> notes.md
-          fi
+Single-file executables (cross-compiled with Bun). Run one next to
+your own config.json / .env. Builtin defaults (port 3050 on 0.0.0.0)
+apply when neither is present.
 
-          if [ -n "$OTHER" ]; then
-            printf '### :wrench: Other Changes\\n\\n' >> notes.md
-            printf '%s\\n\\n' "$OTHER" >> notes.md
-          fi
+## Assets
 
-          # Add installation section
-          printf '## Installation\\n\\n' >> notes.md
-          printf 'Single-file executables (cross-compiled with Bun). Run one next to\\n' >> notes.md
-          printf 'your own `config.json` / `.env`; builtin defaults (port 3050 on\\n' >> notes.md
-          printf '0.0.0.0) apply when neither is present.\\n\\n' >> notes.md
+| Platform | Asset | SHA-256 |
+|---|---|---|
 
-          # Add assets table
-          printf '## Assets\\n\\n' >> notes.md
-          printf '| Platform | Asset | SHA-256 |\\n|---|---|---|\\n' >> notes.md
+INSTALL_EOF
+
+          # Add asset rows
           (cd dist && for f in *; do
              case "$f" in
                *windows*) os="Windows" ;;
@@ -321,15 +314,24 @@ jobs:
                *x64*)    arch="x64" ;;
                *arm64*)  arch="arm64" ;;
              esac
-             printf '| %-9s | `%s` | `%s` |\\n' "$os $arch" "$f" "$(sha256sum "$f" | cut -d' ' -f1)"
-           done >> ../notes.md)
+             sha=$(sha256sum "$f" | cut -d " " -f1)
+             echo "| ${os} ${arch} | ${f} | ${sha} |" >> ../notes.md
+           done)
 
-          printf '\\nVerify any download with:\\n\\n' >> notes.md
-          printf '```sh\\nsha256sum -c SHA256SUMS.txt\\n```\\n' >> notes.md
+          # Verify line and changelog link
+          cat >> notes.md << 'FOOTER_EOF'
 
-          # Add full changelog link
-          printf '\\n**Full Changelog**: https://github.com/%s/compare/%s...%s\\n' \
-            "${{ github.repository }}" "${LAST_TAG:-HEAD~1}" "${{ needs.release.outputs.tag }}" >> notes.md
+Verify any download with:
+
+```sh
+sha256sum -c SHA256SUMS.txt
+```
+
+FOOTER_EOF
+
+          # Full changelog link
+          echo "" >> notes.md
+          echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${LAST_TAG:-HEAD~1}...${TAG}" >> notes.md
 
       - name: Checksums
         shell: bash
