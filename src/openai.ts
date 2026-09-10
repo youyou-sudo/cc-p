@@ -53,8 +53,10 @@ function rawUsageFromCcUsage(u: any): { input_tokens: number; output_tokens: num
 export async function handleChatCompletions(request: Request, headers: Record<string, string | undefined>): Promise<Response> {
   const parsed = await readRequestJson<any>(request, buildError)
   if (!parsed.ok) return parsed.response
-  const openaiReq = parsed.value
+  return handleChatCompletionsBody(parsed.value, headers, request.signal)
+}
 
+export async function handleChatCompletionsBody(openaiReq: any, headers: Record<string, string | undefined>, signal?: AbortSignal): Promise<Response> {
   const apiKey = getApiKey(headers)
   if (!apiKey) {
     return sendJSON(401, { error: { message: authErrorMessage(headers), type: 'auth_error' } })
@@ -71,7 +73,7 @@ export async function handleChatCompletions(request: Request, headers: Record<st
   // when the client sends no explicit session id (zero-cost, same as
   // forwardToCC's upstream session resolution for explicit ids).
   const sessionId = getSessionId(headers, apiKey, openaiReq.prompt_cache_key)
-  const flow = createUpstreamFlow(request)
+  const flow = createUpstreamFlow({ signal: signal ?? new AbortController().signal } as Request)
   const abortController = flow.controller
   const aborted = () => flow.aborted
   const startTime = Date.now()

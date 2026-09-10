@@ -409,8 +409,10 @@ function buildAnthropicError(kind: JsonParseErrorKind, message: string): Respons
 export async function handleMessages(request: Request, headers: Record<string, string | undefined>): Promise<Response> {
   const parsed = await readRequestJson<any>(request, buildAnthropicError)
   if (!parsed.ok) return parsed.response
-  const anthropicReq = parsed.value
+  return handleMessagesBody(parsed.value, headers, request.signal)
+}
 
+export async function handleMessagesBody(anthropicReq: any, headers: Record<string, string | undefined>, signal?: AbortSignal): Promise<Response> {
   const apiKey = getApiKey(headers)
   if (!apiKey) {
     return sendJSON(401, { type: 'error', error: { type: 'authentication_error', message: authErrorMessage(headers) } })
@@ -426,7 +428,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
   // session from misleading a small-context sub-agent on the same key.
   const sessionId = getSessionId(headers, apiKey, openaiReq.prompt_cache_key)
 
-  const flow = createUpstreamFlow(request)
+  const flow = createUpstreamFlow({ signal: signal ?? new AbortController().signal } as Request)
   const abortController = flow.controller
   const aborted = () => flow.aborted
   const startTime = Date.now()
