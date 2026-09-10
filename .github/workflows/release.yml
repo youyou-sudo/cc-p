@@ -245,6 +245,8 @@ jobs:
           merge-multiple: true
 
       - name: Write release notes
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
         shell: bash
         run: |
           : > notes.md
@@ -274,6 +276,12 @@ jobs:
             fi
           }
 
+          # Write header first (heredoc to avoid escaping issues)
+          cat > notes.md << 'NOTES_EOF'
+          ## What's Changed
+
+          NOTES_EOF
+
           writeSection "Security" "$SECURITY"
           writeSection "New Features" "$FEATURES"
           writeSection "Bug Fixes" "$FIXES"
@@ -282,26 +290,20 @@ jobs:
           writeSection "Documentation" "$DOCS"
           writeSection "Other Changes" "$OTHER"
 
-          # Write notes using heredoc to avoid escaping issues
-          cat > notes.md << 'NOTES_EOF'
-## What's Changed
-
-NOTES_EOF
-
           # Installation section (heredoc avoids parenthesis/quote issues)
           cat >> notes.md << 'INSTALL_EOF'
-## Installation
+          ## Installation
 
-Single-file executables (cross-compiled with Bun). Run one next to
-your own config.json / .env. Builtin defaults (port 3050 on 0.0.0.0)
-apply when neither is present.
+          Single-file executables (cross-compiled with Bun). Run one next to
+          your own config.json / .env. Builtin defaults (port 3050 on 0.0.0.0)
+          apply when neither is present.
 
-## Assets
+          ## Assets
 
-| Platform | Asset | SHA-256 |
-|---|---|---|
+          | Platform | Asset | SHA-256 |
+          |---|---|---|
 
-INSTALL_EOF
+          INSTALL_EOF
 
           # Add asset rows
           (cd dist && for f in *; do
@@ -321,13 +323,13 @@ INSTALL_EOF
           # Verify line and changelog link
           cat >> notes.md << 'FOOTER_EOF'
 
-Verify any download with:
+          Verify any download with:
 
-```sh
-sha256sum -c SHA256SUMS.txt
-```
+          ```sh
+          sha256sum -c SHA256SUMS.txt
+          ```
 
-FOOTER_EOF
+          FOOTER_EOF
 
           # Full changelog link
           echo "" >> notes.md
