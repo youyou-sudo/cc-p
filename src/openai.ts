@@ -7,13 +7,15 @@ import { SSE_HEADERS, readWithTimeout, sendJSON } from './http'
 import { log } from './logger'
 import { callUpstream, createUpstreamFlow, readRequestJson } from './proxy-handler'
 import type { JsonParseErrorKind } from './proxy-handler'
-import { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, recordTimeout, recordTimeoutSuccess, timeoutMessage } from './runtime'
+import { idleTimeoutFor, isThinkingWait, recordTimeout, recordTimeoutSuccess, timeoutDetails, timeoutMessage } from './runtime'
+import { getSessionId } from './session'
 import { createSseTranslator, SSE_KEEPALIVE_COMMENT, SsePipeline, startSseHeartbeat } from './sse'
 import { nowUnix, uuid } from './util'
 
 interface TerminalState {
   upstreamError: { status: number; body: any } | null
   timedOut: boolean
+  timedOutMs?: number
   zeroOutput: boolean
   errorMsg: string
 }
@@ -64,6 +66,11 @@ export async function handleChatCompletions(request: Request, headers: Record<st
   const created = nowUnix()
 
   const ccBody = buildCcRequest(openaiReq)
+  // Scoped timeout bucket: main session hangs must not mislead a small
+  // sub-agent sharing the same key. Falls back to ensureSession(apiKey)
+  // when the client sends no explicit session id (zero-cost, same as
+  // forwardToCC's upstream session resolution for explicit ids).
+  const sessionId = getSessionId(headers, apiKey, openaiReq.prompt_cache_key)
   const flow = createUpstreamFlow(request)
   const abortController = flow.controller
   const aborted = () => flow.aborted
@@ -118,7 +125,8 @@ export async function handleChatCompletions(request: Request, headers: Record<st
         try {
           while (true) {
             if (aborted()) break
-            const { done, value } = await readWithTimeout(reader.read(), STREAM_IDLE_TIMEOUT_MS, 'STREAM_IDLE_TIMEOUT')
+            const idleMs = idleTimeoutFor(lastCcEvent, true)
+            const { done, value } = await readWithTimeout(reader.read(), idleMs, 'STREAM_IDLE_TIMEOUT')
             if (done) break
             bytesReceived += value.byteLength
 
@@ -150,7 +158,7 @@ export async function handleChatCompletions(request: Request, headers: Record<st
                 pipeline.writeNow(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'upstream_error', rawUsage: translator.rawUsage }, retry_after: 10 })}\n\n`)
               }
             } else {
-              recordTimeoutSuccess(apiKey)
+              recordTimeoutSuccess(apiKey, sessionId)
               pipeline.emit([translator.getDoneEvent()])
             }
           }
@@ -158,11 +166,13 @@ export async function handleChatCompletions(request: Request, headers: Record<st
           if (aborted()) {
             reader.cancel().catch(() => {})
           } else if (e?.message === 'STREAM_IDLE_TIMEOUT') {
+            const idleMs = idleTimeoutFor(lastCcEvent, true)
             log('warn', 'Stream idle timeout', {
               path: '/v1/chat/completions',
               model,
               streaming: true,
-              timeoutMs: STREAM_IDLE_TIMEOUT_MS,
+              timeoutMs: idleMs,
+              thinkingPhase: isThinkingWait(lastCcEvent),
               elapsedMs: Date.now() - startTime,
               id: completionId,
               bytesReceived,
@@ -173,10 +183,13 @@ export async function handleChatCompletions(request: Request, headers: Record<st
             })
             reader.cancel().catch(() => {})
             try { abortController.abort() } catch {}
-            recordTimeout(apiKey)
+            recordTimeout(apiKey, sessionId)
             state.timedOut = true
+            state.timedOutMs = idleMs
             if (pipeline.started) {
-              pipeline.writeNow(`data: ${JSON.stringify({ error: { message: timeoutMessage(apiKey), type: 'rate_limit_error' }, retry_after: 5 })}\n\n`)
+              const msg = timeoutMessage(apiKey, { sessionId, inputTokens: translator.inputTokens, timeoutMs: idleMs })
+              const details = timeoutDetails(apiKey, { sessionId, timeoutMs: idleMs })
+              pipeline.writeNow(`data: ${JSON.stringify({ error: { message: msg, type: 'rate_limit_error', code: 'stream_idle_timeout', consecutive_timeouts: details.consecutiveTimeouts, timeout_ms: details.timeoutMs }, retry_after: 5 })}\n\n`)
             }
           } else {
             state.errorMsg = e?.message ?? String(e)
@@ -232,7 +245,10 @@ export async function handleChatCompletions(request: Request, headers: Record<st
           return sendJSON(state.upstreamError.status, state.upstreamError.body)
         }
         if (state.timedOut) {
-          return sendJSON(429, { error: { message: timeoutMessage(apiKey), type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 })
+          const terminalMs = state.timedOutMs ?? idleTimeoutFor(lastCcEvent, true)
+          const msg = timeoutMessage(apiKey, { sessionId, inputTokens: translator.inputTokens, timeoutMs: terminalMs })
+          const details = timeoutDetails(apiKey, { sessionId, timeoutMs: terminalMs })
+          return sendJSON(429, { error: { message: msg, type: 'rate_limit_error', code: 'stream_idle_timeout', consecutive_timeouts: details.consecutiveTimeouts, timeout_ms: details.timeoutMs, input_tokens: 0 }, retry_after: 5 })
         }
         if (state.zeroOutput || !state.errorMsg) {
           return sendJSON(429, {
@@ -300,7 +316,8 @@ export async function handleChatCompletions(request: Request, headers: Record<st
     try {
       while (true) {
         if (aborted()) break
-        const { done, value } = await readWithTimeout(reader.read(), NONSTREAM_IDLE_TIMEOUT_MS, 'STREAM_IDLE_TIMEOUT')
+        const idleMs = idleTimeoutFor(lastCcEvent, false)
+        const { done, value } = await readWithTimeout(reader.read(), idleMs, 'STREAM_IDLE_TIMEOUT')
         if (done) break
         bytesReceived += value.byteLength
         processBytes(value)
@@ -311,11 +328,13 @@ export async function handleChatCompletions(request: Request, headers: Record<st
         return new Response(null, { status: 499 })
       }
       if (e?.message === 'STREAM_IDLE_TIMEOUT') {
+        const idleMs = idleTimeoutFor(lastCcEvent, false)
         log('warn', 'Stream idle timeout', {
           path: '/v1/chat/completions',
           model,
           streaming: false,
-          timeoutMs: NONSTREAM_IDLE_TIMEOUT_MS,
+          timeoutMs: idleMs,
+          thinkingPhase: isThinkingWait(lastCcEvent),
           elapsedMs: Date.now() - startTime,
           id: completionId,
           bytesReceived,
@@ -324,8 +343,13 @@ export async function handleChatCompletions(request: Request, headers: Record<st
         })
         reader.cancel().catch(() => {})
         try { abortController.abort() } catch {}
-        recordTimeout(apiKey)
-        return sendJSON(429, { error: { message: timeoutMessage(apiKey), type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 })
+        recordTimeout(apiKey, sessionId)
+        // Non-stream has no translator usage yet; unknown input size must NOT
+        // claim "reduce context" -- context-aware message falls back to the
+        // non-misleading upstream-slow wording.
+        const msg = timeoutMessage(apiKey, { sessionId, timeoutMs: idleMs })
+        const details = timeoutDetails(apiKey, { sessionId, timeoutMs: idleMs })
+        return sendJSON(429, { error: { message: msg, type: 'rate_limit_error', code: 'stream_idle_timeout', consecutive_timeouts: details.consecutiveTimeouts, timeout_ms: details.timeoutMs, input_tokens: 0 }, retry_after: 5 })
       }
       log('error', 'Upstream error', {
         path: '/v1/chat/completions',
@@ -369,7 +393,7 @@ export async function handleChatCompletions(request: Request, headers: Record<st
       })
     }
 
-    recordTimeoutSuccess(apiKey)
+    recordTimeoutSuccess(apiKey, sessionId)
     if (!usage) usage = {}
     normalizeUsage(usage)
     const rawUsage = rawUsageFromCcUsage(usage)

@@ -141,3 +141,8 @@ export const NONSTREAM_IDLE_TIMEOUT_MS = (() => {
   const v = envNumber('CC_NONSTREAM_IDLE_MS')
   return v !== undefined && v > 0 ? v : 90_000
 })()
+// 容忍 reasoning 长 prefill / 首 token 停顿，默认 120s；设 0/空回默认，非法数字沿用 die()。
+export const THINKING_IDLE_TIMEOUT_MS = (() => {
+  const v = envNumber('CC_THINKING_IDLE_MS')
+  return v !== undefined && v > 0 ? v : 120_000
+})()

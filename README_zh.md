@@ -14,7 +14,7 @@
 - **流式 / 非流式**、工具调用、多模态图片、`reasoning_effort` / `thinking`
 - **动态模型**：`GET /v1/models` 从 Provider API 获取（5 分钟缓存），失败回退内置列表
 - **CLI 仿真**：按 Key 的设备指纹（8h + 2h 抖动）、`cli_session_exists` 生命周期事件、按 Key 会话（12h + 1h 抖动）、`x-command-code-version` 取自 npm（每天刷新）、`traceparent`、`x-project-slug`
-- **容错**：零输出 → 可重试 `429`，空闲超时（流式 30s / 非流式 90s，可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变）→ `429`，断连立刻中止上游
+- **容错**：零输出 → 可重试 `429`，空闲超时（流式 30s / 非流式 90s，可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变；思考期 `start`/`start-step`/`reasoning-start`/`reasoning-delta` 走 120s 宽限 `CC_THINKING_IDLE_MS`）→ `429`，断连立刻中止上游
 - **认证灵活**：按请求的 `Bearer user_*` / `x-api-key`，自托管可选 `CC_API_KEY` 兜底
 - **开箱可运维**：`GET /health`、`server healthcheck` CLI、Docker HEALTHCHECK、隐私日志（不记 Key、包体与堆栈）
 
@@ -144,6 +144,7 @@ Bun 启动时自动加载 `.env`。空值 = 沿用 `config.json`；真实 shell 
 | `CC_MAX_BODY_MB` | ——（仅环境变量） | `100` |
 | `CC_STREAM_IDLE_MS` | ——（仅环境变量） | `30000` |
 | `CC_NONSTREAM_IDLE_MS` | ——（仅环境变量） | `90000` |
+| `CC_THINKING_IDLE_MS` | ——（仅环境变量） | `120000`（思考期宽限：`start`/`start-step`/`reasoning-start`/`reasoning-delta`；深度推理/高 `reasoning_effort` 建议 `180000`；调大代价是真 hang 时失败感知更慢） |
 
 > **默认值说明：** 源码运行（`bun start`）、Docker 镜像、Release 二进制共用同一套
 > 内置默认值——`3050` / `0.0.0.0`，与入库的 `config.json` 一致。`PORT` / `HOST`
@@ -230,13 +231,48 @@ CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64
 |------|------|----------------------|
 | `400` `context_window_exceeded` | HTTP 或流内 error 命中 `CONTEXT_WINDOW_EXCEEDED_PATTERN`（`src/errors.ts`）——关键词判超长，即使上游误标 `429` | 裁剪历史 / 总结 / 开新会话。同样的包体重试必败。 |
 | `429` `Empty response` / 零输出，`retry_after: 10` | 上游零输出 token（zero-output） | 可退避重试一次；反复出现则压缩上下文、简化上一轮。 |
-| `429` 空闲超时，`retry_after: 5` | 上游 30s（流式）/ 90s（非流式）无字节（可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变）；按 Key 记连续超时，≥3 次后消息提示压缩上下文 | 缩小上下文后重试；拆分任务；避免单次超大 tool 调用。 |
+| `429` 空闲超时，`retry_after: 5` | 上游 30s（流式）/ 90s（非流式）无字节（可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变）；**思考期**（`lastCcEvent` 为 `start`/`start-step`/`reasoning-start`/`reasoning-delta`）走 120s 宽限（`CC_THINKING_IDLE_MS`）；按 Key 记连续超时，≥3 次后消息提示压缩上下文——**即使当前请求很小（空闲≠上下文大）** | 别无脑压缩：先看是哪个 `429`（见下）。`retry_after: 5` 优先怀疑上游慢 / 并发 fan-out / 超大 `tool_result` / 推理停顿；拆任务、截断 tool 结果、降并发。日志若为 `thinkingPhase=true` + `lastCcEvent=reasoning-start` + `elapsedMs≈timeoutMs`，应调大 `CC_THINKING_IDLE_MS`（见下“思考时报错”）。 |
+| `429` 思考超时，`retry_after: 5` + `thinkingPhase=true` | `reasoning-start` 后 30s+ 上游零字节：旧逻辑下 `readWithTimeout` 在 30s 误杀（120s 思考宽限之前）。与上下文大小无关——流式超时 `inputTokens` 恒为 `0`，不能判大小。自证三件套：`lastCcEvent=reasoning-start`/`start` 无 delta + `bytesReceived` 几十字节 + `elapsedMs` 顶格阈值。Opencode 包装为 `failed to send message`。 | 别压缩上下文。调大 `CC_THINKING_IDLE_MS`（深度推理如 `180000`），或拆任务/降 `reasoning_effort`。真 hang 代价：失败感知延迟到阈值。 |
 | `429` 真限流，`retry_after: 30` | 真实上游 `402/429`，经 `src/errors.ts` 映射 | 按 `Retry-After` 退避等待。裁剪没用——等，再重试。 |
 | `502/503` 其他 | 真实上游错误（`CC_STATUS_MAP`；未列出 → `502 upstream_error`） | 重试 / 退避。 |
 
 区分三个 `429`：读包体——`message` 文案 + 数字 `retry_after`
 （`10` = 零输出，`5` = 空闲超时，`30` = 真限流）。`sendJSON` 会把
 `retry_after` 同步为 `Retry-After` 响应头，真正可重试的场景 SDK 会自动重试。
+Opencode 会把本代理的 `429` 包一层 `Opencode failed to send message ...
+rate_limit_error`——看到该包装先拆开看内层 `retry_after` 再决策。
+
+### 思考时报错（深度推理 / 高 `reasoning_effort`）？
+
+- **症状：** 长时间推理停顿（30s+ 无输出）后出现 `429` `retry_after: 5`，
+  Opencode 包装为 `failed to send message`。
+- **确认：** 服务端日志带 `thinkingPhase=true` + `lastCcEvent=reasoning-start`
+  （或 `start` 无 delta）+ `elapsedMs` 顶格 `timeoutMs` + `bytesReceived` 几十字节。
+  三件套齐了 = 思考超时，不是上下文膨胀。**不要**压缩上下文。
+- **修复：** 调大 `CC_THINKING_IDLE_MS`（如 `180000`）；仍顶格则继续加，
+  或拆任务/降 `reasoning_effort`。代价：真 hang 时失败感知延迟到阈值。
+
+### 上下文很小却还让 `reduce context`？
+
+`src/runtime.ts:58-62` 在**同一 API Key** **连续超时 ≥3 次**后（TTL 30min，
+成功一次即清零），把空闲超时的文案切换为 `try reducing context length`。
+此后该 Key 上的**每一次**空闲超时都带这句文案——再小的请求也一样，
+**不代表**当前 prompt 太大。
+
+- **空闲≠大。** 空闲超时只看“30s/90s 无上游字节”。小上下文 + 子代理并发
+  fan-out、单条超大 `tool_result`、长时间 reasoning 停顿、上游单纯慢，
+  都会触发。
+- **计数器按 Key 共享，会互相污染。** 主+子代理同 Key 共用一个计数器，
+  默认还共用上游 `x-session-id`（12h，`src/session.ts`）：3 次慢子代理调用
+  就能污染第 4 次小请求。
+- **看日志定性。** `Stream idle timeout` 行里 `inputTokens` 很小 +
+  `lastCcEvent` 卡住无 delta + `bytesReceived ≈ 0` = 上游慢，不是你上下文大；
+  `inputTokens` 逐轮爬升才是真膨胀。
+- **止血步骤（30s 分流）：** 子代理用独立 Key；新任务开新会话（去掉
+  `x-session-id` / `prompt_cache_key`）；降并发（一子代理一任务）；返回前截断
+  `tool_result`；上游确实慢则调大 `CC_STREAM_IDLE_MS=60000` /
+  `CC_NONSTREAM_IDLE_MS=120000`（容忍慢首 token，但延迟失败感知——见
+  `.env.example`）。
 
 ## CLI 仿真原理
 

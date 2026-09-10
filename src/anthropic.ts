@@ -7,7 +7,8 @@ import { SSE_HEADERS, readWithTimeout, sendAnthropicError, sendJSON } from './ht
 import { log } from './logger'
 import { callUpstream, createUpstreamFlow, readRequestJson } from './proxy-handler'
 import type { JsonParseErrorKind } from './proxy-handler'
-import { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, recordTimeout, recordTimeoutSuccess, timeoutMessage } from './runtime'
+import { idleTimeoutFor, isThinkingWait, recordTimeout, recordTimeoutSuccess, timeoutDetails, timeoutMessage } from './runtime'
+import { getSessionId } from './session'
 import { SsePipeline, startSseHeartbeat } from './sse'
 import { bytesToBase64, sha256bytes, uuid } from './util'
 
@@ -370,7 +371,8 @@ export async function* createAnthropicSseTranslator(
 
   try {
     while (true) {
-      const { done, value } = await readWithTimeout(reader.read(), STREAM_IDLE_TIMEOUT_MS, 'STREAM_IDLE_TIMEOUT')
+      const idleMs = idleTimeoutFor(ctx.lastCcEvent, true)
+      const { done, value } = await readWithTimeout(reader.read(), idleMs, 'STREAM_IDLE_TIMEOUT')
       if (done) break
       ctx.bytesReceived += value.byteLength
       const out = parser.push(value, hooks)
@@ -420,6 +422,9 @@ export async function handleMessages(request: Request, headers: Record<string, s
   const openaiReq = convertAnthropicToOpenAI(anthropicReq)
   if (anthropicReq.prompt_cache_key !== undefined) openaiReq.prompt_cache_key = anthropicReq.prompt_cache_key
   const ccBody = buildCcRequest(openaiReq)
+  // Same scoping as openai.ts: per-session buckets stop a hanging main
+  // session from misleading a small-context sub-agent on the same key.
+  const sessionId = getSessionId(headers, apiKey, openaiReq.prompt_cache_key)
 
   const flow = createUpstreamFlow(request)
   const abortController = flow.controller
@@ -446,7 +451,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
     if (stream) {
       const pipeline = new SsePipeline(false)
       const ctx: AnthropicStreamContext = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, upstreamError: null }
-      const state = { upstreamError: null as { status: number; body: any } | null, timedOut: false, zeroOutput: false, errorMsg: '' }
+      const state = { upstreamError: null as { status: number; body: any } | null, timedOut: false, timedOutMs: undefined as number | undefined, zeroOutput: false, errorMsg: '' }
 
       const onClientAbort = () => {
         if (pipeline.closed) return
@@ -484,7 +489,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
           }
 
           if (!aborted()) {
-            recordTimeoutSuccess(apiKey)
+            recordTimeoutSuccess(apiKey, sessionId)
             if (ctx.upstreamError) {
               state.upstreamError = ctx.upstreamError
             } else if (ctx.outputTokens === 0) {
@@ -497,12 +502,14 @@ export async function handleMessages(request: Request, headers: Record<string, s
         } catch (e: any) {
           if (aborted()) {
           } else if (e?.message === 'STREAM_IDLE_TIMEOUT') {
+            const idleMs = idleTimeoutFor(ctx.lastCcEvent, true)
             log('warn', 'Stream idle timeout', {
               path: '/v1/messages',
               model,
               messageId,
               streaming: true,
-              timeoutMs: STREAM_IDLE_TIMEOUT_MS,
+              timeoutMs: idleMs,
+              thinkingPhase: isThinkingWait(ctx.lastCcEvent),
               elapsedMs: Date.now() - startTime,
               id: messageId,
               bytesReceived: ctx.bytesReceived,
@@ -512,10 +519,13 @@ export async function handleMessages(request: Request, headers: Record<string, s
               cachedInputTokens: ctx.cachedInputTokens,
             })
             try { abortController.abort() } catch {}
-            recordTimeout(apiKey)
+            recordTimeout(apiKey, sessionId)
             state.timedOut = true
+            state.timedOutMs = idleMs
             if (pipeline.started) {
-              pipeline.writeNow(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMessage(apiKey) }, retry_after: 5 })}\n\n`)
+              const msg = timeoutMessage(apiKey, { sessionId, inputTokens: ctx.inputTokens, timeoutMs: idleMs })
+              const details = timeoutDetails(apiKey, { sessionId, timeoutMs: idleMs })
+              pipeline.writeNow(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: msg, code: 'stream_idle_timeout', consecutive_timeouts: details.consecutiveTimeouts, timeout_ms: details.timeoutMs }, retry_after: 5 })}\n\n`)
             }
           } else {
             state.errorMsg = e?.message ?? String(e)
@@ -571,7 +581,11 @@ export async function handleMessages(request: Request, headers: Record<string, s
           return sendAnthropicError(state.upstreamError.status, state.upstreamError.body.error.type, state.upstreamError.body.error.message, anthropicRetryOpts(state.upstreamError.body))
         }
         if (state.timedOut) {
-          return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(apiKey), { retryAfter: 5 })
+          const terminalMs = state.timedOutMs ?? idleTimeoutFor(ctx.lastCcEvent, true)
+          const msg = timeoutMessage(apiKey, { sessionId, inputTokens: ctx.inputTokens, timeoutMs: terminalMs })
+          const details = timeoutDetails(apiKey, { sessionId, timeoutMs: terminalMs })
+          const body: any = { type: 'error', error: { type: 'rate_limit_error', message: msg, code: 'stream_idle_timeout', consecutive_timeouts: details.consecutiveTimeouts, timeout_ms: details.timeoutMs }, retry_after: 5 }
+          return new Response(JSON.stringify(body), { status: 429, headers: { 'Content-Type': 'application/json', 'Retry-After': '5' } })
         }
         if (state.zeroOutput) {
           const rawUsage = {
@@ -665,7 +679,8 @@ export async function handleMessages(request: Request, headers: Record<string, s
     try {
       while (true) {
         if (aborted()) break
-        const { done, value } = await readWithTimeout(reader.read(), NONSTREAM_IDLE_TIMEOUT_MS, 'STREAM_IDLE_TIMEOUT')
+        const idleMs = idleTimeoutFor(lastCcEvent, false)
+        const { done, value } = await readWithTimeout(reader.read(), idleMs, 'STREAM_IDLE_TIMEOUT')
         if (done) break
         bytesReceived += value.byteLength
         processBytes(value)
@@ -676,12 +691,14 @@ export async function handleMessages(request: Request, headers: Record<string, s
         return new Response(null, { status: 499 })
       }
       if (e?.message === 'STREAM_IDLE_TIMEOUT') {
+        const idleMs = idleTimeoutFor(lastCcEvent, false)
         const timeoutRawUsage = rawUsageFromCcUsageAnthropic(usage)
         log('warn', 'Stream idle timeout', {
           path: '/v1/messages',
           model,
           streaming: false,
-          timeoutMs: NONSTREAM_IDLE_TIMEOUT_MS,
+          timeoutMs: idleMs,
+          thinkingPhase: isThinkingWait(lastCcEvent),
           elapsedMs: Date.now() - startTime,
           id: messageId,
           bytesReceived,
@@ -693,8 +710,12 @@ export async function handleMessages(request: Request, headers: Record<string, s
         })
         reader.cancel().catch(() => {})
         try { abortController.abort() } catch {}
-        recordTimeout(apiKey)
-        return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(apiKey), { retryAfter: 5 })
+        recordTimeout(apiKey, sessionId)
+        // Non-stream has partial usage only; pass inputTokens when known.
+        const msg = timeoutMessage(apiKey, { sessionId, inputTokens: timeoutRawUsage.input_tokens || undefined, timeoutMs: idleMs })
+        const details = timeoutDetails(apiKey, { sessionId, timeoutMs: idleMs })
+        const body: any = { type: 'error', error: { type: 'rate_limit_error', message: msg, code: 'stream_idle_timeout', consecutive_timeouts: details.consecutiveTimeouts, timeout_ms: details.timeoutMs }, retry_after: 5 }
+        return new Response(JSON.stringify(body), { status: 429, headers: { 'Content-Type': 'application/json', 'Retry-After': '5' } })
       }
       log('error', 'Upstream error', {
         path: '/v1/messages',
@@ -744,7 +765,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
       return sendAnthropicErrorWithRawUsage(429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', rawUsage, 10)
     }
 
-    recordTimeoutSuccess(apiKey)
+    recordTimeoutSuccess(apiKey, sessionId)
     if (!usage) usage = {}
     normalizeUsage(usage)
     const rawUsage = rawUsageFromCcUsageAnthropic(usage)

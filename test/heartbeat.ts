@@ -23,6 +23,11 @@ async function readOne(p: SsePipeline, timeoutMs = 200): Promise<string> {
 }
 
 console.log('--- heartbeat ---')
+// 心跳只保下游不续租上游：startSseHeartbeat 只向客户端 SSE 写 ping/keepalive，
+// 不触碰上游 readWithTimeout 空闲计时。上游思考期（reasoning-start 后 30s+ 零字节）
+// 仍由 CC_THINKING_IDLE_MS（默认 120s）裁决，心跳 ping 不能为上游续租——
+// “客户端连接存活”不等于“上游有字节”。思考超时定性看服务端日志
+// thinkingPhase=true + lastCcEvent=reasoning-start + elapsedMs≈timeoutMs。
 {
   // started + idle → `event: ping` (Anthropic default) 且 pingCount>0
   const p = new SsePipeline(false)

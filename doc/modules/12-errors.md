@@ -25,3 +25,14 @@
 - OpenAI：`sendJSON(status, {error:{message,type}, retry_after?})`（http.sendJSON 自动加 Retry-After 头）。
 - Anthropic：`sendAnthropicError(status, body.error.type, body.error.message)`——**字段从 MappedError.body 解包重组**，保持 Anthropic 顶层 `{type:'error',error:{...}}` 形状。
 - 两处 `retry_after:30` 的 429 均来自 CC_STATUS_MAP 的 rate_limit 分支。
+
+## 三种 429 速查（`retry_after` 为准，勿只看文案）
+
+| `retry_after` | 含义 | 动作 |
+|---|---|---|
+| `5` | 空闲超时：非思考期流式 30s / 非流式 90s 无上游字节；**思考期**（`lastCcEvent` in `start`/`start-step`/`reasoning-start`/`reasoning-delta`）走 120s 宽限（`CC_THINKING_IDLE_MS`，日志 `thinkingPhase=true` + 实际 `timeoutMs`）；同 Key 连续 ≥3 次后文案带 `reduce context`（小请求也一样，见 `05-runtime.md` 排障备注） | 先定性（日志 `inputTokens`/`lastCcEvent`/`bytesReceived`/`thinkingPhase`），再拆任务/截断 tool_result/降并发/调大 `CC_*_IDLE_MS`；思考期三件套（`reasoning-start` 无 delta + `bytesReceived` 几十字节 + `elapsedMs` 顶格）→ 只调 `CC_THINKING_IDLE_MS`，不压缩上下文 |
+| `5` + `thinkingPhase=true` | 思考超时：`reasoning-start` 后 30s+ 零字节被旧 30s 阈值误杀（120s 宽限之前）；与上下文大小无关（流式超时 `inputTokens` 恒 0） | 调大 `CC_THINKING_IDLE_MS`（深度推理 180000）或拆任务/降 `reasoning_effort` |
+| `10` | 零输出：上游零输出 token | 退避重试一次；反复出现再压缩上下文 |
+| `30` | 真限流：上游 `402/429` 映射 | 按 `Retry-After` 退避；裁剪无用 |
+
+> Opencode 把本代理 429 再包一层 `Opencode failed to send message ... rate_limit_error`——排障时先拆包装看内层 `retry_after`。
