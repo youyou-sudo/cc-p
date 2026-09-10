@@ -85,8 +85,8 @@
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 1 | `STREAM_IDLE_TIMEOUT_MS` | const | E | 30 000，流式响应读空闲上限 |
-| 2 | `NONSTREAM_IDLE_TIMEOUT_MS` | const | E | 90 000，非流式聚合读空闲上限 |
+| 1 | `STREAM_IDLE_TIMEOUT_MS` | const | E | 30 000（`CC_STREAM_IDLE_MS` 可覆盖，默认不变），流式响应读空闲上限 |
+| 2 | `NONSTREAM_IDLE_TIMEOUT_MS` | const | E | 90 000（`CC_NONSTREAM_IDLE_MS` 可覆盖，默认不变），非流式聚合读空闲上限 |
 | 3 | `TIMEOUT_REDUCE_CONTEXT_THRESHOLD` | const | E | 3 |
 | 5-7 | `runtimeState` | const | E | `{ consecutiveTimeouts: 0 }`，成功响应后归零（openai.ts:286 / anthropic.ts:435,591） |
 | 9-13 | `timeoutMessage` | 函数 | E | ≥3 次连续超时 → 提示缩减上下文文案，否则普通超时文案 |

@@ -14,7 +14,7 @@ Stack: **Bun + Elysia + TypeScript**. Single-file binary via `bun build --compil
 - **Streaming & non-streaming**, tool calling, multimodal images, `reasoning_effort` / `thinking`
 - **Dynamic models**: `GET /v1/models` from Provider API (5 min cache) with builtin fallback
 - **CLI emulation**: per-key device fingerprint (8h + 2h jitter), lifecycle `cli_session_exists`, per-key session (12h + 1h jitter), `x-command-code-version` from npm (24h refresh), `traceparent`, `x-project-slug`
-- **Resilience**: zero-output → `429` retryable, idle timeout (30s stream / 90s non-stream) → `429`, disconnect aborts upstream
+- **Resilience**: zero-output → `429` retryable, idle timeout (30s stream / 90s non-stream, overridable via `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS`, defaults unchanged) → `429`, disconnect aborts upstream
 - **Auth flexibility**: per-request `Bearer user_*` / `x-api-key`, optional `CC_API_KEY` fallback for self-host
 - **Ops ready**: `GET /health`, `server healthcheck` CLI, Docker HEALTHCHECK, privacy-aware logs (no keys, bodies, or stacks)
 
@@ -137,6 +137,8 @@ Precedence (low → high): **builtin defaults → `config.json` → `.env` / env
 | `CC_MODEL_REFRESH_INTERVAL_MS` | `modelRefreshIntervalMs` | `300000` |
 | `CMD_ZDR` | `zdr` | `false` |
 | `CC_MAX_BODY_MB` | — (env only) | `100` |
+| `CC_STREAM_IDLE_MS` | — (env only) | `30000` |
+| `CC_NONSTREAM_IDLE_MS` | — (env only) | `90000` |
 
 > **Note on defaults:** source runs (`bun start`), Docker images, and Release
 > binaries all share one set of builtin defaults — `3050` / `0.0.0.0` — matching
@@ -189,7 +191,7 @@ Client disconnects (`request.signal`) abort the upstream `fetch` immediately; un
 > every request — no prune / trim / compact. History growth lives on the
 > caller (Claude Code, Cline, your agent loop), not in the proxy. So context
 > hygiene is a **client habit**, not a server setting. Facts that shape the
-> habits below: stream idle timeout 30s / non-stream 90s (per-key consecutive
+> habits below: stream idle timeout 30s / non-stream 90s (overridable via `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS`, defaults unchanged; per-key consecutive
 > counter, ≥3 → message tells you to reduce context); body cap 100MB
 > (`CC_MAX_BODY_MB`); over-long prompts are normalized to `400`
 > `context_window_exceeded` on both HTTP (`mapCcError`) and in-stream error
@@ -232,7 +234,7 @@ Client disconnects (`request.signal`) abort the upstream `fetch` immediately; un
 |--------|---------|-----------------------------|
 | `400` `context_window_exceeded` | Prompt matched `CONTEXT_WINDOW_EXCEEDED_PATTERN` (`src/errors.ts`) on HTTP or in-stream error — over-long by keyword even if upstream said `429` | Trim history / summarize / start a new session. Retrying the same payload always fails. |
 | `429` `Empty response` / zero output, `retry_after: 10` | Upstream returned zero output tokens | Safe to retry once with backoff; if it repeats, shrink context and simplify the last turn. |
-| `429` idle timeout, `retry_after: 5` | No upstream bytes for 30s (stream) / 90s (non-stream); per-key consecutive counter, ≥3 → message tells you to reduce context | Retry with smaller context; split the task; avoid huge single tool calls. |
+| `429` idle timeout, `retry_after: 5` | No upstream bytes for 30s (stream) / 90s (non-stream) (overridable via `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS`, defaults unchanged); per-key consecutive counter, ≥3 → message tells you to reduce context | Retry with smaller context; split the task; avoid huge single tool calls. |
 | `429` true rate limit, `retry_after: 30` | Real upstream `402/429` mapped through `src/errors.ts` | Back off and honor `Retry-After`. Trimming won't help — wait, then retry. |
 | `502/503` other | Genuine upstream error (`CC_STATUS_MAP`; unlisted → `502 upstream_error`) | Retry / backoff. |
 

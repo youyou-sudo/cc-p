@@ -6,8 +6,7 @@
 // failing - a successful response deletes the entry, and entries idle for
 // TIMEOUT_STATE_TTL_MS are pruned lazily, so the map stays bounded.
 
-export const STREAM_IDLE_TIMEOUT_MS = 30_000
-export const NONSTREAM_IDLE_TIMEOUT_MS = 90_000
+export { STREAM_IDLE_TIMEOUT_MS, NONSTREAM_IDLE_TIMEOUT_MS } from './config'
 export const TIMEOUT_REDUCE_CONTEXT_THRESHOLD = 3
 
 /** Entries untouched for this long are pruned / treated as reset. */

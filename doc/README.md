@@ -115,8 +115,8 @@ OpenAI 路径（`/v1/chat/completions`）结构相同，区别在于：
 
 | 常量 | 值 | 定义处 |
 |---|---|---|
-| 流式空闲超时 | 30 000 ms | `src/runtime.ts:1` |
-| 非流式空闲超时 | 90 000 ms | `src/runtime.ts:2` |
+| 流式空闲超时 | 30 000 ms（`CC_STREAM_IDLE_MS` 可覆盖，默认不变） | `src/runtime.ts:1` |
+| 非流式空闲超时 | 90 000 ms（`CC_NONSTREAM_IDLE_MS` 可覆盖，默认不变） | `src/runtime.ts:2` |
 | 连续超时降级阈值 | 3 次 → 提示缩减上下文 | `src/runtime.ts:3` |
 | 会话有效期 | 12 h + ≤1 h 抖动，按 API key | `src/session.ts:5-6` |
 | 指纹/生命周期刷新 | 8 h + ≤2 h 抖动，按 API key | `src/fingerprint.ts:115-116` |
@@ -130,7 +130,8 @@ OpenAI 路径（`/v1/chat/completions`）结构相同，区别在于：
 
 > 代理无状态：`src/cc.ts:buildCcRequest` 每请求全量透传完整历史，不做
 > prune / trim / compact。历史膨胀在调用方。超时：流式 30s / 非流式 90s
->（`src/runtime.ts`，按 Key 记连续超时，≥3 次提示压缩上下文）；包体上限
+>（可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变；
+> `src/runtime.ts`，按 Key 记连续超时，≥3 次提示压缩上下文）；包体上限
 > 100MB（`CC_MAX_BODY_MB`）；超长在 HTTP 与流内 error 事件统一归一化为
 > `400 context_window_exceeded`（`src/errors.ts`，关键词优先、即使误标
 > `<429>`）；session 按 Key 12h + ≤1h 抖动（`src/session.ts`），换 Key 或

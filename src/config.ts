@@ -132,3 +132,12 @@ export const MAX_BODY_SIZE = (() => {
   const mb = envNumber('CC_MAX_BODY_MB')
   return mb !== undefined && mb > 0 ? mb * 1024 * 1024 : 100 * 1024 * 1024
 })()
+
+export const STREAM_IDLE_TIMEOUT_MS = (() => {
+  const v = envNumber('CC_STREAM_IDLE_MS')
+  return v !== undefined && v > 0 ? v : 30_000
+})()
+export const NONSTREAM_IDLE_TIMEOUT_MS = (() => {
+  const v = envNumber('CC_NONSTREAM_IDLE_MS')
+  return v !== undefined && v > 0 ? v : 90_000
+})()

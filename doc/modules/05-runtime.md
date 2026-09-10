@@ -12,8 +12,8 @@
 
 | 行号 | 符号 | 值/说明 |
 |---|---|---|
-| 9 | `STREAM_IDLE_TIMEOUT_MS` | 30 000 ms：流式响应中两次上游数据之间的最大间隔（经 `readWithTimeout` 应用于每次 `reader.read()`） |
-| 10 | `NONSTREAM_IDLE_TIMEOUT_MS` | 90 000 ms：非流式聚合读取的空闲上限 |
+| 9 | `STREAM_IDLE_TIMEOUT_MS` | 30 000 ms（`CC_STREAM_IDLE_MS` 可覆盖，默认不变）：流式响应中两次上游数据之间的最大间隔（经 `readWithTimeout` 应用于每次 `reader.read()`） |
+| 10 | `NONSTREAM_IDLE_TIMEOUT_MS` | 90 000 ms（`CC_NONSTREAM_IDLE_MS` 可覆盖，默认不变）：非流式聚合读取的空闲上限 |
 | 11 | `TIMEOUT_REDUCE_CONTEXT_THRESHOLD` | 3：连续超时达到该值后，超时文案切换为「建议缩减上下文」 |
 | 14 | `TIMEOUT_STATE_TTL_MS` | 30 分钟：条目空闲超此时间后被清除，防止内存泄漏 |
 | 16-19 | `TimeoutEntry` | `{ consecutiveTimeouts, lastUpdatedAt }` 每个 API key 独立的超时状态 |

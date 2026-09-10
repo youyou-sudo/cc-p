@@ -14,7 +14,7 @@
 - **流式 / 非流式**、工具调用、多模态图片、`reasoning_effort` / `thinking`
 - **动态模型**：`GET /v1/models` 从 Provider API 获取（5 分钟缓存），失败回退内置列表
 - **CLI 仿真**：按 Key 的设备指纹（8h + 2h 抖动）、`cli_session_exists` 生命周期事件、按 Key 会话（12h + 1h 抖动）、`x-command-code-version` 取自 npm（每天刷新）、`traceparent`、`x-project-slug`
-- **容错**：零输出 → 可重试 `429`，空闲超时（流式 30s / 非流式 90s）→ `429`，断连立刻中止上游
+- **容错**：零输出 → 可重试 `429`，空闲超时（流式 30s / 非流式 90s，可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变）→ `429`，断连立刻中止上游
 - **认证灵活**：按请求的 `Bearer user_*` / `x-api-key`，自托管可选 `CC_API_KEY` 兜底
 - **开箱可运维**：`GET /health`、`server healthcheck` CLI、Docker HEALTHCHECK、隐私日志（不记 Key、包体与堆栈）
 
@@ -142,6 +142,8 @@ Bun 启动时自动加载 `.env`。空值 = 沿用 `config.json`；真实 shell 
 | `CC_MODEL_REFRESH_INTERVAL_MS` | `modelRefreshIntervalMs` | `300000` |
 | `CMD_ZDR` | `zdr` | `false` |
 | `CC_MAX_BODY_MB` | ——（仅环境变量） | `100` |
+| `CC_STREAM_IDLE_MS` | ——（仅环境变量） | `30000` |
+| `CC_NONSTREAM_IDLE_MS` | ——（仅环境变量） | `90000` |
 
 > **默认值说明：** 源码运行（`bun start`）、Docker 镜像、Release 二进制共用同一套
 > 内置默认值——`3050` / `0.0.0.0`，与入库的 `config.json` 一致。`PORT` / `HOST`
@@ -194,7 +196,7 @@ CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64
 > 本代理是无状态的：`src/cc.ts` 每次都把完整历史全量透传上游——不做
 > prune / trim / compact。历史膨胀在调用方（Claude Code、Cline、你的 agent
 > 循环），不在代理里。所以上下文卫生是**客户端习惯**，不是服务端开关。
-> 决定下述习惯的既定事实：流式空闲超时 30s / 非流式 90s（按 Key 记连续超时，
+> 决定下述习惯的既定事实：流式空闲超时 30s / 非流式 90s（可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变；按 Key 记连续超时，
 > ≥3 次后消息提示压缩上下文）；包体上限 100MB（`CC_MAX_BODY_MB`）；超长
 > prompt 在 HTTP（`mapCcError`）与流内 error 事件（`mapCcEventError`，关键词
 > 优先、即使上游误标 `<429>`）统一归一化为 `400` `context_window_exceeded`；
@@ -228,7 +230,7 @@ CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64
 |------|------|----------------------|
 | `400` `context_window_exceeded` | HTTP 或流内 error 命中 `CONTEXT_WINDOW_EXCEEDED_PATTERN`（`src/errors.ts`）——关键词判超长，即使上游误标 `429` | 裁剪历史 / 总结 / 开新会话。同样的包体重试必败。 |
 | `429` `Empty response` / 零输出，`retry_after: 10` | 上游零输出 token（zero-output） | 可退避重试一次；反复出现则压缩上下文、简化上一轮。 |
-| `429` 空闲超时，`retry_after: 5` | 上游 30s（流式）/ 90s（非流式）无字节；按 Key 记连续超时，≥3 次后消息提示压缩上下文 | 缩小上下文后重试；拆分任务；避免单次超大 tool 调用。 |
+| `429` 空闲超时，`retry_after: 5` | 上游 30s（流式）/ 90s（非流式）无字节（可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变）；按 Key 记连续超时，≥3 次后消息提示压缩上下文 | 缩小上下文后重试；拆分任务；避免单次超大 tool 调用。 |
 | `429` 真限流，`retry_after: 30` | 真实上游 `402/429`，经 `src/errors.ts` 映射 | 按 `Retry-After` 退避等待。裁剪没用——等，再重试。 |
 | `502/503` 其他 | 真实上游错误（`CC_STATUS_MAP`；未列出 → `502 upstream_error`） | 重试 / 退避。 |
 
