@@ -1,5 +1,5 @@
 import { Elysia } from 'elysia'
-import { MAX_BODY_SIZE } from '../config'
+import { MAX_BODY_SIZE } from '../shared/config'
 
 // Reusable copy of the src/index.ts onError branches (NOT_FOUND / 413 /
 // PARSE / VALIDATION + 500 fallback). Kept byte-identical in shape:

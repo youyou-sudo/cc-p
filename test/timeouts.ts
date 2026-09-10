@@ -90,7 +90,7 @@ console.log(`\nRESULT: ${pass} passed, ${fail} failed`)
 if (process.env.ENABLE_THINKING_ASSERT === '1') {
   console.log('--- thinking idle mapping (skippable, no real wait) ---')
   try {
-    const rt: any = await import('../src/runtime.ts')
+    const rt: any = await import('../src/shared/runtime.ts')
     if (typeof rt.isThinkingWait === 'function' && typeof rt.idleTimeoutFor === 'function') {
       check('thinking: start → wait', rt.isThinkingWait('start') === true)
       check('thinking: start-step → wait', rt.isThinkingWait('start-step') === true)

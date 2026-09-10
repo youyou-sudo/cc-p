@@ -1,5 +1,5 @@
 import { Elysia } from 'elysia'
-import { authErrorMessage, getApiKey } from '../auth'
+import { authErrorMessage, getApiKey } from '../shared/auth'
 
 // Shim over the legacy pure auth helpers (src/auth.ts).
 // Old call sites (openai.ts / anthropic.ts hand-rolled 401s) keep working:

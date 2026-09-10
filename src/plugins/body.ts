@@ -1,5 +1,5 @@
 import { Elysia } from 'elysia'
-import { readJsonBody, BodyTooLargeError } from '../http'
+import { readJsonBody, BodyTooLargeError } from '../shared/http'
 
 // 单次限流 JSON 解析插件：复用 readJsonBody 不变式，消除 Elysia 内建解析与
 // readJsonBody 双解析冲突。

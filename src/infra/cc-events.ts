@@ -6,8 +6,8 @@
 // warnings, and the "hit an error event" bookkeeping. That removes the four
 // duplicated event switches and gives a single place to add new event types.
 
-import { log } from './logger'
-import type { CcErrorEvent, CcEventType } from './cc-types'
+import { log } from '../shared/logger'
+import type { CcErrorEvent, CcEventType } from '../shared/cc-types'
 
 // Every event type the upstream can emit (union of CcStreamEvent types). A
 // parser only warns about a type when it is NOT in this set, so adding a new

@@ -1,5 +1,5 @@
 import { Elysia } from 'elysia'
-import { CORS_HEADERS } from '../http'
+import { CORS_HEADERS } from '../shared/http'
 
 // Shim over src/http.ts CORS_HEADERS (module-load snapshot of
 // corsAllowOrigin(): CFG.apiKey ? 'null' : '*' unless CORS_ALLOW_ORIGIN set).

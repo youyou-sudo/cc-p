@@ -1,7 +1,7 @@
-import { CFG } from './config'
+import { CFG } from '../shared/config'
 import { getSessionId } from './session'
-import { CC_VERSION } from './version'
-import { fakeProjectSlug, generateTraceparent, getDateStr, getEnvironment, tryParseJSON } from './util'
+import { CC_VERSION } from '../shared/version'
+import { fakeProjectSlug, generateTraceparent, getDateStr, getEnvironment, tryParseJSON } from '../shared/util'
 
 function isEphemeralCacheControl(v: any): boolean {
   return !!v && v.type === 'ephemeral'

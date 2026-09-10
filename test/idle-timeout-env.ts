@@ -1,13 +1,13 @@
 // test/idle-timeout-env.ts — Issue #19 env 解析快速验证（无 30s 真等待，总耗时 <15s）。
 // 契约：CC_STREAM_IDLE_MS 默认 30000、CC_NONSTREAM_IDLE_MS 默认 90000、
 // CC_THINKING_IDLE_MS 默认 120000；unset/空 → 默认；非数字 → 进程 exit(1)；<=0 → 回默认。
-// 每个用例独立子进程（env 继承隔离），import src/config.ts 并打印三个常量。
+// 每个用例独立子进程（env 继承隔离），import src/shared/config.ts 并打印三个常量。
 // 现有 test/timeouts.ts 的 30s 断言保持不动，默认行为由它继续覆盖。
 // 思考宽限说明：start 后挂起在新契约下期望超时变为 120s（THINKING_IDLE_TIMEOUT_MS），
 // timeouts.ts 仍用 28–35s 断言覆盖“非思考期（空 lastCcEvent）仍 30s 快速失败”路径——不要改成真实等待 120s 的用例。
 
 const ROOT = import.meta.dir + "/..";
-const PROBE = `import { STREAM_IDLE_TIMEOUT_MS, NONSTREAM_IDLE_TIMEOUT_MS, THINKING_IDLE_TIMEOUT_MS } from "./src/config.ts"; console.log(JSON.stringify({ s: STREAM_IDLE_TIMEOUT_MS, n: NONSTREAM_IDLE_TIMEOUT_MS, t: THINKING_IDLE_TIMEOUT_MS }));`;
+const PROBE = `import { STREAM_IDLE_TIMEOUT_MS, NONSTREAM_IDLE_TIMEOUT_MS, THINKING_IDLE_TIMEOUT_MS } from "./src/shared/config.ts"; console.log(JSON.stringify({ s: STREAM_IDLE_TIMEOUT_MS, n: NONSTREAM_IDLE_TIMEOUT_MS, t: THINKING_IDLE_TIMEOUT_MS }));`;
 
 const dec = new TextDecoder();
 

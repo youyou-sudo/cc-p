@@ -1,5 +1,5 @@
-import { log } from './logger'
-import { mapCcEventError, mapFinishReason, normalizeUsage } from './errors'
+import { log } from '../shared/logger'
+import { mapCcEventError, mapFinishReason, normalizeUsage } from '../shared/errors'
 import { CcStreamParser } from './cc-events'
 import type { CcEventHooks } from './cc-events'
 

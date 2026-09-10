@@ -1,9 +1,9 @@
-import { CFG } from './config'
-import { log } from './logger'
-import { CC_VERSION } from './version'
-import { getApiKey } from './auth'
-import { nowUnix } from './util'
-import { sendJSON } from './http'
+import { CFG } from '../../shared/config'
+import { log } from '../../shared/logger'
+import { CC_VERSION } from '../../shared/version'
+import { getApiKey } from '../../shared/auth'
+import { nowUnix } from '../../shared/util'
+import { sendJSON } from '../../shared/http'
 
 export interface ModelEntry {
   id: string

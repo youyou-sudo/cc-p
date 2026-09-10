@@ -1,8 +1,8 @@
-import { CFG } from './config'
-import { log } from './logger'
-import { MODELS } from './models'
-import { startSessionCleanup } from './session'
-import { startVersionRefresh } from './version'
+import { CFG } from './shared/config'
+import { log } from './shared/logger'
+import { MODELS } from './modules/models/catalog'
+import { startSessionCleanup } from './infra/session'
+import { startVersionRefresh } from './shared/version'
 import { createApp } from './app'
 
 export function startServer() {

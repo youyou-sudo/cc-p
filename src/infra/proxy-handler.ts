@@ -4,11 +4,11 @@
 // forwarding are identical, so they live here once.
 
 import { forwardToCC } from './cc'
-import { mapCcError } from './errors'
-import type { MappedError } from './errors'
+import { mapCcError } from '../shared/errors'
+import type { MappedError } from '../shared/errors'
 import { ensureInitialized } from './fingerprint'
-import { BodyTooLargeError, readJsonBody } from './http'
-import { log } from './logger'
+import { BodyTooLargeError, readJsonBody } from '../shared/http'
+import { log } from '../shared/logger'
 
 export type JsonParseErrorKind = 'too-large' | 'invalid'
 

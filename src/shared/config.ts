@@ -27,9 +27,9 @@ function candidateDirs(): string[] {
     dirs.push(process.cwd())
     if (import.meta.dir) dirs.push(import.meta.dir)
   } else {
-    // Source runs (bun run / bun test): project root sits one level above src/.
+    // Source runs (bun run / bun test): project root sits two levels above src/shared/.
     if (import.meta.dir && !import.meta.dir.includes('$bunfs')) {
-      dirs.push(import.meta.dir + '/..')
+      dirs.push(import.meta.dir + '/../..')
     }
     dirs.push(process.cwd())
   }

@@ -1,5 +1,5 @@
-import { log } from './logger'
-import { uuid } from './util'
+import { log } from '../shared/logger'
+import { uuid } from '../shared/util'
 import { keyStateStore } from './fingerprint'
 
 const SESSION_DURATION_MS = 12 * 60 * 60 * 1000

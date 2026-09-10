@@ -1,4 +1,4 @@
-import { SSE_PING_EVENT, SsePipeline, startSseHeartbeat } from '../src/sse.ts'
+import { SSE_PING_EVENT, SsePipeline, startSseHeartbeat } from '../src/infra/sse.ts'
 
 let pass = 0
 let fail = 0

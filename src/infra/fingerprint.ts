@@ -1,7 +1,7 @@
-import { CFG } from './config'
-import { log } from './logger'
-import { pick, randHex, sha256hex } from './util'
-import { CC_VERSION } from './version'
+import { CFG } from '../shared/config'
+import { log } from '../shared/logger'
+import { pick, randHex, sha256hex } from '../shared/util'
+import { CC_VERSION } from '../shared/version'
 
 const FINGERPRINT_CPUS = [
   { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },
