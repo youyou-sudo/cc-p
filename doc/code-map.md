@@ -1,446 +1,1016 @@
 # 完整代码段映射报告（Code Map）
 
-> 扫描范围：`src/` 19 个模块 + `test/` 2 个测试，共 21 个 TS 文件、约 3 235 行。
+> 扫描范围：`src/` 40 个源文件（`shared/` 9、`infra/` 6、`modules/` 19、`plugins/` 4，外加 `app.ts` + `index.ts`）+ `test/` 4 个测试；共 44 个 TS 文件、约 4 518 行（源码约 3 718 + 测试约 800 行）。
 > 行号基于当前工作区文件内容；「可见性」中 `E`=export、`P`=模块私有。
+> 分层：入口（index/app）→ 插件（plugins）→ 协议模块（modules）→ 共享管道/上游对接（infra）/ 基础设施（shared）。
 
 ---
 
-## src/index.ts（117 行 · 入口层）
+## src/index.ts（79 行 · 入口层）
 
-服务启动入口：注册 Elysia 路由、CORS、全局错误处理，并提供 `healthcheck` CLI 子命令。
+服务启动入口：拉起后台任务、创建并监听 Elysia app、提供 `healthcheck` CLI 与 `unhandledRejection` 兜底。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 1-9 | — | import | — | elysia + config/http/logger/anthropic/models/openai/session/version |
-| 11-16 | `jsonResponse` | 函数 | P | 简易 JSON Response 构造（仅错误路径使用） |
-| 18-75 | `startServer` | 函数 | E | 创建 Elysia app 并监听 `CFG.port/CFG.host` |
-| 23-28 | └ onRequest 钩子 | 路由中间件 | P | 注入 CORS_HEADERS；OPTIONS → 204 |
-| 29-33 | └ 路由注册 | 路由 | P | `/`、`/health`、`/v1/models`、`/v1/chat/completions`、`/v1/messages` |
-| 34-51 | └ onError 处理 | 错误处理 | P | 404 / 413 / PARSE / VALIDATION → 协议化错误体（messages 路径用 Anthropic 错误形状） |
-| 54-72 | └ 启动日志 | 日志 | P | 打印 url/api/models 数量/CORS 策略/会话策略/ZDR/日志文件；无兜底 Key 时告警 |
-| 77-99 | `healthcheck` | 异步函数 | E | GET `/health`，期望 `{ok:true}`，失败 `process.exit(1)`；Docker HEALTHCHECK 入口 |
-| 101-110 | unhandledRejection | 全局钩子 | P | AbortError 静默，其余记 error 日志 |
-| 112-117 | CLI 分派 | 入口 | P | `argv[2]==='healthcheck'` → healthcheck()，否则 startServer() |
+| 1-6 | — | import | — | `./shared/config`(CFG) `./shared/logger`(log) `./modules/models/catalog`(MODELS) `./infra/session`(startSessionCleanup) `./shared/version`(startVersionRefresh) `./app`(createApp) |
+| 8-37 | `startServer` | 函数 | E | 启动 `startVersionRefresh`/`startSessionCleanup`，`createApp().listen()`，打印启动日志与无 Key 告警 |
+| 39-61 | `healthcheck` | 异步函数 | E | GET `127.0.0.1:{PORT\|CFG.port}/health`，5s 超时，要求 `body.ok===true`；成功 `exit(0)` 否则 `exit(1)` |
+| 63-72 | unhandledRejection 监听 | 逻辑 | P | `AbortError`/`ABORT_ERR` 记 info，其余记 error |
+| 74-79 | CLI 分派 | 逻辑 | P | `argv[2]==='healthcheck'` → `healthcheck()`，否则 `startServer()` |
 
-依赖：`./config`(CFG,MAX_BODY_SIZE) → `./http`(CORS_HEADERS) → `./logger`(log) → `./anthropic`(handleMessages) → `./models`(handleModels,MODELS) → `./openai`(handleChatCompletions) → `./session`(startSessionCleanup) → `./version`(startVersionRefresh)
+依赖：`./shared/config` `./shared/logger` `./modules/models/catalog` `./infra/session` `./shared/version` `./app`
 
 ---
 
-## src/config.ts（123 行 · 基础设施）
+## src/app.ts（21 行 · 入口层）
 
-配置加载：内置默认值 → config.json → 环境变量，三层覆盖；顶层 `await` 一次加载。
+组装 Elysia 应用，按固定顺序注册 4 个插件与 4 个 controller，返回未 listen 的实例。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 1-12 | `AppConfig` | interface | E | port/host/apiBase/apiKey/corsAllowOrigin/logFile/logLevel/useProviderModels/modelRefreshIntervalMs/zdr |
-| 14-17 | `die` | 函数 | P | 打印 `[config]` 错误并 `process.exit(1)` |
-| 19-36 | `candidateDirs` | 函数 | P | 独立二进制：cwd → $bunfs；源码运行：`src/..` → cwd（兼容 Docker/Release） |
-| 38-51 | `findConfigJson` | 异步函数 | P | 按候选目录查找并解析 config.json，解析失败返回 null |
-| 53-55 | `AppConfigWithSource` | interface | E | AppConfig + `configPath?`（当前未被使用，预留） |
-| 57-60 | `envString` | 函数 | P | 环境变量读取，空串视为未设置 |
-| 62-68 | `envNumber` | 函数 | P | 非法数字 → die |
-| 70-74 | `envBool` | 函数 | P | `'1'`/`'true'`（大小写不敏感）→ true |
-| 76-116 | `loadConfig` | 异步函数 | P | 默认值(L79-90) → fileConfig 合并(L92-95) → 端口/刷新间隔校验(L97-102) → 环境变量覆盖(L104-113)：PORT/HOST/CC_API_BASE/CC_API_KEY/CORS_ALLOW_ORIGIN/LOG_FILE/LOG_LEVEL/CC_USE_PROVIDER_MODELS/CC_MODEL_REFRESH_INTERVAL_MS/CMD_ZDR |
-| 118 | `CFG` | const | E | `await loadConfig()` 的单例配置 |
-| 120-123 | `MAX_BODY_SIZE` | const | E | `CC_MAX_BODY_MB`（默认 100MB），仅接受 >0 |
+| 1-9 | — | import | — | `elysia`(Elysia)；`./plugins/cors` `./plugins/errors` `./plugins/body` `./plugins/auth`；`./modules/health/index` `./modules/models/index` `./modules/chat/index` `./modules/messages/index` |
+| 11-21 | `createApp` | 函数 | E | `new Elysia().use(...)` 装配顺序：cors → errors → bodyLimit → auth → health → models → chat → messages |
+| 13-16 | └ 插件注册 | 插件 | P | cors / errors / bodyLimit / auth |
+| 17-20 | └ controller 注册 | 路由 | P | health / models / chat / messages |
+
+依赖：`elysia` `./plugins/cors` `./plugins/errors` `./plugins/body` `./plugins/auth` `./modules/health/index` `./modules/models/index` `./modules/chat/index` `./modules/messages/index`
 
 ---
 
-## src/logger.ts（16 行 · 基础设施）
+## src/plugins/cors.ts（16 行 · 插件层）
 
-分级日志：console 输出 + 可选文件追加（异步、失败静默）。
+每请求注入 CORS 头并对 OPTIONS 短路 204；`@elysiajs/cors` 的替代 shim。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 4 | `LogLevel` | type | E | `'info' \| 'warn' \| 'error'` |
-| 6 | `LEVEL_RANK` | const | P | debug:0 / info:1 / warn:2 / error:3（含 debug 供阈值比较） |
-| 8-16 | `log` | 函数 | E | 低于 `CFG.logLevel` 阈值则丢弃；格式 `[ISO时间] [level] msg {json}`；logFile 存在时 appendFile 追加 |
+| 1-2 | — | import | — | `elysia`(Elysia) `../shared/http`(CORS_HEADERS) |
+| 10 | `corsPlugin` | 常量/插件 | E | `new Elysia({ name: 'cors' })` |
+| 11-15 | └ `onRequest` 钩子 | 中间件 | P | `Object.assign(set.headers, CORS_HEADERS)`；`OPTIONS` → `204` + CORS_HEADERS |
+
+依赖：`elysia` `../shared/http`
 
 ---
 
-## src/util.ts（75 行 · 基础设施）
+## src/plugins/errors.ts（60 行 · 插件层）
 
-无依赖工具集：哈希、随机、时间、JSON、伪造指纹辅助。
+scoped `onError`：404 / 413 / PARSE / VALIDATION / 500 归一化，`/v1/messages` 用 Anthropic 形状。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 1-3 | `sha256hex` | 函数 | E | Bun.CryptoHasher → hex 摘要 |
-| 5-7 | `sha256bytes` | 函数 | E | 同上，返回原始字节 |
-| 9-16 | `bytesToBase64` | 函数 | E | 分块(0x8000) String.fromCharCode + btoa |
-| 18-22 | `randHex` | 函数 | E | crypto.getRandomValues → hex 串 |
-| 24-26 | `uuid` | 函数 | E | crypto.randomUUID |
-| 28-30 | `pick` | 函数 | E | 随机取数组元素 |
-| 32-34 | `nowUnix` | 函数 | E | 秒级时间戳 |
-| 36-38 | `getDateStr` | 函数 | E | `YYYY-MM-DD`（ISO 截取） |
-| 40-42 | `getEnvironment` | 函数 | E | `'win32-x64, Node.js 22.10.0'` 与 fingerprint.ts 保持一致，避免被检测为机器人 |
-| 44-50 | `tryParseJSON` | 函数 | E | 解析失败返回 `{}` |
-| 52-54 | `generateTraceparent` | 函数 | E | W3C traceparent：`00-{32hex}-{16hex}-01` |
-| 56-75 | `fakeProjectSlug` | 函数 | E | 由 sessionId 确定性生成 `users-dev-projects-<name>-<suffix>` 形态 slug |
+| 1-2 | — | import | — | `elysia`(Elysia) `../shared/config`(MAX_BODY_SIZE) |
+| 15-20 | `jsonResponse` | 函数 | P | 构造 JSON `Response` |
+| 22-30 | `isStatusResponse` | 函数 | P | 判定 `ElysiaCustomStatusResponse` |
+| 32 | `errorsPlugin` | 常量/插件 | E | `new Elysia({ name: 'errors' })` |
+| 38-59 | └ `onError`（scoped） | 中间件 | P | 401 穿透；NOT_FOUND→404；413/PARSE/VALIDATION→413 或 400 双形；其余→500 |
+
+依赖：`elysia` `../shared/config`
 
 ---
 
-## src/runtime.ts（13 行 · 基础设施）
+## src/plugins/body.ts（77 行 · 插件层）
 
-超时常量与进程级超时计数（连续超时 N 次后向客户端建议缩减上下文）。
+单次限流 JSON 解析插件：`onParse` 复用 `readJsonBody`，`onTransform` 抛 `Error(status=413)` 桥接 413 双形。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 1 | `STREAM_IDLE_TIMEOUT_MS` | const | E | 30 000（`CC_STREAM_IDLE_MS` 可覆盖，默认不变），流式响应读空闲上限 |
-| 2 | `NONSTREAM_IDLE_TIMEOUT_MS` | const | E | 90 000（`CC_NONSTREAM_IDLE_MS` 可覆盖，默认不变），非流式聚合读空闲上限 |
-| 3 | `TIMEOUT_REDUCE_CONTEXT_THRESHOLD` | const | E | 3 |
-| 5-7 | `runtimeState` | const | E | `{ consecutiveTimeouts: 0 }`，成功响应后归零（openai.ts:286 / anthropic.ts:435,591） |
-| 9-13 | `timeoutMessage` | 函数 | E | ≥3 次连续超时 → 提示缩减上下文文案，否则普通超时文案 |
-14 | `TIMEOUT_STATE_TTL_MS` | 30 分钟：条目空闲超此时间后被清除 |
-16-19 | `TimeoutEntry` | 接口 | P | `{ consecutiveTimeouts, lastUpdatedAt }` 每个 API key 独立的超时状态 |
-21 | `timeoutStates` | Map | P | 按 API key 隔离的超时状态存储 |
-23-27 | `pruneStale` | 函数 | P | 清理超过 TTL 的过期条目 |
-29-36 | `entryFor` | 函数 | P | 获取或创建指定 key 的条目 |
-39-45 | `recordTimeout` | 函数 | E | 指定 key 超时计数 +1 |
-48-50 | `recordTimeoutSuccess` | 函数 | E | 指定 key 成功时删除其状态 |
-53-57 | `consecutiveTimeouts` | 函数 | E | 获取指定 key 的当前连续超时次数 |
-59-63 | `timeoutMessage` | 函数 | E | ≥3 次连续超时 → 提示缩减上下文文案 |
+| 1-2 | — | import | — | `elysia`(Elysia) `../shared/http`(readJsonBody, BodyTooLargeError) |
+| 43 | `tooLargeByRequest` | 常量/字段 | P | `WeakMap<Request,string>` 暂存超限 message |
+| 44 | `TOO_LARGE_BODY` | 常量 | P | 占位对象，短路默认解析 |
+| 46 | `bodyLimitPlugin` | 常量/插件 | E | `new Elysia({ name: 'body-limit' })` |
+| 47-66 | └ `onParse`（scoped） | 中间件 | P | 仅 JSON 拦截；GET/HEAD 放行；`BodyTooLargeError` → stash+占位，其余透传 |
+| 67-77 | └ `onTransform`（scoped） | 中间件 | P | 命中 stash → 抛普通 `Error` 并置 `status=413` |
+
+依赖：`elysia` `../shared/http`
 
 ---
 
-## src/http.ts（135 行 · 基础设施）
+## src/plugins/auth.ts（70 行 · 插件层）
 
-HTTP 层工具：CORS/SSE 头、JSON/Anthropic 错误响应、带排水保护和全局读超时的请求体读取、Promise 超时竞速。
+鉴权 shim：decorate `getApiKey` + opt-in `requireAuth` macro，导出双协议 401 body 与 `createAuthPreCheck` 预检工厂。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 9-12 | `corsAllowOrigin` | 函数 | P | 显式配置优先；否则有兜底 Key → `'null'`（拒绝浏览器跨域），无 → `'*'` |
-| 14-18 | `CORS_HEADERS` | const | E | Allow-Origin / Methods(`GET, POST, OPTIONS`) / Headers(`*`) |
-| 20-25 | `SSE_HEADERS` | const | E | text/event-stream + no-cache + keep-alive + X-Accel-Buffering:no |
-| 27-33 | `sendJSON` | 函数 | E | JSON 响应；body 含 `retry_after` 时自动加 `Retry-After` 头 |
-| 35-50 | `sendAnthropicError` | 函数 | E | `{type:'error',error:{type,message}}` 形状；`headerOnly` 选项只发头不带 body.retry_after |
-| 52-56 | `BodyTooLargeError` | class | E | 超 MAX_BODY_SIZE 抛出（消息含 MB 数） |
-| 58 | `DRAIN_LIMIT` | const | P | 32 MB：超限后最多再排水 32MB 即取消 reader（防慢速攻击占内存） |
-| 59 | `sharedDecoder` | const | P | 模块级共享 TextDecoder |
-| 61-121 | `readJsonBody(request, timeoutMs=30000)` | 异步函数 | E | content-length 预检 → 分块读取；超限置 tooLarge 并排水；使用 `readWithTimeout` 实现全局读超时（默认 30s），超时自动 cancel reader；最终 JSON.parse（失败抛 Invalid JSON） |
-| 75-80 | `readWithTimeout` | 内部函数 | P | Promise.race 超时包装；超时 reject `new Error('READ_TIMEOUT')`；防止 Slowloris 攻击 |
-| 123-135 | `readWithTimeout` | 异步函数 | E | `Promise.race` 包超时；超时 reject `new Error(tag)`（tag 约定为 `'STREAM_IDLE_TIMEOUT'`，被上层按 message 匹配）；finally 清定时器 |
+| 1-2 | — | import | — | `elysia`(Elysia) `../shared/auth`(authErrorMessage, getApiKey) |
+| 15-23 | `authErrorBody` | 函数 | E | 合并形状 401 body（macro 用，双协议并存） |
+| 25-35 | `authPlugin` | 常量/插件 | E | `new Elysia({ name: 'auth' })`；decorate `getApiKey`，macro `requireAuth` |
+| 40 | `openAI401Body` | 函数 | E | OpenAI 401 字面量 `{ error:{ message, type:'auth_error' } }` |
+| 41-44 | `anthropic401Body` | 函数 | E | Anthropic 401 字面量 `{ type:'error', error:{ type:'authentication_error', message } }` |
+| 55-69 | `createAuthPreCheck` | 函数 | E | 返回 `onTransform`/`derive` 预检回调：无 key → `status(401, …)` |
+
+依赖：`elysia` `../shared/auth`
 
 ---
 
-## src/auth.ts（43 行 · 基础设施）
+## src/shared/config.ts（148 行 · 基础设施层）
 
-API Key 提取与鉴权错误文案（格式校验：`user_` 前缀 + base64url 字符集）。
+三层覆盖（默认值 → config.json → 环境变量）的全局配置单例与请求体/空闲超时常量。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 3 | `KEY_PATTERN` | const | E | `/user_[a-zA-Z0-9_-]+/`（非锚定，取首个匹配） |
-| 5-9 | `extractKey` | 函数 | P | 从字符串中提取符合 KEY_PATTERN 的 Key |
-| 11-22 | `getApiKey` | 函数 | E | 优先级：`Authorization: Bearer user_xxx` → `x-api-key` → `CFG.apiKey` 兜底；三者皆无 → null |
-| 24-34 | `keyFormatError` | 函数 | E | 客户端**带了** Key 但格式非法时返回错误文案（截取前 12 字符），合法/未带 → null |
-| 36-42 | `authErrorMessage` | 函数 | E | 格式错误文案优先；否则区分「有兜底 Key（提示可设 CC_API_KEY）」与「无兜底」两种 401 文案 |
+| 1-13 | `AppConfig` | interface | E | 11 字段配置接口 |
+| 15-18 | `die` | 函数 | P | `[config]` 报错 + `exit(1)` |
+| 20-37 | `candidateDirs` | 函数 | P | 独立二进制与源码两种目录探测顺序 |
+| 39-52 | `findConfigJson` | 函数 | P | 逐目录查找并解析 config.json，损坏返回 null |
+| 54-56 | `AppConfigWithSource` | interface | E | 追加可选 `configPath` |
+| 58-61 | `envString` | 函数 | P | 空串视为未设置 |
+| 63-69 | `envNumber` | 函数 | P | 非有限数字 `die()` |
+| 71-75 | `envBool` | 函数 | P | 仅 `1`/`true` 为真 |
+| 77-83 | `envBoolDefaultTrue` | 函数 | P | 仅 `false`/`0`/`no` 为假 |
+| 85-127 | `loadConfig` | 函数 | P | 默认值 + 文件合并 + 校验 + 11 项 env 覆盖 |
+| 129 | `CFG` | 常量 | E | 顶层 await 得到的配置单例 |
+| 131-134 | `MAX_BODY_SIZE` | 常量 | E | `CC_MAX_BODY_MB`，默认 100MiB |
+| 136-139 | `STREAM_IDLE_TIMEOUT_MS` | 常量 | E | `CC_STREAM_IDLE_MS`，默认 30_000 |
+| 140-143 | `NONSTREAM_IDLE_TIMEOUT_MS` | 常量 | E | `CC_NONSTREAM_IDLE_MS`，默认 90_000 |
+| 144-148 | `THINKING_IDLE_TIMEOUT_MS` | 常量 | E | `CC_THINKING_IDLE_MS`，默认 120_000 |
+
+依赖：无（Bun 全局/process）
 
 ---
 
-## src/cc-types.ts（39 行 · 基础设施 · 纯类型）
+## src/shared/logger.ts（16 行 · 基础设施层）
+
+按 `CFG.logLevel` 过滤的全局日志，同时写控制台与可选日志文件。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1-2 | — | import | — | `CFG`（./config）、`appendFile`（node:fs/promises） |
+| 4 | `LogLevel` | type | E | `info` \| `warn` \| `error` |
+| 6 | `LEVEL_RANK` | 常量 | P | `debug:0,info:1,warn:2,error:3` |
+| 8-16 | `log` | 函数 | E | 阈值过滤、格式化、双通道输出 |
+
+依赖：`./config` `node:fs/promises`
+
+---
+
+## src/shared/util.ts（75 行 · 基础设施层）
+
+无状态工具：哈希、Base64、随机/UUID、时间、宽松 JSON 解析与指纹辅助字符串。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1-3 | `sha256hex` | 函数 | E | SHA-256 十六进制 |
+| 5-7 | `sha256bytes` | 函数 | E | SHA-256 `Uint8Array` |
+| 9-16 | `bytesToBase64` | 函数 | E | 分块 0x8000 后 `btoa` |
+| 18-22 | `randHex` | 函数 | E | 随机字节转十六进制 |
+| 24-26 | `uuid` | 函数 | E | `crypto.randomUUID()` |
+| 28-30 | `pick` | 函数 | E | 随机取数组项 |
+| 32-34 | `nowUnix` | 函数 | E | Unix 秒 |
+| 36-38 | `getDateStr` | 函数 | E | `YYYY-MM-DD` |
+| 40-42 | `getEnvironment` | 函数 | E | 硬编码指纹 `win32-x64, Node.js 22.10.0` |
+| 44-50 | `tryParseJSON` | 函数 | E | 失败返回 `{}` |
+| 52-54 | `generateTraceparent` | 函数 | E | W3C `00-<16字节>-<8字节>-01` |
+| 56-75 | `fakeProjectSlug` | 函数 | E | 确定性模拟项目路径 slug |
+
+依赖：无（Bun 全局/Web crypto）
+
+---
+
+## src/shared/runtime.ts（139 行 · 基础设施层）
+
+按 (apiKey, session) 隔离的连续空闲超时计数，并选择 per-read 超时预算。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 9 | 重导出 | import | E | 从 ./config 重导出三个超时常量 |
+| 10 | — | import | — | 本地导入三个超时常量 |
+| 11 | `TIMEOUT_REDUCE_CONTEXT_THRESHOLD` | 常量 | E | 连续 3 次触发缩减上下文提示 |
+| 12-13 | `TIMEOUT_LARGE_CONTEXT_TOKENS` | 常量 | E | 80_000 |
+| 15-16 | `TIMEOUT_STATE_TTL_MS` | 常量 | P | 30 分钟懒清理 |
+| 18-21 | `TimeoutEntry` | interface | P | 计数 + 时间戳 |
+| 23 | `timeoutStates` | 字段 | P | 模块级 Map 状态 |
+| 25-29 | `scopeKey` | 函数 | E | `${apiKey}::${sessionId \|\| 'default'}` |
+| 31-35 | `legacyKey` | 函数 | P | 裸 apiKey 旧键兜底 |
+| 37-41 | `pruneStale` | 函数 | P | 删除过期条目 |
+| 43-47 | `freshCount` | 函数 | P | 缺失/过期返回 0 |
+| 49-56 | `entryFor` | 函数 | P | 取或新建条目 |
+| 58-65 | `recordTimeout` | 函数 | E | 先清理再自增计数 |
+| 67-74 | `recordTimeoutSuccess` | 函数 | E | 删除 scoped 与（无 session 时）legacy 键 |
+| 76-84 | `consecutiveTimeouts` | 函数 | E | 无 session 时取 scoped/legacy 最大 |
+| 86-90 | `TimeoutMessageOptions` | interface | E | inputTokens/timeoutMs/sessionId |
+| 92-104 | `timeoutMessage` | 函数 | E | 三次以上给上游慢/减上下文提示 |
+| 106-109 | `TimeoutDetailsOptions` | interface | E | timeoutMs/sessionId |
+| 111-121 | `timeoutDetails` | 函数 | E | 机器可读诊断字段 |
+| 123-131 | `isThinkingWait` | 函数 | E | start/start-step/reasoning-start/reasoning-delta |
+| 133-138 | `idleTimeoutFor` | 函数 | E | thinking 用长窗口，否则按 streaming 选默认 |
+
+依赖：`./config`
+
+---
+
+## src/shared/http.ts（126 行 · 基础设施层）
+
+CORS/SSE 头常量、JSON 与 Anthropic 错误响应构造器、带限制与超时的请求体解析。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1 | — | import | — | `CFG`、`MAX_BODY_SIZE`（./config） |
+| 9-12 | `corsAllowOrigin` | 函数 | P | 显式值优先；有兜底 key 时为 `null`，否则 `*` |
+| 14-18 | `CORS_HEADERS` | 常量 | E | 允许 Origin/Methods/Headers |
+| 20-25 | `SSE_HEADERS` | 常量 | E | event-stream 全套头 |
+| 27-33 | `sendJSON` | 函数 | E | 附带 `retry_after` → `Retry-After` |
+| 35-50 | `sendAnthropicError` | 函数 | E | `{type:'error',error:{type,message}}`，支持 headerOnly |
+| 52-56 | `BodyTooLargeError` | class | E | 消息含 MB 上限 |
+| 58 | `DRAIN_LIMIT` | 常量 | P | 32MiB 排水上限 |
+| 59 | `sharedDecoder` | 常量 | P | 复用 TextDecoder |
+| 61-112 | `readJsonBody` | 函数 | E | 长度预检 + 超时读取 + 超限排水 + 解析 |
+| 114-126 | `readWithTimeout` | 函数 | E | `Promise.race` 超时并以 tag 拒绝 |
+
+依赖：`./config`
+
+---
+
+## src/shared/auth.ts（43 行 · 基础设施层）
+
+API Key 提取与鉴权错误文案，格式校验为 `user_` 前缀 + base64url 字符集。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1-1 | — | import | — | `./config`(CFG) |
+| 3 | `KEY_PATTERN` | 常量 | E | `/user_[a-zA-Z0-9_-]+/`，非锚定，取首个匹配 |
+| 5-9 | `extractKey` | 函数 | P | 从字符串中提取合法 Key；无值/无匹配 → null |
+| 11-22 | `getApiKey` | 函数 | E | 优先级：`Authorization: Bearer` → `x-api-key` → `CFG.apiKey` 兜底；皆无 → null |
+| 24-34 | `keyFormatError` | 函数 | E | 客户端主动带 Key 但格式非法 → 错误文案（前 12 字符预览）；未带/合法 → null |
+| 36-42 | `authErrorMessage` | 函数 | E | 格式错误文案优先；否则按是否有兜底 Key 区分两种 401 文案 |
+
+依赖：`./config`(CFG)
+
+---
+
+## src/shared/cc-types.ts（39 行 · 基础设施层 · 纯类型）
 
 Command Code 上游 NDJSON 线协议类型定义，无运行时代码。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
 | 4-9 | `CcUsage` | interface | E | inputTokens/outputTokens/cachedInputTokens/inputTokenDetails.cacheWriteTokens |
-| 13-30 | 17 个事件接口 | interface | E | `CcStartEvent`(13) `CcStartStepEvent`(14) `CcReasoningStartEvent`(15) `CcTextStartEvent`(16) `CcTextEndEvent`(17) `CcReasoningEndEvent`(18) `CcToolInputStartEvent`(19) `CcToolInputDeltaEvent`(20) `CcToolInputEndEvent`(21) `CcToolErrorEvent`(22) `CcProviderMetadataEvent`(23) `CcTextDeltaEvent`(25, text/delta 双字段) `CcReasoningDeltaEvent`(26) `CcToolCallEvent`(27) `CcFinishStepEvent`(28) `CcFinishEvent`(29, totalUsage/usage) `CcErrorEvent`(30, error/message/retry_after) |
-| 32-37 | `CcStreamEvent` | type(union) | E | 上述全部事件的判别联合 |
+| 13 | `CcStartEvent` | interface | E | `{type:'start'}` |
+| 14 | `CcStartStepEvent` | interface | E | `{type:'start-step'}` |
+| 15 | `CcReasoningStartEvent` | interface | E | `{type:'reasoning-start'}` |
+| 16 | `CcTextStartEvent` | interface | E | `{type:'text-start'}` |
+| 17 | `CcTextEndEvent` | interface | E | `{type:'text-end'}` |
+| 18 | `CcReasoningEndEvent` | interface | E | `{type:'reasoning-end'}` |
+| 19 | `CcToolInputStartEvent` | interface | E | `{type:'tool-input-start'}` |
+| 20 | `CcToolInputDeltaEvent` | interface | E | `{type:'tool-input-delta'}` |
+| 21 | `CcToolInputEndEvent` | interface | E | `{type:'tool-input-end'}` |
+| 22 | `CcToolErrorEvent` | interface | E | `{type:'tool-error'}` |
+| 23 | `CcProviderMetadataEvent` | interface | E | `{type:'provider-metadata'}` |
+| 25 | `CcTextDeltaEvent` | interface | E | `{type:'text-delta'; text?/delta?}` 双字段兼容 |
+| 26 | `CcReasoningDeltaEvent` | interface | E | `{type:'reasoning-delta'; text?}` |
+| 27 | `CcToolCallEvent` | interface | E | `{type:'tool-call'; toolCallId?/toolName?/input?}` |
+| 28 | `CcFinishStepEvent` | interface | E | `{type:'finish-step'; finishReason?/usage?}` |
+| 29 | `CcFinishEvent` | interface | E | `{type:'finish'; finishReason?/totalUsage?/usage?}` |
+| 30 | `CcErrorEvent` | interface | E | `{type:'error'; error?{message,type}/message?/retry_after?}` |
+| 32-37 | `CcStreamEvent` | type（联合） | E | 全部 17 个事件的判别联合 |
 | 39 | `CcEventType` | type | E | `CcStreamEvent['type']` 事件名字面量联合 |
 
----
-
-## src/cc-events.ts（96 行 · 共享管道）
-
-CC NDJSON → 事件分发的共用解析器。各协议文件注册 `CcEventHooks`，本模块负责缓冲分行、JSON 解析、未知事件告警与错误事件记账。
-
-| 行号 | 符号 | 类别 | 可见性 | 说明 |
-|---|---|---|---|---|
-| 15-24 | `CC_EVENT_TYPES` | const Set | E | 上游可能出现的全部 17 种事件类型；解析器仅对**不在集合内**的类型告警，新增上游事件只需在此补一行 |
-| 26 | `CcEventHook` | type | E | `(event) => string[] \| string \| void`，返回值作为待发送 SSE 片段 |
-| 27-29 | `CcEventHooks` | type | E | 按事件类型的钩子表 + `default(type,event)` 兜底 |
-| 31-101 | `CcStreamParser` | class | E | 核心解析器 |
-| 32 | └ `lastCcEvent` | 字段 | P | 最近一次收到的事件类型（供超时/断连诊断日志） |
-| 33 | └ `errorEvent` | 字段 | P | 最近一次 `type:'error'` 事件 |
-| 34 | └ `unknownEvent` | 字段 | P | 最近一次未知事件类型 |
-| 36-37 | └ `buffer` / `MAX_LINE_LENGTH` | 字段 | P | 行缓冲；单行上限 64KB，超过自动清空（防止内存攻击） |
-| 43-54 | └ `push` | 方法 | P | 流式解码 → 检查行长度限制 → 按 `\n` 切行（最后一段留缓冲）→ 逐行 handleLine，收集输出片段 |
-| 52-59 | └ `flush` | 方法 | P | 流结束时冲刷尾行 |
-| 61-95 | └ `handleLine` | 方法 | P | 空行/`[DONE]`/SSE 注释行跳过；JSON 解析失败静默；无 type 跳过；`error` 事件优先记账并调用 hooks.error；未知类型 → hooks.default 或 log warn |
+依赖：无
 
 ---
 
-## src/cc.ts（190 行 · 上游对接）
+## src/shared/errors.ts（109 行 · 基础设施层）
 
-OpenAI 中间格式 → CC 请求体构建，以及向 `{CC_API_BASE}/alpha/generate` 的 HTTP 转发（含伪 CLI 头部）。
+CC 上游错误 → 目标协议错误体、finish reason 与 usage 的归一化映射；超长错误优先归 400。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 6-156 | `buildCcRequest` | 函数 | E | OpenAI 请求 → CC body |
-| 9-15 | └ system 提取 | 逻辑 | P | `system`/`developer` 角色消息拼接为 systemPrompt（数组内容按 text 逐段拼接） |
-| 17-26 | └ toolNameMap | 逻辑 | P | assistant `tool_calls[].id → function.name` 映射（供 tool 结果回填工具名） |
-| 28-78 | └ 消息转换 | 逻辑 | P | user：字符串→`[{type:'text'}]`、`image_url`→`{type:'image',image:url}`；assistant：text 片段 + `tool_calls`→`{type:'tool-call',toolCallId,toolName,input}`（arguments 字符串 tryParseJSON）；tool → `{type:'tool-result',toolCallId,toolName(msg.name 优先，查表次之),output:{type:'text',value}}`；其余角色兜底为 user 文本 |
-| 80-86 | └ 缓存标记 | 逻辑 | P | 有 `prompt_cache_key` 且消息无 cache_control 时，在首条 user 消息最后一个 text 片段注入 `cache_control:{type:'ephemeral'}` |
-| 88-110 | └ body 骨架 | 逻辑 | P | `config`（workingDir/date/environment/伪 git 状态）、`memory/taste/skills`、`permissionMode:'standard'`、`params{model(默认 deepseek/deepseek-v4-flash),messages,max_tokens(min(x,200000),默认64000),stream:true}` |
-| 112-153 | └ 可选参数透传 | 逻辑 | P | system/temperature/reasoning_effort/tools(→name+input_schema)/tool_choice(auto,none,required→any;function→tool)/parallel_tool_calls/top_p/stop/user/seed |
-| 158-190 | `forwardToCC` | 异步函数 | E | POST `${CFG.apiBase}/alpha/generate`；头：Content-Type、Authorization Bearer、x-cli-environment:production、x-command-code-version、x-session-id(getSessionId)、x-co-flag:false、x-taste-learning:false、x-project-slug(fakeProjectSlug)、traceparent；`CFG.zdr` 或请求头 `x-cmd-zdr:1` 时加 `x-cmd-zdr:1`；透传 AbortSignal |
+| 1-12 | `CC_STATUS_MAP` | 常量 | E | 400/422→400 invalid_request；401/403→401 authentication；402→402 payment_required；404→404 not_found；429→429 rate_limit；500/502→502 upstream；503→503 temporarily_unavailable |
+| 14-17 | `MappedError` | interface | E | `{status, body}`，body 为目标协议错误形状 |
+| 19-20 | `CONTEXT_WINDOW_EXCEEDED_PATTERN` | 常量 | E | 超长识别正则（prompt/context/max tokens/input/message 等） |
+| 22-24 | `isContextWindowExceeded` | 函数 | E | 正则测试 message，空串 → false |
+| 26 | `CONTEXT_WINDOW_ERROR` | 常量 | E | `{status:400, type:'context_window_exceeded'}` |
+| 28-61 | `mapCcError` | 函数 | E | 非 2xx 响应体 → MappedError；解析 message；**超长优先 400**（L43-48）→ 429 附 retry_after:30（L50-58）→ 默认映射（L60） |
+| 63-84 | `mapCcEventError` | 函数 | E | 流内 error 事件：**超长优先 400**（L66-71）→ 解析消息前缀 `<NNN>`（缺省 502）→ 429 附 retry_after:30 |
+| 86-93 | `mapFinishReason` | 函数 | E | `tool-calls→tool_calls`；length/stop 原样；空值 → stop |
+| 95-100 | `normalizeUsage` | 函数 | E | 当前为**空操作**（no-op），usage 口径原样透传上游 |
+| 102-109 | `mapAnthropicStopReason` | 函数 | E | `tool_calls→tool_use`、`length→max_tokens`、`stop→end_turn`、缺省 end_turn |
 
-依赖：`./config`(CFG) `./session`(getSessionId) `./version`(CC_VERSION) `./util`(fakeProjectSlug,generateTraceparent,getDateStr,getEnvironment,tryParseJSON)
+依赖：无
 
 ---
 
-## src/sse.ts（194 行 · 共享管道）
+## src/shared/version.ts（25 行 · 基础设施层）
 
-SSE 发送管道（缓冲/保活/终止语义）+ OpenAI 协议的 CC→SSE 流式翻译器。
+CC CLI 版本号维护：初值 `0.32.3`，每 24h 从 npm registry 拉取 `command-code` 最新版本刷新。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 6-79 | `SsePipeline` | class | E | 可控 ReadableStream 封装 |
-| 13-18 | └ 字段 | 字段 | P | `stream`(ReadableStream)、`firstOutput`/`terminal` Promise、`started`/`closed`/`keepaliveCount` |
-| 20-26 | └ 构造器 | 方法 | P | autoStart 参数决定 emit 是否自动开播 |
-| 28-32 | └ `enqueue` | 方法 | P | TextEncoder 编码入队，controller 已关闭时静默 |
-| 34-41 | └ `emit` | 方法 | P | 未开播则入 buffered；autoStart=true 时自动 start |
-| 43-47 | └ `emitKeepalive` | 方法 | P | 发送 `: keepalive\n\n` 注释帧并计数（仅在已开播且未关闭） |
-| 49-51 | └ `writeNow` | 方法 | P | 绕过缓冲直接写（用于错误事件） |
-| 53-59 | └ `start` | 方法 | P | 冲刷缓冲 → resolve firstOutput |
-| 61-68 | └ `close` | 方法 | P | 关流 → resolve terminal |
-| 70-78 | └ `terminateWith` | 方法 | P | 冲刷缓冲 + 写入终止事件序列 + close（客户端断连时的优雅收尾） |
-| 81-91 | `makeChunk` | 函数 | P | OpenAI `chat.completion.chunk` SSE 帧；usage 存在时附带 |
-| 93-194 | `createSseTranslator` | 工厂函数 | E | 闭包状态：chunkIndex/finishReason/usage/toolCallIndex + 内嵌 CcStreamParser |
-| 107-163 | └ hooks | 逻辑 | P | `text-delta`→content chunk（首块带 role）；`reasoning-delta`→reasoning_content chunk；`tool-call`→tool_calls delta（id 缺省 `call_{ts}_{i}`）；`finish-step`→记账 usage/finishReason；`finish`→最终带 usage 的空 delta chunk；`error`→记 upstreamError(mapCcEventError) |
-| 165-193 | └ 返回对象 | API | P | getter：lastCcEvent/upstreamError/inputTokens/outputTokens/cachedInputTokens；方法：parseChunk/flush/getDoneEvent(`data: [DONE]\n\n`) |
+| 1-1 | — | import | — | `./logger`(log) |
+| 3 | `CC_VERSION` | 变量(let) | E | 当前版本（可变，被 cc/fingerprint/models 引用写入请求头） |
+| 4 | `CC_VERSION_REFRESH_MS` | 常量 | P | 24h |
+| 6-20 | `refreshCCVersion` | 异步函数 | E | GET `registry.npmjs.org/command-code/latest`（10s 超时）；成功改写 CC_VERSION，失败 warn 保留现值 |
+| 22-25 | `startVersionRefresh` | 函数 | E | 启动即刷新 + setInterval(24h)，不阻塞启动 |
+
+依赖：`./logger`(log)
 
 ---
 
-## src/errors.ts（86 行 · 共享管道）
+## src/infra/cc-events.ts（101 行 · 共享管道层）
 
-CC 上游错误 → 两种协议错误体、finish reason 与 usage 的归一化映射。
+CC NDJSON → 事件分发的共用解析器，负责缓冲分行、JSON 解析、未知事件告警与错误事件记账。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 1-12 | `CC_STATUS_MAP` | const | E | CC 状态→(status,type)：400/422→400 invalid_request、401/403→401 authentication、402→402 payment_required、404→404 not_found、429→429 rate_limit、500/502→502 upstream、503→503 temporarily_unavailable |
-| 14-17 | `MappedError` | interface | E | `{status, body}` |
-| 19-43 | `mapCcError` | 函数 | E | 非 2xx 响应体 → MappedError；优先取 body.error.message/body.message，解析失败截前 200 字符；429 特判附 `retry_after:30` |
-| 45-59 | `mapCcEventError` | 函数 | E | 流内 `type:'error'` 事件 → MappedError；从消息前缀 `<NNN>` 提取状态码（缺省 502）；429 同样附 retry_after:30 |
-| 61-68 | `mapFinishReason` | 函数 | E | CC `tool-calls`→OpenAI `tool_calls`；`length`/`stop` 原样；缺省 `stop` |
-| 70-77 | `normalizeUsage` | 函数 | E | outputTokens 缺失/0 时强制 inputTokens、cachedInputTokens 归零（上游口径一致性） |
-| 79-86 | `mapAnthropicStopReason` | 函数 | E | OpenAI finish→Anthropic stop_reason：tool_calls→tool_use、length→max_tokens、stop→end_turn、缺省 end_turn |
+| 9-10 | — | import | — | `../shared/logger`(log)；`../shared/cc-types`(type CcErrorEvent, CcEventType) |
+| 15-24 | `CC_EVENT_TYPES` | 常量 | E | 上游全部 17 种合法事件类型集合，未知类型才告警 |
+| 26 | `CcEventHook` | type | E | `(event) => string[] \| string \| void` |
+| 27-29 | `CcEventHooks` | type | E | 事件名→钩子表 + `default(type,event)` 兜底 |
+| 31-101 | `CcStreamParser` | class | E | NDJSON 流式解析器 |
+| 32 | `lastCcEvent` | 字段 | P | 最近事件类型（诊断） |
+| 33 | `errorEvent` | 字段 | P | 最近 error 事件记账 |
+| 34 | `unknownEvent` | 字段 | P | 最近未知事件类型 |
+| 36 | `buffer` | 字段 | P | 未完整行缓冲 |
+| 37 | `MAX_LINE_LENGTH` | 字段 | P | 单行上限 64KB，超过清空 |
+| 39 | `constructor` | 方法 | P | 注入 TextDecoder |
+| 43-54 | `push` | 方法 | P | 解码切行并逐行分发 |
+| 57-64 | `flush` | 方法 | P | 冲刷尾部残行 |
+| 66-100 | `handleLine` | 方法 | P | 跳过空/`[DONE]`/注释行；error 优先；未知走 default 或 warn |
+
+依赖：`../shared/logger` `../shared/cc-types`
 
 ---
 
-## src/proxy-handler.ts（91 行 · 共享管道）
+## src/infra/cc.ts（216 行 · 上游对接层）
 
-两个协议处理器共享的管道：请求体解析、客户端断连级联取消（UpstreamFlow）、上游调用前置（指纹初始化 + 转发 + 非 2xx 映射）。
+OpenAI 中间格式 → CC 请求体构建（含 cache_control 白名单），以及向 `/alpha/generate` 的伪 CLI 头部转发。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
+| 1-4 | — | import | — | `../shared/config`(CFG)；`./session`(getSessionId)；`../shared/version`(CC_VERSION)；`../shared/util`(fakeProjectSlug, generateTraceparent, getDateStr, getEnvironment, tryParseJSON) |
+| 6-8 | `isEphemeralCacheControl` | 函数 | P | 判断 `{type:'ephemeral'}` |
+| 10-12 | `pickEphemeralCacheControl` | 函数 | P | 命中返回归一化 ephemeral，否则 undefined |
+| 14-22 | `stripNonEphemeralCacheControl` | 函数 | P | 白名单剥离，仅保留 ephemeral（避 422→400） |
+| 24-182 | `buildCcRequest` | 函数 | E | OpenAI 请求 → CC body |
+| 25 | └ 参数解构 | 逻辑 | P | model/messages/…/seed |
+| 27-33 | └ system 提取 | 逻辑 | P | system/developer 拼 systemPrompt |
+| 35-44 | └ toolNameMap | 逻辑 | P | tool_call id→function.name |
+| 46-99 | └ 消息转换 | 逻辑 | P | user/assistant/tool 三种角色转换 + image_url |
+| 101-107 | └ 缓存标记 | 逻辑 | P | 有 prompt_cache_key 且无标记时注入首条 user 末 text |
+| 109-131 | └ body 骨架 | 逻辑 | P | config/memory/taste/skills/permissionMode/params |
+| 133-140 | └ system 占位 | 逻辑 | P | 空系统提示且开关开启时发单空格 |
+| 141-179 | └ 可选参数透传 | 逻辑 | P | temperature/reasoning_effort/tools/tool_choice/… |
+| 184-216 | `forwardToCC` | 异步函数 | E | POST `/alpha/generate` + 伪 CLI 头（session/slug/traceparent/ZDR） |
+
+依赖：`../shared/config` `./session` `../shared/version` `../shared/util`
+
+---
+
+## src/infra/sse.ts（138 行 · 共享管道层）
+
+协议无关的 SSE 发送管道与空闲心跳；OpenAI 翻译器已移至 modules/chat/translator.ts。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 8 | `SSE_HEARTBEAT_INTERVAL_MS` | 常量 | E | 5s |
+| 9 | `SSE_HEARTBEAT_IDLE_MS` | 常量 | E | 15s |
+| 10 | `SSE_PING_EVENT` | 常量 | E | Anthropic ping 事件帧 |
+| 11 | `SSE_KEEPALIVE_COMMENT` | 常量 | E | `: keepalive\n\n` |
+| 13-118 | `SsePipeline` | class | E | 可控 ReadableStream 封装 |
+| 14-27 | └ 字段 | 字段 | P | encoder/controller/buffered/stream/firstOutput/terminal/started/closed/keepaliveCount/pingCount/lastSentAt |
+| 29-35 | └ `constructor` | 方法 | P | autoStart + 两个 Promise + stream |
+| 37-42 | └ `enqueue` | 方法 | P | 编码入队并更新 lastSentAt |
+| 44-51 | └ `emit` | 方法 | P | 未开播进缓冲，autoStart 自动 start |
+| 53-69 | └ `emitAnthropic` | 方法 | P | content_block_* 才开播，保留零输出重试 |
+| 71-75 | └ `emitKeepalive` | 方法 | P | 发送 keepalive 注释帧 |
+| 77-86 | └ `sendPing` | 方法 | P | 空闲 ping（可被覆盖事件） |
+| 88-90 | └ `writeNow` | 方法 | P | 绕过缓冲直写 |
+| 92-98 | └ `start` | 方法 | P | 冲刷缓冲并 resolve firstOutput |
+| 100-107 | └ `close` | 方法 | P | 关流并 resolve terminal |
+| 109-117 | └ `terminateWith` | 方法 | P | 冲刷 + 终止事件 + close |
+| 120-138 | `startSseHeartbeat` | 函数 | E | 间隔/idle 可配，静默超时发 ping |
+
+依赖：无
+
+---
+
+## src/infra/proxy-handler.ts（97 行 · 共享管道层）
+
+两个协议处理器共享的请求体解析、客户端断连级联取消与上游调用前置。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 6-11 | — | import | — | `./cc`(forwardToCC)；`../shared/errors`(mapCcError, type MappedError)；`./fingerprint`(ensureInitialized)；`../shared/http`(BodyTooLargeError, readJsonBody)；`../shared/logger`(log) |
 | 13 | `JsonParseErrorKind` | type | E | `'too-large' \| 'invalid'` |
-| 17-29 | `readRequestJson<T>` | 异步函数 | E | 包 `readJsonBody`：BodyTooLargeError → `buildError('too-large')`，其余 → `buildError('invalid','Invalid JSON body')`；返回 discriminated union `{ok:true,value}` / `{ok:false,response}` |
-| 40-46 | `UpstreamFlow` | interface | E | signal/controller/aborted/setGracefulClose/abort |
-| 48-64 | `createUpstreamFlow` | 函数 | E | 注册 `request.signal` 的 once abort 监听：置 aborted → 先执行 gracefulClose（优雅收尾）→ 再 `controller.abort()`（掐断上游 fetch/计费） |
-| 66-76 | `UpstreamCallArgs<T>` | interface | E | apiKey/headers/ccBody/signal/promptCacheKey/label/onCcError（协议化错误构造器） |
-| 79-91 | `callUpstream<T>` | 异步函数 | E | `ensureInitialized` → `forwardToCC` → 非 ok：读错误文本 → `log('error',label,{status})` → 返回 `{ok:false,value:onCcError(mapCcError(...))}`；ok 返回 `{ok:true,response}` |
+| 15-29 | `readRequestJson` | 异步函数 | E | 包 readJsonBody，按错误种类回调 buildError |
+| 31-46 | `UpstreamFlow` | interface | E | signal/controller/aborted/setGracefulClose/abort |
+| 48-64 | `createUpstreamFlow` | 函数 | E | once abort：置 aborted → gracefulClose → controller.abort() |
+| 66-76 | `UpstreamCallArgs` | interface | E | apiKey/headers/ccBody/signal/promptCacheKey/label/onCcError |
+| 78-97 | `callUpstream` | 异步函数 | E | ensureInitialized → forwardToCC → 非 2xx 映射日志与错误体 |
+
+依赖：`./cc` `../shared/errors` `./fingerprint` `../shared/http` `../shared/logger`
 
 ---
 
-## src/openai.ts（325 行 · 协议层）
+## src/infra/session.ts（60 行 · 上游对接层）
 
-`POST /v1/chat/completions` 处理器：OpenAI 请求 → CC，流式（SSE）与非流式（JSON）双路径状态机。
-
-| 行号 | 符号 | 类别 | 可见性 | 说明 |
-|---|---|---|---|---|
-| 14-19 | `TerminalState` | interface | P | upstreamError/timedOut/zeroOutput/errorMsg 终态记账 |
-| 21-25 | `buildError` | 函数 | P | JsonParseErrorKind → 413/400 OpenAI 错误体 |
-| 27-36 | `zeroUsageChunk` | 函数 | P | 断连时的终止 chunk（全零 usage + finish_reason:stop） |
-| 38-325 | `handleChatCompletions` | 异步函数 | E | 主处理器 |
-| 39-46 | └ 解析与鉴权 | 逻辑 | P | readRequestJson → getApiKey（缺失 401 auth_error） |
-| 48-59 | └ 请求元信息 | 逻辑 | P | stream/model(默认 deepseek/deepseek-v4-flash)/completionId(`chatcmpl-{uuid12}`)/created/buildCcRequest/createUpstreamFlow |
-| 62-73 | └ 上游调用 | 逻辑 | P | callUpstream（prompt_cache_key 透传，label 'CC API error'，onCcError → sendJSON） |
-| 75-200 | └ 流式分支 | 逻辑 | P | `SsePipeline(true)` + `createSseTranslator` |
-| 80-99 |   └ onClientAbort | 逻辑 | P | 断连原因分类：tool-input 开头→tool-input-silent-timeout；含 delta→streaming-active-disconnect；否则 client-hangup；`terminateWith([zeroUsageChunk, [DONE]])` |
-| 101-178 |   └ pump | 逻辑 | P | 循环 readWithTimeout(30s) 读上游 → translator.parseChunk → pipeline.emit；空闲时 emitKeepalive；结束 flush；upstreamError/zeroOutput 分支写错误帧；catch：断连静默 / STREAM_IDLE_TIMEOUT（recordTimeout(apiKey)、已开播则写 429 错误帧）/ 其他错误（写 proxy_error 帧）；finally close |
-| 180-199 |   └ 竞速与返回 | 逻辑 | P | `Promise.race(firstOutput→'started', terminal→'terminal')`；terminal 未开播则按 state 返回协议化 JSON 错误（429/502）；started 则 `Response(pipeline.stream, SSE_HEADERS)` |
-| 202-311 | └ 非流式分支 | 逻辑 | P | CcStreamParser+hooks 聚合（text-delta/reasoning-delta/tool-call/finish/error）→ readWithTimeout(90s) 循环 → 零输出 429 upstream_error / idle timeout 429(retry_after 5) / 502 / 成功聚合 `chat.completion`（usage: prompt_tokens/completion_tokens/total/cached_tokens） |
-| 312-324 | └ 外层 catch | 逻辑 | P | 断连→499；否则 502 proxy_error |
-
----
-
-## src/anthropic.ts（606 行 · 协议层）
-
-`POST /v1/messages` 处理器 + Anthropic↔OpenAI 转换 + CC→Anthropic SSE 流式翻译器（AsyncGenerator）。
+按 API key 管理稳定上游会话 ID，透传优先、12h+抖动缓存、每小时清理并联动指纹。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 14-18 | `fakeThinkingSignature` | 函数 | E | 由 thinking 文本 sha256 构造 `[0x12,len,...seed]` 的 base64 伪签名（满足 Anthropic 客户端格式校验） |
-| 20-145 | `convertAnthropicToOpenAI` | 函数 | E | Anthropic → OpenAI 中间格式 |
-| 21-31 |   └ system | 逻辑 | P | 字符串或 `[{type:'text'}]` 数组拼接 |
-| 41-93 |   └ 消息 | 逻辑 | P | assistant：text + `tool_use`→`tool_calls`（记录 id→name）；user：text + `tool_result`→`role:'tool'` 消息（数组 content 拼接文本） |
-| 95-129 |   └ 顶层字段 | 逻辑 | P | model(默认 claude-sonnet-4-6)/max_tokens(默认64000)/stream/tools(→function.parameters)/tool_choice(auto/any→required/tool→function/none)/temperature/top_p/stop_sequences→stop/metadata.user_id→user |
-| 131-142 |   └ thinking | 逻辑 | P | disabled/none→忽略；adaptive→effort；budget_tokens≥10000→high、≥5000→medium、≥2000→low、其余 low |
-| 147-177 | `buildAnthropicResponse` | 函数 | E | 非流式聚合：thinking 块（带伪签名）→ text 块 → tool_use 块（arguments 反序列化为 input）；stop_reason 映射；usage 映射（含 cache_creation/read tokens） |
-| 179-186 | `AnthropicStreamContext` | interface | E | 流式翻译的跨层状态：bytesReceived/lastCcEvent/inputTokens/outputTokens/cachedInputTokens/upstreamError |
-| 188-350 | `createAnthropicSseTranslator` | 异步生成器 | E | CC 响应 → Anthropic SSE 事件序列 |
-| 194-204 |   └ 状态 | 逻辑 | P | 块索引/当前块类型/tokens/stopReason/hasError/currentThinkingText |
-| 206-231 |   └ closeBlock/startBlock | 内部函数 | P | 块生命周期：thinking 块关闭时补 `signature_delta`（伪签名）；类型切换自动关旧开新 |
-| 241-251 |   └ message_start | 逻辑 | P | 首事件：message 骨架（id/type/role/model/usage） |
-| 256-298 |   └ hooks | 逻辑 | P | `reasoning-delta`→thinking 块+thinking_delta；`text-delta`→text 块+text_delta（outputTokens+1）；`tool-call`→一次性 tool_use 块（start+input_json_delta+stop，outputTokens+20）；`finish-step`/`finish`→handleFinishStep；`error`→ctx.upstreamError + `event: error` 帧 |
-| 300-318 |   └ handleFinishStep | 内部函数 | P | stopReason 映射；usage 归一化（含 cacheWriteTokens）；有 totalUsage/usage 则累记，否则全零 |
-| 320-350 |   └ 主循环 | 逻辑 | P | readWithTimeout(30s) → parser.push → 逐条 yield；结束后 flush；无错误时关块 + zeroOutput 检查（yield error 帧）或 message_delta(usage)+message_stop；finally reader.cancel |
-| 352-354 | `buildAnthropicError` | 函数 | P | JsonParseErrorKind → 413/400 Anthropic invalid_request_error |
-| 356-606 | `handleMessages` | 异步函数 | E | 主处理器（结构对应 openai.handleChatCompletions） |
-| 357-370 |   └ 解析/鉴权/转换 | 逻辑 | P | readRequestJson → getApiKey(401) → convertAnthropicToOpenAI → buildCcRequest |
-| 382-391 |   └ 上游调用 | 逻辑 | P | callUpstream（label 'CC API error (Anthropic)'，onCcError → sendAnthropicError） |
-| 393-505 |   └ 流式分支 | 逻辑 | P | `SsePipeline(false)` + ctx/state |
-| 398-416 |     └ onClientAbort | 逻辑 | P | 优雅终止：message_delta(end_turn)+message_stop |
-| 418-478 |     └ pump | 逻辑 | P | 生成器逐事件：未开播时仅当事件含 `"text_delta"`/`"tool_use"`/`"thinking_delta"` 才 start（避免把 message_start 冲给 race，thinking_delta 也触发开播避免首包假死）；writeNow 已开播流；错误分支与 openai 相同（timeout→429 帧 + recordTimeout(apiKey)） |
-| 482-504 |     └ 竞速与返回 | 逻辑 | P | terminal 且未开播 → 按 state 返回 429/502 Anthropic 错误；否则 200 + SSE 流 |
-| 507-592 |   └ 非流式分支 | 逻辑 | P | 同 openai 非流式结构，但 hooks 多 `reasoning-delta` 聚合；零输出 → 429 upstream_error；成功走 buildAnthropicResponse；idle timeout → 429 + headerOnly Retry-After |
-| 593-605 |   └ 外层 catch | 逻辑 | P | 断连→499；否则 502 proxy_error |
-
----
-
-## src/models.ts（94 行 · 协议层）
-
-`GET /v1/models`：优先从 Provider API 动态拉取模型列表（带 TTL 缓存），失败回退内置 27 项列表。
-
-| 行号 | 符号 | 类别 | 可见性 | 说明 |
-|---|---|---|---|---|
-| 8-11 | `ModelEntry` | interface | E | `{id,name}` |
-| 13-40 | `MODELS` | const | E | 内置模型列表 27 项（Claude/GPT/DeepSeek/Kimi/GLM/MiniMax/Qwen/Step/MiMo/Gemini 系列） |
-| 42-43 | `dynamicModels`/`modelsLastFetch` | 变量 | P | 缓存与上次拉取时间 |
-| 45-79 | `fetchModels` | 异步函数 | E | 缓存未过期直接返回；无 Key 或 useProviderModels=false 抛错走回退；GET `${apiBase}/provider/v1/models`（10s 超时，带 CC 版本头）；成功则刷新缓存；失败 log warn 并回退 MODELS |
-| 81-94 | `handleModels` | 异步函数 | E | getApiKey → fetchModels → OpenAI list 形状（object:list，owned_by:'command-code'） |
-
----
-
-## src/session.ts（60 行 · 上游对接）
-
-按 API key 的会话 ID 管理：优先透传客户端会话头，否则生成并缓存（12h + ≤1h 抖动），每小时清理过期会话。
-
-| 行号 | 符号 | 类别 | 可见性 | 说明 |
-|---|---|---|---|---|
-| 5-6 | `SESSION_DURATION_MS`/`SESSION_JITTER_MS` | const | P | 12h / 1h |
+| 1-3 | — | import | — | `../shared/logger`(log)；`../shared/util`(uuid)；`./fingerprint`(keyStateStore) |
+| 5 | `SESSION_DURATION_MS` | 常量 | P | 12h |
+| 6 | `SESSION_JITTER_MS` | 常量 | P | 1h |
 | 8-11 | `SessionEntry` | interface | P | `{sessionId, expiresAt}` |
-| 13 | `sessionStore` | const | P | `Map<apiKey, SessionEntry>` |
-| 15-28 | `ensureSession` | 函数 | E | 未过期复用；否则新建 uuid 会话并记日志 |
-| 30-45 | `getSessionId` | 函数 | E | 候选优先级：`x-session-id` → `x-claude-code-session-id` → `session_id` → `prompt_cache_key`（长度≥8 才采纳）；否则 ensureSession |
-| 47-60 | `startSessionCleanup` | 函数 | E | 每小时遍历删除过期条目，同时清理 `keyStateStore`（fingerprint 状态联动）；有清理才记日志 |
+| 13 | `sessionStore` | 常量 | P | `Map<apiKey, SessionEntry>` |
+| 15-28 | `ensureSession` | 函数 | E | 未过期复用，否则 uuid 新建并记日志 |
+| 30-45 | `getSessionId` | 函数 | E | 透传优先级 + 长度≥8，否则 ensureSession |
+| 47-59 | `startSessionCleanup` | 函数 | E | 每小时清理过期会话并联动 keyStateStore |
+
+依赖：`../shared/logger` `../shared/util` `./fingerprint`
 
 ---
 
-## src/fingerprint.ts（190 行 · 上游对接）
+## src/infra/fingerprint.ts（190 行 · 上游对接层）
 
-为每个 API key 伪造稳定的设备指纹并向上游上报（fingerprint/record + lifecycle-events），8h + ≤2h 抖动刷新；init 请求去重（in-flight 合并）。
+为每把 key 伪造稳定设备指纹并上报（record + lifecycle-events），8h+抖动刷新，init 并发去重。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 6-22 | `FINGERPRINT_CPUS` | const | P | 15 种伪造 CPU 型号/核心数（Intel 12-14 代 / Ultra / AMD Ryzen） |
-| 24 | `FINGERPRINT_MEMS` | const | P | 内存档位 8/16/24/32/48/64 GiB |
-| 26-31 | `FINGERPRINT_TZS` | const | P | 15 个时区 |
-| 33 | `FINGERPRINT_MAC_COUNT_RANGE` | const | P | MAC 数量 2-5 |
-| 35-54 | `Fingerprint` | interface | E | thumbmark + components（machineIdHash/macHashes/osUserHash/hostnameHash/gitEmailHash/platform/arch/osRelease/cpuModel/cpuCount/memGiB/isContainer/timezone/runtime/collectorVersion） |
-| 56-93 | `generateFingerprint` | 函数 | E | 随机拼装（平台固定 win32/x64/10.0.22631/isContainer:false/runtime:'cli'）；thumbmark = sha256(各哈希拼接) |
+| 1-4 | — | import | — | `../shared/config`(CFG)；`../shared/logger`(log)；`../shared/util`(pick, randHex, sha256hex)；`../shared/version`(CC_VERSION) |
+| 6-22 | `FINGERPRINT_CPUS` | 常量 | P | 15 种伪造 CPU |
+| 24 | `FINGERPRINT_MEMS` | 常量 | P | 内存档位 8-64 GiB |
+| 26-31 | `FINGERPRINT_TZS` | 常量 | P | 15 个时区 |
+| 33 | `FINGERPRINT_MAC_COUNT_RANGE` | 常量 | P | MAC 数量 2-5 |
+| 35-54 | `Fingerprint` | interface | E | thumbmark + components 各哈希/字段 |
+| 56-93 | `generateFingerprint` | 函数 | E | 随机拼装，固定 win32/x64/cli，thumbmark=sha256 |
 | 95-98 | `KeyState` | interface | E | `{fingerprint, nextInitAt}` |
-| 100 | `keyStateStore` | const | E | `Map<apiKey, KeyState>`（session 清理时联动删除） |
-| 102-113 | `getOrCreateKeyState` | 函数 | E | 懒创建并 log `keyPrefix` |
-| 115-116 | `INIT_REFRESH_MS`/`INIT_JITTER_MS` | const | P | 8h / 2h |
-| 118 | `inFlightInit` | const | P | `Map<apiKey, Promise<void>>` init 去重 |
-| 120-141 | `ensureInitialized` | 异步函数 | E | 未到期直接返回；有 in-flight 复用；否则 doInit，失败仅告警（key 保持旧值，下次请求重试），AbortError 静默；finally 清 in-flight |
-| 143-190 | `doInit` | 异步函数 | P | 并发两个 POST：`/alpha/fingerprint/record`（指纹体）与 `/alpha/lifecycle-events`（eventType:'cli_session_exists' + 伪 sessionId/cliVersion/mode:'interactive'/os）；均 10s 信号外控、非 ok 仅 warn；成功后安排 nextInitAt = now + 8h + jitter |
+| 100 | `keyStateStore` | 常量 | E | `Map<apiKey, KeyState>` |
+| 102-113 | `getOrCreateKeyState` | 函数 | E | 懒创建并记 keyPrefix |
+| 115 | `INIT_REFRESH_MS` | 常量 | P | 8h |
+| 116 | `INIT_JITTER_MS` | 常量 | P | 2h |
+| 118 | `inFlightInit` | 常量 | P | init 去重 Map |
+| 120-141 | `ensureInitialized` | 异步函数 | E | 未到期返回；in-flight 复用；失败仅告警下次重试 |
+| 143-190 | `doInit` | 异步函数 | P | 并发 POST fingerprint/record 与 lifecycle-events，成功后安排 nextInitAt |
+
+依赖：`../shared/config` `../shared/logger` `../shared/util` `../shared/version`
 
 ---
 
-## src/version.ts（25 行 · 上游对接）
+## src/modules/chat/index.ts（18 行 · 协议层）
 
-CC CLI 版本号维护：默认 `0.32.3`，每 24h 从 npm registry 拉取 `command-code` 最新版本刷新。
+chat 模块入口：创建 Elysia 控制器，装配 body schema 与 401 鉴权前置，挂载 `POST /v1/chat/completions`。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 3 | `CC_VERSION` | let | E | 当前版本（可变，被 cc/fingerprint/models 引用写入请求头） |
-| 4 | `CC_VERSION_REFRESH_MS` | const | P | 24h |
-| 6-20 | `refreshCCVersion` | 异步函数 | E | GET `registry.npmjs.org/command-code/latest`（10s 超时）；成功改写 CC_VERSION；失败 warn 保留现值 |
-| 22-25 | `startVersionRefresh` | 函数 | E | 启动即刷新 + setInterval(24h) |
+| 1-4 | — | import | — | elysia；./model；./service；../../plugins/auth |
+| 6-14 | `chatController` | 常量 | E | `new Elysia({name:'chat', prefix:'/v1'})` |
+| 7 | `.use(chatModelPlugin)` | 插件 | P | 注册 `'chat.body'` |
+| 13 | `.onTransform({as:'local'}, createAuthPreCheck(false))` | 插件 | P | 无 key → 401，短路 validation |
+| 14 | `.post('/chat/completions', …)` | 路由 | P | 调 `ChatService.handleBody(body, headers, request.signal)` |
+| 16-18 | `ChatService` / `chatBody` / `chatModel` / `ChatBody` | 重导出 | E | 公共入口再导出 |
+
+依赖：`elysia` `./model` `./service` `../../plugins/auth`
 
 ---
 
-## test/e2e.ts（456 行 · 测试）
+## src/modules/chat/model.ts（35 行 · 协议层）
 
-端到端测试：内置 mock CC 上游（端口 4100）+ 真实被测服务（端口 4200，env 注入隔离配置）。
+OpenAI chat body 的 Elysia schema：宽松校验，未知字段透传。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1 | — | import | — | elysia(Elysia, t) |
+| 5-29 | `chatBody` | 常量 | E | `t.Object({…}, {additionalProperties:true})` |
+| 8-14 | └ `messages` | 逻辑 | P | `t.Array({role, content?}, {additionalProperties:true})`，`minItems:1` |
+| 31 | `ChatBody` | type | E | `typeof chatBody.static` |
+| 33-35 | `chatModelPlugin` | 常量 | E | 注册 model `'chat.body'` |
+
+依赖：`elysia`
+
+---
+
+## src/modules/chat/service.ts（17 行 · 协议层）
+
+Strangler 门面：`ChatService` 静态方法惰性委托 `./protocol`，不复制状态机。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1-4 | — | 注释 | — | 分层说明 |
+| 5 | `buildCcRequest` | 重导出 | E | re-export from `../../infra/cc` |
+| 7-17 | `ChatService` | 抽象类 | E | 纯静态 |
+| 8-11 | └ `handle` | 方法 | E | 动态取 `handleChatCompletions` |
+| 13-16 | └ `handleBody` | 方法 | E | 动态取 `handleChatCompletionsBody` |
+
+依赖：`../../infra/cc`（re-export） `./protocol`（动态）
+
+---
+
+## src/modules/chat/protocol.ts（5 行 · 协议层）
+
+公共 re-export 门面：聚合 handler / translator / aggregator 的导出符号。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1 | `handleChatCompletions`、`handleChatCompletionsBody` | 重导出 | E | from `./handler` |
+| 2-3 | `createSseTranslator`、`zeroUsageChunk`、`ChatStreamTranslator`(type) | 重导出 | E | from `./translator` |
+| 4-5 | `createChatAggregator`、`buildChatCompletion`、`rawUsageFromCcUsage`、`ChatAggregate`(type) | 重导出 | E | from `./aggregator` |
+
+依赖：`./handler` `./translator` `./aggregator`
+
+---
+
+## src/modules/chat/handler.ts（374 行 · 协议层）
+
+`POST /v1/chat/completions` 请求/响应生命周期：流式（SSE）与非流式（JSON）双路径状态机。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1-12 | — | import | — | shared/auth；infra/cc；shared/http；shared/logger；infra/proxy-handler；shared/runtime；infra/session；infra/sse；shared/util；./translator；./aggregator |
+| 14-20 | `TerminalState` | interface | P | upstreamError/timedOut/timedOutMs/zeroOutput/errorMsg |
+| 22-26 | `buildError` | 函数 | P | JsonParseErrorKind → 413/400 |
+| 28-32 | `handleChatCompletions` | 异步函数 | E | `readRequestJson` → 委托 body 处理器 |
+| 34-374 | `handleChatCompletionsBody` | 异步函数 | E | 主处理器 |
+| 35-38 | └ 鉴权 | 逻辑 | P | 无 key → 401 |
+| 40-56 | └ 元信息/会话/流控 | 逻辑 | P | model 缺省、completionId、created、buildCcRequest、getSessionId、createUpstreamFlow |
+| 59-69 | └ 上游调用 | 逻辑 | P | callUpstream，onCcError → sendJSON |
+| 71-243 | └ 流式分支 | 逻辑 | P | translator + SsePipeline(true) + heartbeat |
+| 77-97 |   └ onClientAbort | 逻辑 | P | 断连分类 + terminateWith([zeroUsageChunk, [DONE]]) |
+| 99-194 |   └ pump | 逻辑 | P | 读循环 / flush / 终态 / catch / finally |
+| 102-116 |     └ 读取循环 | 逻辑 | P | readWithTimeout → parseChunk → emit / emitKeepalive |
+| 118-140 |     └ 流尽终态 | 逻辑 | P | upstreamError / zeroOutput / 成功（recordTimeoutSuccess + [DONE]） |
+| 141-189 |     └ catch | 逻辑 | P | aborted / STREAM_IDLE_TIMEOUT(429) / 其他(proxy_error) |
+| 198-201 |   └ 竞速 | 逻辑 | P | race(firstOutput→started, terminal→terminal) |
+| 203-240 |   └ terminal 分支 | 逻辑 | P | 按 state 返回映射 JSON / 429 / 502 |
+| 242 |   └ started 返回 | 逻辑 | P | 200 + SSE_HEADERS |
+| 245-260 | └ 非流式装配 | 逻辑 | P | createChatAggregator({onEventError}) |
+| 262-274 | └ 非流式读取 | 逻辑 | P | readWithTimeout → push → flush |
+| 275-314 | └ 非流式 catch | 逻辑 | P | 499 / 429(idle) / 502 |
+| 320-346 | └ 聚合终态 | 逻辑 | P | upstreamError / zero-output 429 |
+| 348-360 | └ 成功响应 | 逻辑 | P | buildChatCompletion → sendJSON(200) |
+| 361-373 | └ 外层 catch | 逻辑 | P | 499 / 502 |
+
+依赖：`../../shared/auth` `../../infra/cc` `../../shared/http` `../../shared/logger` `../../infra/proxy-handler` `../../shared/runtime` `../../infra/session` `../../infra/sse` `../../shared/util` `./translator` `./aggregator`
+
+---
+
+## src/modules/chat/translator.ts（170 行 · 协议层）
+
+CC NDJSON → OpenAI `chat.completion.chunk` SSE 帧的纯流式翻译器。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1-7 | — | import | — | errors；logger；infra/cc-events |
+| 9-18 | `zeroUsageChunk` | 函数 | E | 零 usage + finish_reason:stop 终止 chunk |
+| 20-30 | `makeChunk` | 函数 | P | 组装 `data: …\n\n` |
+| 32-168 | `createSseTranslator` | 工厂函数 | E | 闭包 + CcStreamParser + hooks |
+| 47-122 | └ hooks | 逻辑 | P | text/reasoning/tool-call/finish-step/finish/error |
+| 124-167 | └ 返回对象 | API | P | getter 与 parseChunk/flush/getDoneEvent |
+| 170 | `ChatStreamTranslator` | type | E | ReturnType 别名 |
+
+依赖：`../../shared/errors` `../../shared/logger` `../../infra/cc-events`
+
+---
+
+## src/modules/chat/aggregator.ts（110 行 · 协议层）
+
+非流式聚合与 `chat.completion` 响应构造，纯函数无 I/O。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1-6 | — | import | — | errors；infra/cc-events；shared/util |
+| 9-19 | `rawUsageFromCcUsage` | 函数 | E | CC usage → rawUsage 三字段 |
+| 21-28 | `ChatAggregate` | interface | E | 聚合结果形状 |
+| 30-82 | `createChatAggregator` | 工厂函数 | E | 闭包 + hooks + push/flush/result |
+| 43-66 | └ hooks | 逻辑 | P | text/reasoning/tool-call/finish/error |
+| 84-110 | `buildChatCompletion` | 函数 | E | 组装 `chat.completion` 体 |
+
+依赖：`../../shared/errors` `../../infra/cc-events` `../../shared/util`
+
+---
+
+## src/modules/messages/index.ts（18 行 · 协议层）
+
+`/v1/messages` 控制器：挂载 body schema、局部前置 Anthropic 鉴权、re-export 门面。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1-4 | — | import | — | elysia + ./model + ./service + ../../plugins/auth(createAuthPreCheck) |
+| 6-14 | `messagesController` | 常量 | E | `new Elysia({name:'messages',prefix:'/v1'}).use(messagesModelPlugin)` |
+| 8-12 | 顺序注释 | 逻辑 | P | onParse(bodyLimit)→onTransform(413)→onTransform(auth 401)→validation(400)→handler；local 不上浮 |
+| 13 | `.onTransform({as:'local'}, createAuthPreCheck(true))` | 插件 | E | 本实例局部鉴权，无 Key 时 401 短路 validation |
+| 14 | `.post('/messages', …)` | 路由 | E | `MessagesService.handleBody(body,headers,request.signal)`，schema `'messages.body'` |
+| 16-18 | `MessagesService`/`messagesBody`/`messagesModelPlugin as messagesModel`/`MessagesBody` | 导出 | E | 从 ./service、./model re-export |
+
+依赖：`elysia` `./model` `./service` `../../plugins/auth`
+
+---
+
+## src/modules/messages/model.ts（33 行 · 协议层）
+
+Anthropic 请求体 Elysia schema：`model` 必填、`messages` minItems 1、其余宽松可选。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1 | — | import | — | elysia(Elysia,t) |
+| 3-4 | 注释 | 逻辑 | P | 显式声明已知字段，未知靠 additionalProperties，联合靠 t.Any()，绝不 422 |
+| 5-27 | `messagesBody` | 常量 | E | `t.Object({…},{additionalProperties:true})` |
+| 7 | └ `model` | 字段 | E | `t.String()` 必填 |
+| 8-14 | └ `messages` | 字段 | E | `t.Array({role,content?},{minItems:1})`，item additionalProperties true |
+| 15-24 | └ 可选字段 | 字段 | E | system/max_tokens/stream/thinking/tools/tool_choice/top_p/stop_sequences/metadata/prompt_cache_key |
+| 26 | └ `additionalProperties` | 字段 | E | 顶层 true |
+| 29 | `MessagesBody` | 类型 | E | `typeof messagesBody.static` |
+| 31-33 | `messagesModelPlugin` | 常量 | E | `Elysia({name:'messages.model'}).model({'messages.body':messagesBody})` |
+
+依赖：`elysia`
+
+---
+
+## src/modules/messages/service.ts（27 行 · 协议层）
+
+Strangler 门面：控制器只依赖 `MessagesService`，动态 import protocol 委托生命周期。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1-7 | 分层注释 | 逻辑 | P | handler→translator/aggregator；protocol 仅 re-export；SSE Pipeline(false) 缓冲头；chat 用 autoStart:true 不对称 |
+| 8-15 | re-export | 导出 | E | buildAnthropicResponse/convertAnthropicToOpenAI/createAnthropicSseTranslator/fakeThinkingSignature/handleMessages/handleMessagesBody ← ./protocol |
+| 16 | `AnthropicStreamContext` | 类型 | E | type-only ← ./protocol |
+| 18-27 | `MessagesService` | 类 | E | abstract，仅静态方法 |
+| 19-22 | └ `handle` | 方法 | E | 动态 import ./protocol → handleMessages(request,headers) |
+| 23-26 | └ `handleBody` | 方法 | E | 动态 import ./protocol → handleMessagesBody(body,headers,signal) |
+
+依赖：`./protocol`
+
+---
+
+## src/modules/messages/protocol.ts（5 行 · 协议层）
+
+纯 re-export 门面：handler/translator/aggregator 的统一出口，无运行时逻辑。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1 | handleMessages/handleMessagesBody | 导出 | E | ← ./handler |
+| 2 | convertAnthropicToOpenAI/createAnthropicSseTranslator/fakeThinkingSignature | 导出 | E | ← ./translator |
+| 3 | `AnthropicStreamContext` | 类型 | E | type-only ← ./translator |
+| 4 | buildAnthropicResponse/createMessagesAggregator/rawUsageFromCcUsageAnthropic | 导出 | E | ← ./aggregator |
+| 5 | `MessagesAggregate` | 类型 | E | type-only ← ./aggregator |
+
+依赖：`./handler` `./translator` `./aggregator`
+
+---
+
+## src/modules/messages/handler.ts（414 行 · 协议层）
+
+`/v1/messages` 请求/响应生命周期：鉴权、两跳转换、流式（pump+竞速+断连）与非流式聚合。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1-14 | — | import | — | auth/cc/errors/http/logger/proxy-handler/runtime/session/sse/util + ./translator + ./aggregator |
+| 16-20 | `anthropicRetryOpts` | 函数 | P | 从错误体取 retry_after |
+| 22-36 | `sendAnthropicErrorWithRawUsage` | 函数 | P | 带 `error.rawUsage` 的 Anthropic 错误响应，可选 Retry-After |
+| 38-40 | `buildAnthropicError` | 函数 | P | too-large→413，其余→400 invalid_request_error |
+| 42-46 | `handleMessages` | 异步函数 | E | readRequestJson → handleMessagesBody |
+| 48-414 | `handleMessagesBody` | 异步函数 | E | 主处理器 |
+| 49-52 | └ 鉴权 | 逻辑 | P | getApiKey 缺失 401 authentication_error |
+| 54-59 | └ 元信息+两跳转换 | 逻辑 | P | stream/model；convertAnthropicToOpenAI→prompt_cache_key→buildCcRequest |
+| 62 | └ session | 逻辑 | P | getSessionId(headers,apiKey,prompt_cache_key) |
+| 64-69 | └ 运行态 | 逻辑 | P | createUpstreamFlow/abortController/aborted()/startTime/messageId/bytesReceived |
+| 71-82 | └ 上游调用 | 逻辑 | P | callUpstream(label 'CC API error (Anthropic)', onCcError→sendAnthropicError) |
+| 84-271 | └ 流式分支 | 逻辑 | P | SsePipeline(false)+ctx+state |
+| 85-87 |   └ pipeline/ctx/state | 逻辑 | P | SsePipeline(false)；AnthropicStreamContext；state{upstreamError,timedOut,zeroOutput,errorMsg} |
+| 89-111 |   └ onClientAbort | 逻辑 | P | terminateWith(message_delta end_turn usage0 + message_stop)，记 warn |
+| 112-114 |   └ gracefulClose+heartbeat | 逻辑 | P | flow.setGracefulClose；startSseHeartbeat |
+| 115-195 |   └ pump | 异步函数 | P | 流式主循环 |
+| 116-120 |     └ reader/翻译器初始化 | 逻辑 | P | reader；messageId=msg_{uuid12}；translator.startEvents() |
+| 121-127 |     └ 读取循环 | 逻辑 | P | aborted()；readWithTimeout(idleTimeoutFor(lastCcEvent,true))；parseChunk |
+| 129-141 |     └ 收尾/开播 | 逻辑 | P | flush+finishEvents；recordTimeoutSuccess；upstreamError→state；零输出→state+abort；否则 pipeline.start() |
+| 142-189 |     └ pump catch | 逻辑 | P | 断连静默；STREAM_IDLE_TIMEOUT→429 帧；其他→internal_error 帧 |
+| 190-194 |     └ pump finally | 逻辑 | P | reader.cancel + clearInterval(heartbeat) + pipeline.close |
+| 197 | └ `void pump()` | 逻辑 | P | 后台启动 |
+| 199-202 | └ 竞速 | 逻辑 | P | Promise.race(firstOutput→started, terminal→terminal) |
+| 204-268 | └ terminal 未开播 | 逻辑 | P | upstreamError→timedOut 429→zeroOutput 429→errorMsg 502→兜底 429 |
+| 270 | └ 流式成功 | 逻辑 | P | Response(pipeline.stream, 200, SSE_HEADERS) |
+| 273-288 | └ 非流式聚合器 | 逻辑 | P | createMessagesAggregator({onEventError}) |
+| 292-301 | └ 读取循环 | 逻辑 | P | idleTimeoutFor(...,false/90s)；bytesReceived+=；aggregator.push/flush |
+| 302-345 | └ 非流式 catch | 逻辑 | P | aborted→499；STREAM_IDLE_TIMEOUT→429(retry_after 5)；其他→502 |
+| 347-349 | └ abort 检查 | 逻辑 | P | 中止→499 |
+| 351-367 | └ upstreamError | 逻辑 | P | 优先透传上游映射错误 |
+| 369-382 | └ 零输出 | 逻辑 | P | !fullText&&!thinkingText&&!toolCalls→abort+429 rawUsage |
+| 384-400 | └ 成功 | 逻辑 | P | recordTimeoutSuccess→normalizeUsage→log→sendJSON(200,buildAnthropicResponse(...)) |
+| 401-413 | └ 外层 catch | 逻辑 | P | 断连→499；否则 abort+502 proxy_error |
+
+依赖：`../../shared/auth` `../../infra/cc` `../../shared/errors` `../../shared/http` `../../shared/logger` `../../infra/proxy-handler` `../../shared/runtime` `../../infra/session` `../../infra/sse` `../../shared/util` `./translator` `./aggregator`
+
+---
+
+## src/modules/messages/translator.ts（333 行 · 协议层）
+
+Anthropic↔OpenAI 转换、fakeThinkingSignature、CC→Anthropic SSE 翻译器（闭包工厂）。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1-5 | — | import | — | cc-events/errors/logger/util |
+| 7-11 | `fakeThinkingSignature` | 函数 | E | sha256→[0x12,len,...seed]→base64 伪签名 |
+| 13-145 | `convertAnthropicToOpenAI` | 函数 | E | Anthropic→OpenAI 中间格式 |
+| 14-31 | └ system | 逻辑 | P | 字符串或 [{type:'text'}] 数组拼接，push system 消息 |
+| 34-56 | └ assistant | 逻辑 | P | text 累积；tool_use→tool_calls（登记 id→name） |
+| 57-92 | └ user | 逻辑 | P | text + tool_result→role:'tool'（按映射回填 name），文本单独成 user |
+| 95-129 | └ 顶层字段 | 逻辑 | P | model/max_tokens(64000)/stream/tools→parameters/tool_choice/temperature/top_p/stop/user |
+| 131-142 | └ thinking | 逻辑 | P | disabled/none 忽略；adaptive→effort；budget_tokens 分档→reasoning_effort |
+| 147-155 | `AnthropicStreamContext` | interface | E | bytesReceived/lastCcEvent/tokens×4/upstreamError |
+| 157-333 | `createAnthropicSseTranslator` | 函数 | E | 闭包状态机，返回 {startEvents,parseChunk,flush,finishEvents} |
+| 162-172 | └ 闭包状态 | 字段 | P | 块索引/类型/blockStarted/tokens/stopReason/hasError/currentThinkingText |
+| 174-188 | └ `closeBlock` | 函数 | P | thinking 块补 signature_delta 后再 content_block_stop |
+| 190-199 | └ `startBlock` | 函数 | P | 类型切换自动关旧块并 content_block_start |
+| 201-207 | └ 便捷封装 | 函数 | P | startTextBlock/startThinkingBlock |
+| 209-219 | └ message_start | 常量 | P | 首帧 message 骨架 |
+| 221 | └ parser | 常量 | P | new CcStreamParser() |
+| 223-277 | └ hooks | 逻辑 | P | reasoning-delta→thinking_delta；text-delta→text_delta(+1)；tool-call→三连帧(+20)；finish→handleFinishStep；error→ctx.upstreamError+error 帧 |
+| 279-293 | └ `handleFinishStep` | 函数 | P | stopReason 映射 + usage 归一化回写 ctx |
+| 296-298 | └ `startEvents` | 方法 | P | [messageStartFrame] |
+| 300-305 | └ `parseChunk` | 方法 | P | 累 ctx.bytesReceived；parser.push；同步 lastCcEvent |
+| 307-311 | └ `flush` | 方法 | P | parser.flush；同步 lastCcEvent |
+| 313-331 | └ `finishEvents` | 方法 | P | hasError→[]；关块；零输出→error 帧；否则 message_delta+message_stop |
+
+依赖：`../../infra/cc-events` `../../shared/errors` `../../shared/logger` `../../shared/util`
+
+---
+
+## src/modules/messages/aggregator.ts（117 行 · 协议层）
+
+非流式聚合器 + `buildAnthropicResponse` + rawUsage 归一化。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1-5 | — | import | — | cc-events/errors/uuid/./translator |
+| 7-18 | `rawUsageFromCcUsageAnthropic` | 函数 | E | CC usage→{input_tokens,output_tokens,cached_tokens}，toNum 容错 |
+| 20-50 | `buildAnthropicResponse` | 函数 | E | 组装 Anthropic message |
+| 21-30 | └ content | 逻辑 | P | thinking(带签名)→text→tool_use（arguments 反序列化回退 {}） |
+| 31-49 | └ 骨架+usage | 逻辑 | P | id=msg_{uuid12}；stop_reason 映射；usage 四元组（IIFE normalizeUsage） |
+| 52-59 | `MessagesAggregate` | interface | E | fullText/thinkingText/toolCalls/finishReason/usage/upstreamError |
+| 61-117 | `createMessagesAggregator` | 函数 | E | 工厂，返回 {lastCcEvent,push,flush,result} |
+| 67-74 | └ 状态+parser | 字段 | P | 聚合状态；new CcStreamParser() |
+| 75-98 | └ hooks | 逻辑 | P | text/reasoning-delta 累加；tool-call→OpenAI 形状；finish→reason+usage；error→upstreamError+回调 |
+| 101-103 | └ `lastCcEvent` | 方法 | P | getter 转发 parser.lastCcEvent |
+| 105-111 | └ `push`/`flush` | 方法 | P | 仅聚合状态，丢弃逐帧返回值 |
+| 113-115 | └ `result` | 方法 | P | 返回 MessagesAggregate 快照 |
+
+依赖：`../../infra/cc-events` `../../shared/errors` `../../shared/util` `./translator`
+
+---
+
+## src/modules/models/index.ts（13 行 · 协议层）
+
+`/v1/models` 控制器：注册模型插件并把 GET 请求转交 `ModelsService.list`。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 3-5 | — | import | — | `elysia` / `./model` / `./service` |
+| 7-9 | `modelsController` | 插件 | E | `Elysia({ name: 'models', prefix: '/v1/models' })`，`.use(modelsModelPlugin)` 后挂 `GET /` |
+| 9 | `ModelsService.list(headers)` | 路由 | P | 路由处理器，仅透传 headers |
+| 11 | `ModelsService` | 再导出 | E | 转发 `./service` |
+| 12 | `listQuery` / `modelEntry` / `listResponse` / `modelsModel` | 再导出 | E | 转发 `./model`（`modelsModelPlugin` 重命名为 `modelsModel`） |
+| 13 | `ModelsModel` | 再导出(type) | E | 转发 `./model` |
+
+依赖：`elysia` `./model` `./service`
+
+---
+
+## src/modules/models/model.ts（33 行 · 协议层）
+
+`/v1/models` 的 JSON Schema 单一真相源，注册 `models.entry`/`models.list` 具名模型。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1 | — | import | — | `elysia` |
+| 4 | `listQuery` | 常量 | E | `t.Object({})` 空 query 占位 |
+| 6-15 | `modelEntry` | 常量 | E | 条目 schema，`id` 必填，其余可选，`additionalProperties: true` |
+| 17-23 | `listResponse` | 常量 | E | `{ object: Literal('list'), data: Array(modelEntry) }`，`additionalProperties: true` |
+| 25-28 | `ModelsModel` | type | E | `UnwrapSchema` 推导的 entry/list 类型 |
+| 30-33 | `modelsModelPlugin` | 插件 | E | 注册 `models.entry` / `models.list` |
+
+依赖：`elysia`
+
+---
+
+## src/modules/models/service.ts（15 行 · 协议层）
+
+Strangler 服务门面，动态 import 委托 catalog，避免单例分裂。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1 | — | import | — | `./catalog`（type `ModelEntry`） |
+| 5-15 | `ModelsService` | class | E | `abstract class`，仅静态方法 |
+| 6-9 | └ `list` | 方法 | E | 动态引入 `handleModels` 并委托（返回 `Response`） |
+| 11-14 | └ `fetch` | 方法 | E | 动态引入 `fetchModels` 并委托（返回 `ModelEntry[]`） |
+
+依赖：`./catalog`
+
+---
+
+## src/modules/models/catalog.ts（124 行 · 协议层）
+
+内置模型清单 + Provider API 动态拉取（TTL 缓存，失败回退）。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1-6 | — | import | — | `../../shared/config`/`logger`/`version`/`auth`/`util`/`http` |
+| 8-13 | `ModelEntry` | interface | E | `{ id, name, context_window?, max_output_tokens? }` |
+| 15-43 | `MODELS` | 常量 | E | 内置模型 26 项（Claude/GPT/DeepSeek/Kimi/GLM/MiniMax/Qwen/Step/MiMo/Gemini） |
+| 45-49 | `toOptionalNumber` | 函数 | P | 非法值归一为 `undefined` |
+| 51-53 | `pickContextWindow` | 函数 | P | `context_window`/`context_length`/`max_context_tokens` 归一 |
+| 55-57 | `pickMaxOutputTokens` | 函数 | P | `max_output_tokens`/`max_tokens` 归一 |
+| 59-61 | `STATIC_WINDOW_BY_ID` | 常量 | P | `MODELS` 中已声明窗口项的 `Map<id, number>` |
+| 63-64 | `dynamicModels` / `modelsLastFetch` | 字段 | P | 模块级缓存与拉取时间戳 |
+| 66-108 | `fetchModels` | 异步函数 | E | TTL 缓存 → 上游 GET（10s 超时）→ 映射写缓存；失败回退 `MODELS` |
+| 67-70 | └ 缓存判定 | 逻辑 | P | 未过期直接返回缓存 |
+| 72-73 | └ 禁用守卫 | 逻辑 | P | 无 key 或 `!CFG.useProviderModels` 抛错回退 |
+| 75-82 | └ 上游请求 | 逻辑 | P | GET `${apiBase}/provider/v1/models`，Bearer + CC 头，`AbortSignal.timeout(10000)` |
+| 87-95 | └ 条目映射 | 逻辑 | P | `id`/`name` 取 `m.id`；窗口上游优先否则静态；`max_output_tokens` 有值才写 |
+| 96-99 | └ 写缓存 | 逻辑 | P | 更新 `dynamicModels`/`modelsLastFetch` 并 log info |
+| 102-107 | └ 失败回退 | 逻辑 | P | log warn 并返回 `MODELS` |
+| 110-123 | `handleModels` | 异步函数 | E | getApiKey → fetchModels → OpenAI list 形状 `sendJSON(200, ...)` |
+
+依赖：`../../shared/config` `../../shared/logger` `../../shared/version` `../../shared/auth` `../../shared/util` `../../shared/http`
+
+---
+
+## src/modules/health/index.ts（12 行 · 协议层）
+
+健康检查控制器：`/` 纯文本、`/health` JSON `{ok:true}`。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1 | — | import | — | `elysia` |
+| 3-8 | `jsonResponse` | 函数 | P | 本地 JSON Response 构造 |
+| 10-12 | `healthController` | 插件 | E | `Elysia({ name: 'health', prefix: '' })` |
+| 11 | └ `GET /` | 路由 | P | 返回 `Response('OK', text/plain)` |
+| 12 | └ `GET /health` | 路由 | P | `jsonResponse(200, { ok: true })` |
+
+依赖：`elysia`
+
+---
+
+## test/e2e.ts（486 行 · 测试）
+
+端到端测试：进程内起 mock CC 上游 `:4100`，动态 import 真实被测服务 `:4200`，覆盖双协议全部主路径与错误路径。
 
 | 行号 | 符号/段落 | 类别 | 说明 |
 |---|---|---|---|
-| 1-5 | env 注入 | 配置 | PORT=4200 / HOST=127.0.0.1 / CC_API_BASE=4100 / CC_MAX_BODY_MB=1 / 无兜底 Key |
-| 9-15 | `stats` | 状态 | mock 上游计数：generate/fingerprint/lifecycle + 最后一次请求头/体 |
-| 17-24 | `ndjson` | 工具 | 事件数组 → NDJSON ReadableStream |
-| 26-38 | `slowNdjson` | 工具 | 慢速流（两次 Bun.sleep(300)），供断连测试 |
-| 42-105 | mock Bun.serve | 桩服务 | `/_stats`、`/alpha/fingerprint/record`、`/alpha/lifecycle-events`、`/provider/v1/models`（mock-model-a/b）、`/alpha/generate`（按 model 分支：mock/reason、mock/zero、mock/slow、mock/upstream-429、mock/event-error、mock/midstream-error、mock/params、默认含 tool-call） |
-| 107-122 | 启动与工具 | 基建 | 动态 import 被测 app；`check` 断言器；`statsFetch` |
-| 124-144 | basic endpoints | 用例组 | /health（含 CORS `*`）、/、OPTIONS 204+CORS、404 JSON |
-| 146-176 | auth / parse errors | 用例组 | 双协议 401、无效 JSON 400、413（体上限 1MB） |
-| 178-244 | openai 非流式 | 用例组 | 文本/工具调用/finish_reason/usage/id 格式；上游头校验（bearer、x-session-id、x-project-slug、traceparent、版本头、co/taste flag）；body 校验（stream:true、system 提取、tools→input_schema、user 包装、cache_control 注入、无 system 角色）；init 不重复、generate 递增 |
-| 246-263 | openai 流式 | 用例组 | content-type、[DONE]、首块 role、后续块无 role、tool_calls chunk、finish 带 usage |
-| 265-274 | openai reasoning | 用例组 | reasoning_content + content 并存、finish stop |
-| 276-320 | param passthrough | 用例组 | top_p/stop/user/seed 透传（双协议） |
-| 322-366 | zero output / errors | 用例组 | 零输出 429(retry_after 10)、上游 429 → 映射(retry_after 30)、流前错误事件→429、流中错误→保持 200 SSE 且含 error 帧无 [DONE] |
-| 368-408 | anthropic 非流式/thinking | 用例组 | msg_id、text+tool_use 块、stop_reason、usage；thinking 块+伪签名、budget_tokens 12000→reasoning_effort high |
-| 410-435 | anthropic 流式 | 用例组 | 事件顺序 message_start→…→message_stop、text_delta、tool_use/input_json_delta、message_delta(stop_reason+usage) |
-| 437-451 | client disconnect | 用例组 | 断连后服务存活（/health 200） |
-| 453-455 | 结果 | 输出 | `RESULT: N passed, M failed`，失败 exit 1 |
+| 1-5 | env 注入 | env | `PORT=4200`/`HOST=127.0.0.1`/`CC_API_BASE=http://127.0.0.1:4100`/`CC_MAX_BODY_MB=1`/`CC_API_KEY=''`，先于 import |
+| 7 | `enc` | 工具 | `TextEncoder` 单例 |
+| 9-15 | `stats` | 状态 | mock 计数 generate/fingerprint/lifecycle + lastGenerateHeaders/lastGenerateBody |
+| 17-24 | `ndjson(events)` | 工具 | 事件数组 → NDJSON ReadableStream |
+| 26-38 | `slowNdjson()` | 工具 | 慢速流（两次 sleep300），供断连 |
+| 40 | `usage` | 状态 | 标准 usage 样本 {100,20,50} |
+| 42-105 | mock `Bun.serve(:4100)` | mock | 上游桩服务 |
+| 46 | `/_stats` | mock | 返回 stats |
+| 49 | `/alpha/fingerprint/record` | mock | fingerprint++ 返回 {} |
+| 50 | `/alpha/lifecycle-events` | mock | lifecycle++ 返回 {} |
+| 51-53 | `/provider/v1/models` | mock | mock-model-a(context_window)/mock-model-b(context_length)/claude-sonnet-4-6 |
+| 54-102 | `/alpha/generate` | mock | 记录头/体，按 params.model 分支 |
+| 61-67 | `mock/reason` | mock | reasoning-delta+text-delta+finish |
+| 68-72 | `mock/zero` | mock | start+finish，outputTokens 0 |
+| 73-74 | `mock/slow` | mock | slowNdjson 流 |
+| 75-76 | `mock/upstream-429` | mock | JSON 429 `rate limited upstream` |
+| 77-80 | `mock/event-error` | mock | 流内 error 事件 `<429> slow down` |
+| 81-86 | `mock/midstream-error` | mock | partial→error→finish |
+| 87-92 | `mock/params` | mock | start+`params-ok`+finish |
+| 93-101 | 默认分支 | mock | Hello world + tool-call get_weather + finish tool-calls |
+| 103 | 兜底 404 | mock | 返回 `nf` |
+| 107-108 | 启动 | 基建 | import `../src/index.ts` + sleep500 |
+| 110-111 | `BASE`/`KEY` | 状态 | :4200 基址 + 测试 Key |
+| 113-117 | `check` | 断言 | PASS/FAIL 计数 |
+| 119-122 | `statsFetch` | 工具 | 拉取 mock `/_stats` |
+| 124-144 | basic endpoints | 用例组 | /health 200+CORS、/ 返回 OK、OPTIONS 204、404 JSON |
+| 146-186 | auth / parse errors | 用例组 | 双协议 401、无效 JSON 400、>1MB 413、无 Key models 200 |
+| 188-196 | models | 用例组 | 动态列表、context_window 透传、context_length 别名、静态兜底 |
+| 198-247 | openai 非流式 | 用例组 | 内容/工具调用/usage/id；上游头；上游体；init 幂等 |
+| 249-266 | openai 流式 | 用例组 | event-stream、[DONE]、role、tool_calls chunk、finish+usage |
+| 268-277 | openai reasoning | 用例组 | reasoning_content + content 并存、finish stop |
+| 279-323 | 参数透传 | 用例组 | top_p/stop/user/seed 与 anthropic 对应字段 |
+| 325-369 | 零输出 / 上游错误 | 用例组 | 429 各分支与流中 error 保持 SSE |
+| 371-411 | anthropic 非流式 | 用例组 | msg_/tool_use/stop_reason/usage、thinking 伪签名、reasoning_effort |
+| 413-438 | anthropic 流式 | 用例组 | 事件序列、text_delta、tool_use、message_delta |
+| 440-465 | anthropic 零输出 / 上游错误 | 用例组 | 429 与流前 error → JSON 429 |
+| 467-481 | 客户端断连 | 用例组 | abort 后服务存活 |
+| 483-486 | 结果 / 导出 | 输出 | RESULT 行、fail>0 exit1、export {} |
 
-## test/timeouts.ts（81 行 · 测试）
+依赖：`../src/index.ts`（动态 import） Bun 全局（Bun.serve/fetch/ReadableStream/TextEncoder/Bun.sleep）
 
-真实时间流逝的超时专项测试（约 30s）：mock 上游挂起 120s。
+---
+
+## test/heartbeat.ts（89 行 · 测试）
+
+SSE 心跳单元测试：验证 `startSseHeartbeat` 的四种状态闸门与两种 ping 帧形状。
 
 | 行号 | 符号/段落 | 类别 | 说明 |
 |---|---|---|---|
-| 1-4 | env 注入 | 配置 | PORT=4210 / CC_API_BASE=4110 / 无兜底 Key |
-| 7 | `generateCancelled` | 状态 | 上游 /alpha/generate 是否被取消（abort 事件 + cancel 回调双标记） |
-| 9-31 | mock Bun.serve | 桩服务 | idleTimeout:120；/alpha/generate 返回只发 `start` 后挂起 120s 的流 |
-| 33-43 | 启动与工具 | 基建 | import 被测 app；`check` 断言器 |
-| 45-58 | stream idle timeout | 用例组 | 流式挂起 → 恰在 28-35s 内返回 429 rate_limit_error(retry_after 5)；且上游 generateCancelled=true |
-| 60-76 | anthropic disconnect | 用例组 | /v1/messages 流式中途 abort → 上游被取消；服务存活 |
-| 78-81 | 结果 | 输出 | 同 e2e 输出格式 |
+| 1 | import | import | `SSE_PING_EVENT`/`SsePipeline`/`startSseHeartbeat` from `../src/infra/sse.ts` |
+| 3-7 | `check` | 断言 | PASS/FAIL 计数 |
+| 9 | `dec` | 工具 | TextDecoder 单例 |
+| 11-23 | `readOne(p, timeoutMs=200)` | 工具 | 竞速读取一帧，超时返回 ''，finally 释放锁 |
+| 25-30 | 保活语义注释 | 输出 | 心跳只保下游不续租上游 |
+| 31-43 | 用例组① idle → ping | 用例组 | 已开播+空闲 → `event: ping`/`"type":"ping"`、pingCount>0、默认帧形状 |
+| 44-52 | 用例组② unstarted → no ping | 用例组 | 未 start → pingCount 0 |
+| 53-62 | 用例组③ closed → no ping | 用例组 | close 后 → pingCount 0 |
+| 63-74 | 用例组④ custom pingEvent | 用例组 | `: keepalive` 注释帧、不含 event: ping、计数>0 |
+| 75-84 | 用例组⑤ no idle → no ping | 用例组 | idleMs=10000 窗口内不发 |
+| 86-89 | 结果 / 导出 | 输出 | RESULT 行、exit、export {} |
+
+依赖：`../src/infra/sse.ts`
 
 ---
 
-## 模块依赖矩阵（import 方向：行 = 依赖方，列 = 被依赖方）
+## test/idle-timeout-env.ts（111 行 · 测试）
 
-外部依赖：`elysia`（仅 index.ts）、`node:fs/promises`（仅 logger.ts）、Bun 全局 API（Bun.CryptoHasher / Bun.file / Bun.isStandaloneExecutable / crypto / fetch / ReadableStream 等）。
+`CC_*_IDLE_MS` 环境变量解析契约的快速子进程测试，无 30s 真实等待。
 
-| 模块 | config | logger | util | http | auth | runtime | cc-types | cc-events | cc | sse | errors | proxy-handler | models | session | fingerprint | version | elysia |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| index | ✔ | ✔ | | ✔ | | | | | | | | | ✔ | ✔ | | ✔ | ✔ |
-| config | — | | | | | | | | | | | | | | | | |
-| logger | ✔ | — | | | | | | | | | | | | | | | |
-| util | | | — | | | | | | | | | | | | | | |
-| runtime | | | | | | — | | | | | | | | | | | |
-| http | ✔ | | | — | | | | | | | | | | | | | |
-| auth | ✔ | | | | — | | | | | | | | | | | | |
-| cc-types | | | | | | | — | | | | | | | | | | |
-| cc-events | | ✔ | | | | | ✔ | — | | | | | | | | | |
-| cc | ✔ | | ✔ | | | | | | — | | | | | ✔ | | ✔ | |
-| sse | | ✔ | | | | | | ✔ | | — | ✔ | | | | | | |
-| errors | | | | | | | | | | | — | | | | | | |
-| proxy-handler | | ✔ | | ✔ | | | | | ✔ | | ✔ | — | | | ✔ | | |
-| openai | | ✔ | ✔ | ✔ | ✔ | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ | | | | | |
-| anthropic | | ✔ | ✔ | ✔ | ✔ | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ | | | | | |
-| models | ✔ | ✔ | ✔ | ✔ | ✔ | | | | | | | | — | | | ✔ | |
-| session | | ✔ | ✔ | | | | | | | | | | | — | ✔ | | |
-| fingerprint | ✔ | ✔ | ✔ | | | | | | | | | | | | — | ✔ | |
-| version | | ✔ | | | | | | | | | | | | | | — | |
+| 行号 | 符号/段落 | 类别 | 说明 |
+|---|---|---|---|
+| 1-7 | 头注释 | 输出 | env 契约与分工说明 |
+| 9 | `ROOT` | 状态 | 子进程 cwd |
+| 10 | `PROBE` | 状态 | 探测脚本：import config 三常量并打印 JSON |
+| 12 | `dec` | 工具 | TextDecoder 单例 |
+| 14-18 | `ProbeResult` | 状态 | `{code,out,err}` |
+| 20-39 | `runProbe(overrides)` | 工具 | 复制 env、undefined 删除 key、Bun.spawnSync 跑探测 |
+| 41-47 | `parseOut` | 工具 | JSON 解析，失败 null |
+| 49-59 | `check` | 断言 | PASS/FAIL 计数 |
+| 61-66 | (a) unset | 用例组 | code 0 且 30000/90000/120000 |
+| 68-73 | (b) custom | 用例组 | 60000/120000，thinking 默认 120000 |
+| 75-80 | (b2) thinking custom | 用例组 | thinking 180000，stream/non-stream 默认 |
+| 82-87 | (c) stream 0 | 用例组 | 0 → 默认 30000 |
+| 89-94 | (c2) thinking 0 | 用例组 | 0 → 默认 120000 |
+| 96-100 | (d) stream abc | 用例组 | 非数字 → 子进程非零退出 |
+| 102-106 | (d2) thinking abc | 用例组 | 非数字 → 子进程非零退出 |
+| 108-111 | 结果 / 导出 | 输出 | RESULT 行、exit、export {} |
 
-被依赖次数（反向入度，衡量核心度）：config×6 · logger×10 · util×6 · http×5 · errors×4 · cc×3 · cc-events×3 · sse×2 · proxy-handler×2 · version×4 · fingerprint×2 · session×2 · auth×3 · runtime×2 · models×1 · cc-types×1。
-
-> 观察要点：
-> 1. `config` / `logger` / `util` 为全局地基，被广泛引用；
-> 2. `cc-types` 与 `errors` 是零依赖叶子，适合单独测试；
-> 3. `openai.ts` 与 `anthropic.ts` 的导入面几乎相同（10 个共享模块），仅 anthropic 额外承担协议转换；
-> 4. 无循环依赖：依赖方向严格按 入口 → 协议 → 管道 → 上游 → 基础设施 分层。
+依赖：`./src/shared/config.ts`（子进程内探测） Bun.spawnSync
 
 ---
+
+## test/timeouts.ts（114 行 · 测试）
+
+真实时间超时专项（约 30s）：mock 上游零字节挂起，验证 30s 空闲超时、上游取消与断连级联取消。
+
+| 行号 | 符号/段落 | 类别 | 说明 |
+|---|---|---|---|
+| 1-4 | env 注入 | env | `PORT=4210`/`HOST=127.0.0.1`/`CC_API_BASE=http://127.0.0.1:4110`/`CC_API_KEY=''` |
+| 6 | `enc` | 工具 | TextEncoder 单例 |
+| 7 | `generateCancelled` | 状态 | 上游是否被取消 |
+| 9-33 | mock `Bun.serve(:4110)` | mock | 上游桩服务，idleTimeout:120 |
+| 14 | `/alpha/fingerprint/record` | mock | 返回 {} |
+| 15 | `/alpha/lifecycle-events` | mock | 返回 {} |
+| 16 | `/provider/v1/models` | mock | `{data:[{id:'m'}]}` |
+| 17-30 | `/alpha/generate` | mock | abort 监听置位 + 零字节挂起 120s + cancel 回调置位 |
+| 31 | 兜底 404 | mock | 返回 `nf` |
+| 35-36 | 启动 | 基建 | import `../src/index.ts` + sleep300 |
+| 38-39 | `BASE`/`KEY` | 状态 | :4210 基址 + 测试 Key |
+| 41-45 | `check` | 断言 | PASS/FAIL 计数 |
+| 47-65 | 用例组① stream idle timeout | 用例组 | 429 rate_limit_error(retry_after 5)、耗时 28-35s、上游已取消 |
+| 67-83 | 用例组② anthropic 断连 | 用例组 | abort 后上游取消、/health 200 |
+| 85 | 结果 | 输出 | RESULT 行 |
+| 87-111 | ENABLE_THINKING_ASSERT 门控 | 用例组 | 纯函数断言 isThinkingWait/idleTimeoutFor 映射，默认跳过 |
+| 112-114 | 退出 / 导出 | 输出 | fail>0 exit1、export {} |
+
+依赖：`../src/index.ts`（动态 import） `../src/shared/runtime.ts`（门控动态 import）
+
+---
+
+## 模块依赖矩阵
+
+### 外部依赖
+
+- `elysia`：`src/app.ts`、`src/plugins/*`、各 `src/modules/*/index.ts` 与 `src/modules/*/model.ts`。
+- `node:fs/promises`：仅 `src/shared/logger.ts`（`appendFile`）。
+- 其余运行时能力均为 Bun/Web 全局 API：`Bun.serve`/`Bun.spawnSync`/`Bun.sleep`、`fetch`、`ReadableStream`、`TextEncoder`/`TextDecoder`、`crypto`。
+
+### 按目录/层级的依赖矩阵
+
+行=依赖方目录，列=被依赖目录；✔=存在 import。`入口`=index/app（含 index→app 的内部接线）。
+
+| 依赖方 \ 被依赖 | 入口 | 插件 | shared | infra | chat | messages | models | health |
+|---|---|---|---|---|---|---|---|---|
+| 入口 | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| 插件 |  |  | ✔ |  |  |  |  |  |
+| shared |  |  | ✔ |  |  |  |  |  |
+| infra |  |  | ✔ | ✔ |  |  |  |  |
+| modules-chat |  | ✔ | ✔ | ✔ | ✔ |  |  |  |
+| modules-messages |  | ✔ | ✔ | ✔ |  | ✔ |  |  |
+| modules-models |  |  | ✔ |  |  |  | ✔ |  |
+| modules-health |  |  |  |  |  |  |  |  |
+
+### 核心度（被依赖次数）排序
+
+| 排名 | 模块 | 被依赖次数 | 主要依赖方 |
+|---|---|---|---|
+| 1 | `shared/logger.ts` | 11 | index、version、cc-events、proxy-handler、session、fingerprint、chat/messages 的 handler+translator、models/catalog |
+| 2 | `shared/config.ts` | 9 | index、logger、runtime、http、auth、plugins/errors、infra/cc、infra/fingerprint、models/catalog |
+| 3 | `shared/util.ts` | 9 | infra/cc、infra/session、infra/fingerprint、chat handler/aggregator、messages handler/translator/aggregator、models/catalog |
+| 4 | `shared/errors.ts` | 6 | infra/proxy-handler、chat translator/aggregator、messages handler/translator/aggregator |
+| 5 | `shared/http.ts` | 6 | plugins/cors、plugins/body、infra/proxy-handler、chat handler、messages handler、models/catalog |
+| 6 | `shared/version.ts` | 4 | index、infra/cc、infra/fingerprint、models/catalog |
+| 7 | `shared/auth.ts` | 4 | plugins/auth、chat handler、messages handler、models/catalog |
+| 8 | `infra/cc.ts` | 4 | proxy-handler、chat/service(re-export)、chat handler、messages handler |
+| 9 | `infra/session.ts` | 4 | index、infra/cc、chat handler、messages handler |
+| 10 | `infra/cc-events.ts` | 4 | chat translator/aggregator、messages translator/aggregator |
+
+> 统计口径：仅计 `src/` 内 import；`test/` 另行依赖 `src/index.ts`、`src/infra/sse.ts`、`src/shared/config.ts`、`src/shared/runtime.ts`。
+
+### 观察要点
+
+1. `shared/` 是典型高扇入地基：`logger`(11)、`config`(9)、`util`(9)、`errors`(6)、`http`(6) 构成全仓最底层，且 shared 内部仅指向 `config`/`logger`，无回边。
+2. `infra/` 承担上游对接与共享管道：`cc`+`session`+`fingerprint` 管请求构建与会话/指纹，`proxy-handler` 抽出双协议共用的读体、断连级联与上游调用，`cc-events` 统一 NDJSON 解析。
+3. 分层方向清晰为 入口 → 插件/协议模块 → infra → shared，矩阵中无反向依赖、无环；`plugins` 只依赖 `shared`，`health` 为仅依赖 `elysia` 的叶子。
+4. chat 与 messages 的 `handler/translator/aggregator` 结构对称，差异集中在传输层：chat 的 `SsePipeline(true)` 用 `autoStart=true`，messages 用 `SsePipeline(false)` 缓冲头部并走 `emitAnthropic` + 两跳 Anthropic↔OpenAI 转换。
+5. `models/catalog` 是唯一同时依赖 `config/logger/version/auth/util/http` 六个 shared 模块的聚合点，也是连通 `shared` 与 `modules-models` 的关键。
 
 *本报告由全量源码扫描生成；行号对应当前工作区版本。*
-
-
-
-
-

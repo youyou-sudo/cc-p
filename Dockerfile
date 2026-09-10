@@ -15,7 +15,7 @@ ENV NODE_ENV=production
 # Compile the Elysia app into a single executable. Flags mirror the Release
 # workflow build (release.yml) — production + minify. import.meta.dir points to
 # the virtual $bunfs inside the binary, so runtime files (.env / config.json)
-# must be resolved from process.cwd() — see src/config.ts (candidateDirs).
+# must be resolved from process.cwd() — see src/shared/config.ts (candidateDirs).
 RUN bun build ./src/index.ts --compile --production --minify --outfile server
 
 # Production stage: distroless runtime (no shell / no package manager)

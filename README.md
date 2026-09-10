@@ -116,7 +116,7 @@ Streaming emits `message_start / content_block_* / message_delta / message_stop`
 
 ### `GET /v1/models`
 
-Tries `GET {CC_API_BASE}/provider/v1/models` with your key (10s timeout); caches for `CC_MODEL_REFRESH_INTERVAL_MS`. Falls back to the builtin list in `src/models.ts` on any failure. Set `CC_USE_PROVIDER_MODELS=false` to always use the builtin list.
+Tries `GET {CC_API_BASE}/provider/v1/models` with your key (10s timeout); caches for `CC_MODEL_REFRESH_INTERVAL_MS`. Falls back to the builtin list in `src/modules/models/catalog.ts` on any failure. Set `CC_USE_PROVIDER_MODELS=false` to always use the builtin list.
 
 ## Configuration
 
@@ -182,13 +182,13 @@ Oversized bodies (> `CC_MAX_BODY_MB`) are rejected with `413`.
 | `429` | Zero output tokens (`retry_after: 10`), idle timeout (`retry_after: 5`) | SDK auto-retries via `Retry-After`; after 3 consecutive timeouts the message suggests reducing context |
 | `502/503` | Upstream CC error (mapped from CC status/event) | Retry / backoff |
 
-Upstream mapping (`src/errors.ts`): CC `402/429` → `429`, `401/403` → `401`, `400/422` → `400`, `500/502` → `502`, `503` → `503`. CC `tool-calls` is normalized to OpenAI `tool_calls` and Anthropic `tool_use` on both stream and non-stream paths.
+Upstream mapping (`src/shared/errors.ts`): CC `402/429` → `429`, `401/403` → `401`, `400/422` → `400`, `500/502` → `502`, `503` → `503`. CC `tool-calls` is normalized to OpenAI `tool_calls` and Anthropic `tool_use` on both stream and non-stream paths.
 
 Client disconnects (`request.signal`) abort the upstream `fetch` immediately; unfinished streams are closed without leaking sockets.
 
 ## Long Sessions / Context Management
 
-> The proxy is stateless: `src/cc.ts` forwards the full message history on
+> The proxy is stateless: `src/infra/cc.ts` forwards the full message history on
 > every request — no prune / trim / compact. History growth lives on the
 > caller (Claude Code, Cline, your agent loop), not in the proxy. So context
 > hygiene is a **client habit**, not a server setting. Facts that shape the
@@ -200,7 +200,7 @@ Client disconnects (`request.signal`) abort the upstream `fetch` immediately; un
 > are per-key, 12h + ≤1h jitter — a new key or a new session resets to zero;
 > `GET /v1/models` exposes `context_window` (provider passthrough
 > `context_window` / `context_length` / `max_context_tokens` + static fallback
-> in `src/models.ts`), so pin a large-window model programmatically and fall
+> in `src/modules/models/catalog.ts`), so pin a large-window model programmatically and fall
 > back to manual lookup only for models still without a window.
 
 1. **Pass file paths, don't paste contents.** Anything pasted into `messages`
@@ -221,7 +221,7 @@ Client disconnects (`request.signal`) abort the upstream `fetch` immediately; un
 5. **Pin a large-window model for context-heavy work.** `GET /v1/models` now
    carries `context_window` (provider fields `context_window` /
    `context_length` / `max_context_tokens`, static fallback for known ids in
-   `src/models.ts`). Query it and hardcode the model id on tasks that need
+   `src/modules/models/catalog.ts`). Query it and hardcode the model id on tasks that need
    long context (repo-wide refactors, big log dives). Manual lookup is only
    needed for ids still without a published window.
 6. **Watch `finish` usage, not just errors.** On stream / non-stream paths
@@ -233,11 +233,11 @@ Client disconnects (`request.signal`) abort the upstream `fetch` immediately; un
 
 | Signal | Meaning | Do this (don't blind-retry) |
 |--------|---------|-----------------------------|
-| `400` `context_window_exceeded` | Prompt matched `CONTEXT_WINDOW_EXCEEDED_PATTERN` (`src/errors.ts`) on HTTP or in-stream error — over-long by keyword even if upstream said `429` | Trim history / summarize / start a new session. Retrying the same payload always fails. |
+| `400` `context_window_exceeded` | Prompt matched `CONTEXT_WINDOW_EXCEEDED_PATTERN` (`src/shared/errors.ts`) on HTTP or in-stream error — over-long by keyword even if upstream said `429` | Trim history / summarize / start a new session. Retrying the same payload always fails. |
 | `429` `Empty response` / zero output, `retry_after: 10` | Upstream returned zero output tokens | Safe to retry once with backoff; if it repeats, shrink context and simplify the last turn. |
 | `429` idle timeout, `retry_after: 5` | No upstream bytes for 30s (stream) / 90s (non-stream) (overridable via `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS`, defaults unchanged); **thinking phase** (`lastCcEvent` in `start`/`start-step`/`reasoning-start`/`reasoning-delta`) gets a 120s window (`CC_THINKING_IDLE_MS`); per-key consecutive counter, ≥3 → message tells you to reduce context **even when the current request is small (idle ≠ large context)** | Don't blind-compress: first check which `429` it is (see below). If `retry_after: 5`, suspect slow upstream / fan-out / huge `tool_result` / reasoning pause; split the task, cap tool results, lower concurrency. If the log shows `thinkingPhase=true` + `lastCcEvent=reasoning-start` + `elapsedMs≈timeoutMs`, raise `CC_THINKING_IDLE_MS` instead (see "Fails while thinking" below). |
 | `429` thinking timeout, `retry_after: 5` + `thinkingPhase=true` | `reasoning-start` followed by 30s+ of zero upstream bytes: `readWithTimeout` used to kill it at 30s (before the 120s thinking grace existed). Unrelated to context size — streaming-timeout `inputTokens` is always `0`, so it can't judge size. Self-proof triple: `lastCcEvent=reasoning-start`/`start` with no delta + `bytesReceived` of tens of bytes + `elapsedMs` pinned at the threshold. Opencode wraps it as `failed to send message`. | Don't compress context. Raise `CC_THINKING_IDLE_MS` (e.g. `180000` for deep reasoning), or split the task / lower `reasoning_effort`. True hang cost: failure detection is delayed to the threshold. |
-| `429` true rate limit, `retry_after: 30` | Real upstream `402/429` mapped through `src/errors.ts` | Back off and honor `Retry-After`. Trimming won't help — wait, then retry. |
+| `429` true rate limit, `retry_after: 30` | Real upstream `402/429` mapped through `src/shared/errors.ts` | Back off and honor `Retry-After`. Trimming won't help — wait, then retry. |
 | `502/503` other | Genuine upstream error (`CC_STATUS_MAP`; unlisted → `502 upstream_error`) | Retry / backoff. |
 
 How to tell the three `429`s apart: read the body — `message` text plus the
@@ -261,7 +261,7 @@ rate_limit_error` — when you see that wrapper, unwrap it and check the inner
 
 ### Small context but still told to `reduce context`?
 
-`src/runtime.ts:58-62` switches the idle-timeout copy to `try reducing context
+`src/shared/runtime.ts:92-104` switches the idle-timeout copy to `try reducing context
 length (summarize earlier messages)` once **the same API key** has
 **≥3 consecutive timeouts** (TTL 30min, success resets to zero). After that
 point **every** idle timeout on that key carries the "reduce context" wording —
@@ -271,7 +271,7 @@ even a tiny request. It does **not** mean the current prompt is too large.
   Small context + subagent fan-out, one giant `tool_result`, a long reasoning
   pause, or just a slow upstream all trigger it.
 - **Counter is per-key, shared.** Main + subagents using the same key share
-  one counter and (by default) one upstream `x-session-id` (12h, `src/session.ts`),
+  one counter and (by default) one upstream `x-session-id` (12h, `src/infra/session.ts`),
   so they pollute each other: 3 slow subagent calls poison the 4th tiny call.
 - **Read the log.** A `Stream idle timeout` line with small `inputTokens` +
   `lastCcEvent` stuck with no delta + `bytesReceived ≈ 0` = upstream was slow,

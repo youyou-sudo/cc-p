@@ -1,42 +1,39 @@
-# 模块报告：src/index.ts（服务入口）
+# 模块报告：src/index.ts
 
 | 属性 | 值 |
 |---|---|
 | 路径 | `src/index.ts` |
-| 行数 | 117 |
+| 行数 | 79 |
 | 层级 | 入口层 |
-| 依赖 | elysia；`./config` `./http` `./logger` `./anthropic` `./models` `./openai` `./session` `./version` |
-| 被依赖 | 无（唯一入口；Docker CMD 与测试均从这里启动） |
+| 依赖 | `./shared/config`(CFG) `./shared/logger`(log) `./modules/models/catalog`(MODELS) `./infra/session`(startSessionCleanup) `./shared/version`(startVersionRefresh) `./app`(createApp) |
+| 被依赖 | `test/e2e.ts`、`test/timeouts.ts`（`await import('../src/index.ts')`）；另外 `package.json` 的 `start`/`dev`/`build` 脚本以此为入口 |
 
 ## 职责
 
-1. 启动时先拉起两个后台任务：`startVersionRefresh()`（CC 版本 24h 刷新）与 `startSessionCleanup()`（会话每小时清理）。
-2. 创建 Elysia 应用并注册全部路由与全局错误处理。
-3. 提供 `healthcheck` CLI 子命令（Docker HEALTHCHECK 调用）。
-4. 进程级 `unhandledRejection` 兜底。
+- 启动两个后台任务：`startVersionRefresh()`（CC 版本刷新）与 `startSessionCleanup()`（会话清理）。
+- 通过 `createApp()` 组装应用并 `.listen()` 在 `CFG.port`/`CFG.host` 上。
+- 打印启动日志、以及未配置兜底 Key（`CC_API_KEY`）时的告警。
+- 提供 `healthcheck` CLI 子命令（GET `/health` 自检）与进程级 `unhandledRejection` 兜底。
 
 ## 代码段映射
 
-| 行号 | 符号/段落 | 说明 |
-|---|---|---|
-| 11-16 | `jsonResponse(status, body)` | 私有辅助：JSON Response |
-| 18-75 | `startServer()` | 主启动流程（下详） |
-| 23-28 | onRequest 钩子 | 所有请求注入 CORS_HEADERS；OPTIONS 直接 204（配合 SSE_HEADERS 覆盖下游） |
-| 29 | GET `/` | 文本 `OK` 探针 |
-| 30 | GET `/health` | `{ok:true}`（healthcheck 子命令消费） |
-| 31 | GET `/v1/models` | → `handleModels(headers)` |
-| 32 | POST `/v1/chat/completions` | → `handleChatCompletions(request, headers)` |
-| 33 | POST `/v1/messages` | → `handleMessages(request, headers)` |
-| 34-51 | onError | 404 → not_found；413/PARSE/VALIDATION → 413 或 400（`/v1/messages` 用 Anthropic 错误形状 `{type:'error',...}`，其余用 OpenAI 形状）；其余 → 500 internal_error（透传 error.status/message） |
-| 52 | `.listen()` | `{port: CFG.port, hostname: CFG.host}` |
-| 54-68 | 启动日志 | url/api/models 数量/CORS 策略描述/会话策略（12h+1h jitter）/ZDR 状态/日志文件 |
-| 70-72 | 无兜底 Key 告警 | 未设 CC_API_KEY 时提示必须按请求携带 Key |
-| 77-99 | `healthcheck()` | GET `http://127.0.0.1:{PORT|CFG.port}/health`，5s 超时；非 ok / body.ok!==true → exit(1)，成功 exit(0) |
-| 101-110 | unhandledRejection | AbortError/ABORT_ERR → info「已清理」；其余 error 日志（message+stack 首行） |
-| 112-117 | CLI 分派 | `argv[2]==='healthcheck'` → healthcheck；否则 startServer |
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 1-6 | — | import | — | `./shared/config`(CFG) `./shared/logger`(log) `./modules/models/catalog`(MODELS) `./infra/session`(startSessionCleanup) `./shared/version`(startVersionRefresh) `./app`(createApp) |
+| 8-37 | `startServer` | 函数 | E | 启动主流程：拉起后台任务、创建并监听 app、输出启动日志 |
+| 9 | └ `startVersionRefresh()` | 逻辑 | P | 启动 CC 版本刷新后台任务 |
+| 10 | └ `startSessionCleanup()` | 逻辑 | P | 启动会话清理后台任务 |
+| 12-13 | └ `createApp().listen()` | 逻辑 | P | 监听 `{ port: CFG.port, hostname: CFG.host }` |
+| 15-30 | └ 启动日志 | 逻辑 | P | 打印 url/api/models 数量/CORS 策略/session/ZDR/emptySystemPlaceholder/logFile |
+| 32-34 | └ 无兜底 Key 告警 | 逻辑 | P | `CFG.apiKey` 为空时提示请求须带 `Authorization: Bearer` 或 `x-api-key` |
+| 39-61 | `healthcheck` | 异步函数 | E | GET `http://127.0.0.1:{PORT\|CFG.port}/health`，5s 超时；失败 `process.exit(1)`，成功 `exit(0)` |
+| 63-72 | unhandledRejection 监听 | 逻辑 | P | `AbortError`/`ABORT_ERR` 记 info；其余记 error（message+stack 首行） |
+| 74-79 | CLI 分派 | 逻辑 | P | `process.argv[2]==='healthcheck'` → `healthcheck()`，否则 `startServer()` |
 
 ## 关键行为
 
-- **CORS 双态**：见 `doc/modules/06-http.md`——无兜底 Key 时 `*`，有兜底 Key 且未显式配置时 `'null'`（拒绝浏览器跨域）。
-- **错误形状自适应**：`/v1/messages` 路径的解析类错误返回 Anthropic 顶层 `{type:'error'}`，其余返回 OpenAI `{error:{...}}`，保证客户端 SDK 能正确解析。
-- **顶层 await 可行性**：`./config` 使用顶层 `await loadConfig()`，Bun 原生支持，因此 CFG 在任何路由前已就绪。
+- **启动顺序固定**（L9-13）：先拉起 `startVersionRefresh`/`startSessionCleanup`，再 `createApp().listen()`；app 单独由 `src/app.ts` 组装。
+- **端口解析**（L40）：`healthcheck` 用 `Number(process.env.PORT) || CFG.port`，与 listen 的 `CFG.port` 可能因环境变量而不同，但默认一致。
+- **健康判定严格**（L49-53）：不仅要求 `res.ok`，还要求响应体 `body.ok === true`，否则 exit(1)。
+- **CORS 三态日志**（L19-23）：有 `CFG.apiKey` 时描述为受限（浏览器仅来自 `CFG.corsAllowOrigin`，未设则禁用 CORS）；无 Key 且有 origin 为允许该 origin；其余为 open。
+- **入口副作用**（L74-79）：模块被 import 即执行 CLI 分派并启动服务；测试通过 `await import('../src/index.ts')` 启动。

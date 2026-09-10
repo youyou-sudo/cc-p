@@ -119,7 +119,7 @@ Anthropic 结构，自动转换：
 ### `GET /v1/models`
 
 用你的 Key 请求 `GET {CC_API_BASE}/provider/v1/models`（10s 超时），按
-`CC_MODEL_REFRESH_INTERVAL_MS` 缓存。任何失败都回退到 `src/models.ts` 内置列表。
+`CC_MODEL_REFRESH_INTERVAL_MS` 缓存。任何失败都回退到 `src/modules/models/catalog.ts` 内置列表。
 `CC_USE_PROVIDER_MODELS=false` 则始终用内置列表。
 
 ## 配置
@@ -186,7 +186,7 @@ CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64
 | `429` | 零输出（`retry_after: 10`）、空闲超时（`retry_after: 5`） | SDK 按 `Retry-After` 自动重试；连续 3 次超时后提示压缩上下文 |
 | `502/503` | CC 上游错误（由 CC 状态/事件映射） | 重试 / 退避 |
 
-上游映射（`src/errors.ts`）：CC `402/429` → `429`，`401/403` → `401`，
+上游映射（`src/shared/errors.ts`）：CC `402/429` → `429`，`401/403` → `401`，
 `400/422` → `400`，`500/502` → `502`，`503` → `503`。CC 的 `tool-calls`
 在流式与非流式路径统一归一化为 OpenAI `tool_calls` / Anthropic `tool_use`。
 
@@ -194,7 +194,7 @@ CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64
 
 ## 长会话 / 上下文管理（Context）
 
-> 本代理是无状态的：`src/cc.ts` 每次都把完整历史全量透传上游——不做
+> 本代理是无状态的：`src/infra/cc.ts` 每次都把完整历史全量透传上游——不做
 > prune / trim / compact。历史膨胀在调用方（Claude Code、Cline、你的 agent
 > 循环），不在代理里。所以上下文卫生是**客户端习惯**，不是服务端开关。
 > 决定下述习惯的既定事实：流式空闲超时 30s / 非流式 90s（可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变；按 Key 记连续超时，
@@ -203,7 +203,7 @@ CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64
 > 优先、即使上游误标 `<429>`）统一归一化为 `400` `context_window_exceeded`；
 > session 按 Key 隔离 12h + ≤1h 抖动——换 Key 或新会话即清零；
 > `GET /v1/models` 已带 `context_window`（provider 透传
-> `context_window` / `context_length` / `max_context_tokens` + `src/models.ts`
+> `context_window` / `context_length` / `max_context_tokens` + `src/modules/models/catalog.ts`
 > 静态兜底），可程序化 pin 大窗口模型，仅无窗口的 id 才需人工查表。
 
 1. **传文件路径，不要粘贴全文。** 粘进 `messages` 的内容每轮都会原样重发，
@@ -219,7 +219,7 @@ CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64
    `prompt_cache_key` 请求头会保持会话——想要干净起点就别带它们。
 5. **上下文敏感任务 pin 大窗口模型。** `GET /v1/models` 已带 `context_window`
    （provider 字段 `context_window` / `context_length` / `max_context_tokens`，
-   已知 id 另有 `src/models.ts` 静态兜底）。查表后把长上下文任务（整仓重构、
+   已知 id 另有 `src/modules/models/catalog.ts` 静态兜底）。查表后把长上下文任务（整仓重构、
    大日志排查）的模型 id 写死。仅无窗口的 id 才需人工确认。
 6. **看 `finish` 的 usage 趋势，别只看报错。** 流式/非流式终包都带 `usage`
    （`prompt_tokens` / `inputTokens` 逐轮爬升就是早期告警）。如果 inputTokens
@@ -229,11 +229,11 @@ CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64
 
 | 信号 | 含义 | 动作（不要无脑重试） |
 |------|------|----------------------|
-| `400` `context_window_exceeded` | HTTP 或流内 error 命中 `CONTEXT_WINDOW_EXCEEDED_PATTERN`（`src/errors.ts`）——关键词判超长，即使上游误标 `429` | 裁剪历史 / 总结 / 开新会话。同样的包体重试必败。 |
+| `400` `context_window_exceeded` | HTTP 或流内 error 命中 `CONTEXT_WINDOW_EXCEEDED_PATTERN`（`src/shared/errors.ts`）——关键词判超长，即使上游误标 `429` | 裁剪历史 / 总结 / 开新会话。同样的包体重试必败。 |
 | `429` `Empty response` / 零输出，`retry_after: 10` | 上游零输出 token（zero-output） | 可退避重试一次；反复出现则压缩上下文、简化上一轮。 |
 | `429` 空闲超时，`retry_after: 5` | 上游 30s（流式）/ 90s（非流式）无字节（可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变）；**思考期**（`lastCcEvent` 为 `start`/`start-step`/`reasoning-start`/`reasoning-delta`）走 120s 宽限（`CC_THINKING_IDLE_MS`）；按 Key 记连续超时，≥3 次后消息提示压缩上下文——**即使当前请求很小（空闲≠上下文大）** | 别无脑压缩：先看是哪个 `429`（见下）。`retry_after: 5` 优先怀疑上游慢 / 并发 fan-out / 超大 `tool_result` / 推理停顿；拆任务、截断 tool 结果、降并发。日志若为 `thinkingPhase=true` + `lastCcEvent=reasoning-start` + `elapsedMs≈timeoutMs`，应调大 `CC_THINKING_IDLE_MS`（见下“思考时报错”）。 |
 | `429` 思考超时，`retry_after: 5` + `thinkingPhase=true` | `reasoning-start` 后 30s+ 上游零字节：旧逻辑下 `readWithTimeout` 在 30s 误杀（120s 思考宽限之前）。与上下文大小无关——流式超时 `inputTokens` 恒为 `0`，不能判大小。自证三件套：`lastCcEvent=reasoning-start`/`start` 无 delta + `bytesReceived` 几十字节 + `elapsedMs` 顶格阈值。Opencode 包装为 `failed to send message`。 | 别压缩上下文。调大 `CC_THINKING_IDLE_MS`（深度推理如 `180000`），或拆任务/降 `reasoning_effort`。真 hang 代价：失败感知延迟到阈值。 |
-| `429` 真限流，`retry_after: 30` | 真实上游 `402/429`，经 `src/errors.ts` 映射 | 按 `Retry-After` 退避等待。裁剪没用——等，再重试。 |
+| `429` 真限流，`retry_after: 30` | 真实上游 `402/429`，经 `src/shared/errors.ts` 映射 | 按 `Retry-After` 退避等待。裁剪没用——等，再重试。 |
 | `502/503` 其他 | 真实上游错误（`CC_STATUS_MAP`；未列出 → `502 upstream_error`） | 重试 / 退避。 |
 
 区分三个 `429`：读包体——`message` 文案 + 数字 `retry_after`
@@ -254,7 +254,7 @@ rate_limit_error`——看到该包装先拆开看内层 `retry_after` 再决策
 
 ### 上下文很小却还让 `reduce context`？
 
-`src/runtime.ts:58-62` 在**同一 API Key** **连续超时 ≥3 次**后（TTL 30min，
+`src/shared/runtime.ts:92-104` 在**同一 API Key** **连续超时 ≥3 次**后（TTL 30min，
 成功一次即清零），把空闲超时的文案切换为 `try reducing context length`。
 此后该 Key 上的**每一次**空闲超时都带这句文案——再小的请求也一样，
 **不代表**当前 prompt 太大。
@@ -263,7 +263,7 @@ rate_limit_error`——看到该包装先拆开看内层 `retry_after` 再决策
   fan-out、单条超大 `tool_result`、长时间 reasoning 停顿、上游单纯慢，
   都会触发。
 - **计数器按 Key 共享，会互相污染。** 主+子代理同 Key 共用一个计数器，
-  默认还共用上游 `x-session-id`（12h，`src/session.ts`）：3 次慢子代理调用
+  默认还共用上游 `x-session-id`（12h，`src/infra/session.ts`）：3 次慢子代理调用
   就能污染第 4 次小请求。
 - **看日志定性。** `Stream idle timeout` 行里 `inputTokens` 很小 +
   `lastCcEvent` 卡住无 delta + `bytesReceived ≈ 0` = 上游慢，不是你上下文大；
