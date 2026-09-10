@@ -49,7 +49,7 @@ Bun.serve({
     if (url.pathname === '/alpha/fingerprint/record') { stats.fingerprint++; return Response.json({}) }
     if (url.pathname === '/alpha/lifecycle-events') { stats.lifecycle++; return Response.json({}) }
     if (url.pathname === '/provider/v1/models') {
-      return Response.json({ data: [{ id: 'mock-model-a' }, { id: 'mock-model-b' }] })
+      return Response.json({ data: [{ id: 'mock-model-a', context_window: 128000, max_output_tokens: 4096 }, { id: 'mock-model-b', context_length: 64000 }, { id: 'claude-sonnet-4-6' }] })
     }
     if (url.pathname === '/alpha/generate') {
       stats.generate++
@@ -189,7 +189,10 @@ console.log('--- models ---')
 {
   const r = await fetch(BASE + '/v1/models', { headers: { authorization: `Bearer ${KEY}` } })
   const body = await r.json()
-  check('models from provider API', r.status === 200 && body.object === 'list' && body.data.length === 2 && body.data[0].id === 'mock-model-a', body)
+  check('models from provider API', r.status === 200 && body.object === 'list' && body.data.length === 3 && body.data[0].id === 'mock-model-a', body)
+  check('models passthrough context_window', body.data[0]?.context_window === 128000, body.data?.[0])
+  check('models alias context_length → context_window', body.data[1]?.context_window === 64000, body.data?.[1])
+  check('models static fallback window', body.data[2]?.id === 'claude-sonnet-4-6' && body.data[2]?.context_window === 200000, body.data?.[2])
 }
 
 console.log('--- openai non-stream ---')

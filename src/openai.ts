@@ -35,6 +35,19 @@ function zeroUsageChunk(completionId: string, created: number, model: string): s
   })}\n\n`
 }
 
+/** 从已聚合 CC usage 取真实上报口径的 rawUsage（只加字段，不改状态码分支）。 */
+function rawUsageFromCcUsage(u: any): { input_tokens: number; output_tokens: number; cached_tokens: number } {
+  const toNum = (v: any): number => {
+    const n = Number(v)
+    return Number.isFinite(n) ? n : 0
+  }
+  return {
+    input_tokens: toNum(u?.inputTokens),
+    output_tokens: toNum(u?.outputTokens),
+    cached_tokens: toNum(u?.cachedInputTokens),
+  }
+}
+
 export async function handleChatCompletions(request: Request, headers: Record<string, string | undefined>): Promise<Response> {
   const parsed = await readRequestJson<any>(request, buildError)
   if (!parsed.ok) return parsed.response
@@ -87,7 +100,7 @@ export async function handleChatCompletions(request: Request, headers: Record<st
           model, completionId, reason,
           streaming: true,
           elapsedMs: Date.now() - startTime,
-          bytesSent: bytesReceived,
+          bytesReceived,
           lastCcEvent: lastCcEvent || '(none)',
           keepaliveCount: pipeline.keepaliveCount,
           inputTokens: translator.inputTokens,
@@ -108,9 +121,9 @@ export async function handleChatCompletions(request: Request, headers: Record<st
             bytesReceived += value.byteLength
 
             const events = translator.parseChunk(value)
+            if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent
             if (events.length > 0) {
               pipeline.emit(events)
-              if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent
             } else {
               pipeline.emitKeepalive()
             }
@@ -118,20 +131,21 @@ export async function handleChatCompletions(request: Request, headers: Record<st
 
           if (!aborted()) {
             const flushed = translator.flush()
+            if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent
             if (flushed.length > 0) {
               pipeline.emit(flushed)
-              if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent
             }
             if (translator.upstreamError) {
               state.upstreamError = translator.upstreamError
               if (pipeline.started) {
-                pipeline.writeNow(`data: ${JSON.stringify(translator.upstreamError.body)}\n\n`)
+                const errBody = translator.upstreamError.body
+                pipeline.writeNow(`data: ${JSON.stringify({ ...errBody, error: { ...errBody.error, rawUsage: translator.rawUsage } })}\n\n`)
               }
             } else if (translator.outputTokens === 0) {
               state.zeroOutput = true
               try { if (!abortController.signal.aborted) abortController.abort() } catch {}
               if (pipeline.started) {
-                pipeline.writeNow(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'upstream_error' }, retry_after: 10 })}\n\n`)
+                pipeline.writeNow(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'upstream_error', rawUsage: translator.rawUsage }, retry_after: 10 })}\n\n`)
               }
             } else {
               recordTimeoutSuccess(apiKey)
@@ -164,7 +178,19 @@ export async function handleChatCompletions(request: Request, headers: Record<st
             }
           } else {
             state.errorMsg = e?.message ?? String(e)
-            log('error', 'Stream error', { message: state.errorMsg })
+            log('error', 'Stream error', {
+              path: '/v1/chat/completions',
+              model,
+              completionId,
+              streaming: true,
+              message: state.errorMsg,
+              lastCcEvent: lastCcEvent || '(none)',
+              bytesReceived,
+              inputTokens: translator.inputTokens,
+              outputTokens: translator.outputTokens,
+              cachedInputTokens: translator.cachedInputTokens,
+              elapsedMs: Date.now() - startTime,
+            })
             try { abortController.abort() } catch {}
             if (pipeline.started) {
               pipeline.writeNow(`data: ${JSON.stringify({ error: { message: state.errorMsg, type: 'proxy_error' } })}\n\n`)
@@ -185,13 +211,35 @@ export async function handleChatCompletions(request: Request, headers: Record<st
       if (outcome === 'terminal') {
         flow.setGracefulClose(null)
         if (state.upstreamError) {
+          log('warn', 'CC stream error (terminal JSON)', {
+            path: '/v1/chat/completions',
+            model,
+            completionId,
+            streaming: true,
+            message: state.upstreamError.body?.error?.message,
+            mappedStatus: state.upstreamError.status,
+            mappedType: state.upstreamError.body?.error?.type,
+            lastCcEvent: lastCcEvent || '(none)',
+            bytesReceived,
+            inputTokens: translator.inputTokens,
+            outputTokens: translator.outputTokens,
+            cachedInputTokens: translator.cachedInputTokens,
+            started: pipeline.started,
+          })
           return sendJSON(state.upstreamError.status, state.upstreamError.body)
         }
         if (state.timedOut) {
           return sendJSON(429, { error: { message: timeoutMessage(apiKey), type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 })
         }
         if (state.zeroOutput || !state.errorMsg) {
-          return sendJSON(429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })
+          return sendJSON(429, {
+            error: {
+              message: 'Empty response from upstream (zero output tokens)',
+              type: 'rate_limit_error',
+              rawUsage: translator.rawUsage,
+            },
+            retry_after: 10,
+          })
         }
         return sendJSON(502, { error: { message: `Upstream error: ${state.errorMsg}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 })
       }
@@ -226,8 +274,19 @@ export async function handleChatCompletions(request: Request, headers: Record<st
         if (event.totalUsage) usage = event.totalUsage
       },
       'error': (event: any) => {
-        log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message })
+        const message = event.error?.message || event.message || 'Unknown error'
         state.upstreamError = mapCcEventError(event)
+        log('warn', 'CC stream error (non-stream)', {
+          path: '/v1/chat/completions',
+          model,
+          completionId,
+          streaming: false,
+          message,
+          mappedStatus: state.upstreamError.status,
+          mappedType: state.upstreamError.body?.error?.type,
+          lastCcEvent: parser.lastCcEvent || '(none)',
+          bytesReceived,
+        })
       },
     }
     const processBytes = (bytes: Uint8Array): void => {
@@ -265,7 +324,15 @@ export async function handleChatCompletions(request: Request, headers: Record<st
         recordTimeout(apiKey)
         return sendJSON(429, { error: { message: timeoutMessage(apiKey), type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 })
       }
-      log('error', 'Upstream error', { message: e?.message })
+      log('error', 'Upstream error', {
+        path: '/v1/chat/completions',
+        model,
+        completionId,
+        streaming: false,
+        message: e?.message,
+        bytesReceived,
+        lastCcEvent: lastCcEvent || '(none)',
+      })
       try { abortController.abort() } catch {}
       return sendJSON(502, { error: { message: `Upstream error: ${e?.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 })
     }
@@ -280,10 +347,39 @@ export async function handleChatCompletions(request: Request, headers: Record<st
 
     if ((usage?.outputTokens ?? 0) === 0) {
       try { if (!abortController.signal.aborted) abortController.abort() } catch {}
-      return sendJSON(429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })
+      log('warn', 'Zero-output 429 (non-stream)', {
+        path: '/v1/chat/completions',
+        model,
+        completionId,
+        streaming: false,
+        bytesReceived,
+        lastCcEvent: lastCcEvent || '(none)',
+        rawUsage: rawUsageFromCcUsage(usage),
+      })
+      return sendJSON(429, {
+        error: {
+          message: 'Empty response from upstream (zero output tokens)',
+          type: 'rate_limit_error',
+          rawUsage: rawUsageFromCcUsage(usage),
+        },
+        retry_after: 10,
+      })
     }
 
     recordTimeoutSuccess(apiKey)
+    if (!usage) usage = {}
+    normalizeUsage(usage)
+    const rawUsage = rawUsageFromCcUsage(usage)
+    log('info', 'OpenAI non-stream finish', {
+      path: '/v1/chat/completions',
+      model,
+      completionId,
+      streaming: false,
+      finishReason,
+      inputTokens: rawUsage.input_tokens,
+      outputTokens: rawUsage.output_tokens,
+      cachedInputTokens: rawUsage.cached_tokens,
+    })
     return sendJSON(200, {
       id: completionId,
       object: 'chat.completion',
@@ -298,16 +394,12 @@ export async function handleChatCompletions(request: Request, headers: Record<st
         ),
         finish_reason: finishReason,
       }],
-      usage: (() => {
-        if (!usage) usage = {}
-        normalizeUsage(usage)
-        return {
-          prompt_tokens: usage.inputTokens ?? 0,
-          completion_tokens: usage.outputTokens ?? 0,
-          total_tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
-          prompt_tokens_details: { cached_tokens: usage.cachedInputTokens ?? 0 },
-        }
-      })(),
+      usage: {
+        prompt_tokens: rawUsage.input_tokens,
+        completion_tokens: rawUsage.output_tokens,
+        total_tokens: rawUsage.input_tokens + rawUsage.output_tokens,
+        prompt_tokens_details: { cached_tokens: rawUsage.cached_tokens },
+      },
     })
   } catch (e: any) {
     if (aborted() || abortController.signal.aborted) {

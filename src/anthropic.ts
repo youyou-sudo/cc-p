@@ -8,13 +8,43 @@ import { log } from './logger'
 import { callUpstream, createUpstreamFlow, readRequestJson } from './proxy-handler'
 import type { JsonParseErrorKind } from './proxy-handler'
 import { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, recordTimeout, recordTimeoutSuccess, timeoutMessage } from './runtime'
-import { SsePipeline } from './sse'
+import { SsePipeline, startSseHeartbeat } from './sse'
 import { bytesToBase64, sha256bytes, uuid } from './util'
 
 export function fakeThinkingSignature(thinkingText: string): string {
   const seed = sha256bytes(thinkingText || 'dsh-proxy-thinking').slice(0, 64)
   const raw = new Uint8Array([0x12, seed.length, ...seed])
   return bytesToBase64(raw)
+}
+
+/** 从已聚合 CC usage 取真实上报口径的 rawUsage（只加字段，不改状态码分支）。 */
+function rawUsageFromCcUsageAnthropic(u: any): { input_tokens: number; output_tokens: number; cached_tokens: number } {
+  const toNum = (v: any): number => {
+    const n = Number(v)
+    return Number.isFinite(n) ? n : 0
+  }
+  return {
+    input_tokens: toNum(u?.inputTokens),
+    output_tokens: toNum(u?.outputTokens),
+    cached_tokens: toNum(u?.cachedInputTokens),
+  }
+}
+
+/** 与 sendAnthropicError 同形，仅多带 error.rawUsage（供零输出 429 可重试回包用）。 */
+function sendAnthropicErrorWithRawUsage(
+  status: number,
+  type: string,
+  message: string,
+  rawUsage: { input_tokens: number; output_tokens: number; cached_tokens: number },
+  retryAfter?: number,
+): Response {
+  const body: any = { type: 'error', error: { type, message, rawUsage } }
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (retryAfter !== undefined) {
+    body.retry_after = retryAfter
+    headers['Retry-After'] = String(retryAfter)
+  }
+  return new Response(JSON.stringify(body), { status, headers })
 }
 
 export function convertAnthropicToOpenAI(anthropicReq: any): any {
@@ -63,6 +93,7 @@ export function convertAnthropicToOpenAI(anthropicReq: any): any {
       openaiMessages.push(assistantMsg)
     } else if (msg.role === 'user') {
       let textContent = ''
+      let textCacheControl: { type: 'ephemeral' } | undefined
       const toolResults: any[] = []
       if (typeof msg.content === 'string') {
         textContent = msg.content
@@ -70,24 +101,30 @@ export function convertAnthropicToOpenAI(anthropicReq: any): any {
         for (const block of msg.content) {
           if (block.type === 'text') {
             textContent += block.text || ''
+            if (!textCacheControl && block.cache_control?.type === 'ephemeral') {
+              textCacheControl = { type: 'ephemeral' }
+            }
           } else if (block.type === 'tool_result') {
             toolResults.push(block)
           }
         }
       }
-      if (textContent) {
-        openaiMessages.push({ role: 'user', content: textContent })
-      }
       for (const tr of toolResults) {
         const toolContent = typeof tr.content === 'string' ? tr.content
           : Array.isArray(tr.content) ? tr.content.map((c: any) => c.text || '').join('')
           : String(tr.content || '')
-        openaiMessages.push({
+        const toolMsg: any = {
           role: 'tool',
           tool_call_id: tr.tool_use_id,
-          name: toolNameFromId[tr.tool_use_id] || '',
           content: toolContent,
-        })
+        }
+        if (toolNameFromId[tr.tool_use_id]) toolMsg.name = toolNameFromId[tr.tool_use_id]
+        openaiMessages.push(toolMsg)
+      }
+      if (textContent) {
+        const userMsg: any = { role: 'user', content: [{ type: 'text', text: textContent }] }
+        if (textCacheControl) userMsg.content[0].cache_control = textCacheControl
+        openaiMessages.push(userMsg)
       }
     }
   }
@@ -169,7 +206,7 @@ export function buildAnthropicResponse(model: string, fullText: string, toolCall
       return {
         input_tokens: u.inputTokens ?? 0,
         output_tokens: u.outputTokens ?? 0,
-        cache_creation_input_tokens: u.inputTokenDetails?.cacheWriteTokens ?? null,
+        cache_creation_input_tokens: u.inputTokenDetails?.cacheWriteTokens ?? 0,
         cache_read_input_tokens: u.cachedInputTokens ?? 0,
       }
     })(),
@@ -182,6 +219,7 @@ export interface AnthropicStreamContext {
   inputTokens: number
   outputTokens: number
   cachedInputTokens: number
+  cacheWriteTokens: number
   upstreamError: { status: number; body: any } | null
 }
 
@@ -293,6 +331,17 @@ export async function* createAnthropicSseTranslator(
       hasError = true
       const upstreamError = mapCcEventError(event)
       ctx.upstreamError = upstreamError
+      log('warn', 'CC stream error', {
+        path: '/v1/messages',
+        model,
+        messageId,
+        streaming: true,
+        message: (event as any)?.error?.message || (event as any)?.message || 'Unknown error',
+        mappedStatus: upstreamError.status,
+        mappedType: (upstreamError.body as any)?.error?.type,
+        lastCcEvent: parser.lastCcEvent || '(none)',
+        bytesReceived: ctx.bytesReceived,
+      })
       return `event: error\ndata: ${JSON.stringify({ type: 'error', error: upstreamError.body.error })}\n\n`
     },
   }
@@ -306,15 +355,11 @@ export async function* createAnthropicSseTranslator(
       outputTokens = u.outputTokens ?? outputTokens
       cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens
       cacheWriteTokens = u.inputTokenDetails?.cacheWriteTokens ?? cacheWriteTokens
-    } else {
-      inputTokens = 0
-      outputTokens = 0
-      cachedInputTokens = 0
-      cacheWriteTokens = 0
     }
     ctx.inputTokens = inputTokens
     ctx.outputTokens = outputTokens
     ctx.cachedInputTokens = cachedInputTokens
+    ctx.cacheWriteTokens = cacheWriteTokens
   }
 
   try {
@@ -338,7 +383,7 @@ export async function* createAnthropicSseTranslator(
         yield `event: message_delta\ndata: ${JSON.stringify({
           type: 'message_delta',
           delta: { stop_reason: stopReason || 'end_turn' },
-          usage: { output_tokens: outputTokens, cache_read_input_tokens: cachedInputTokens, cache_creation_input_tokens: cacheWriteTokens || null, input_tokens: inputTokens },
+          usage: { output_tokens: outputTokens, cache_read_input_tokens: cachedInputTokens, cache_creation_input_tokens: cacheWriteTokens || 0, input_tokens: inputTokens },
         })}\n\n`
 
         yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`
@@ -367,6 +412,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
   const model = anthropicReq.model || 'claude-sonnet-4-6'
 
   const openaiReq = convertAnthropicToOpenAI(anthropicReq)
+  if (anthropicReq.prompt_cache_key !== undefined) openaiReq.prompt_cache_key = anthropicReq.prompt_cache_key
   const ccBody = buildCcRequest(openaiReq)
 
   const flow = createUpstreamFlow(request)
@@ -384,6 +430,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
       headers,
       ccBody,
       signal: flow.signal,
+      promptCacheKey: openaiReq.prompt_cache_key,
       label: 'CC API error (Anthropic)',
       onCcError: (mapped) => sendAnthropicError(mapped.status, mapped.body.error.type, mapped.body.error.message),
     })
@@ -392,7 +439,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
 
     if (stream) {
       const pipeline = new SsePipeline(false)
-      const ctx: AnthropicStreamContext = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, upstreamError: null }
+      const ctx: AnthropicStreamContext = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, upstreamError: null }
       const state = { upstreamError: null as { status: number; body: any } | null, timedOut: false, zeroOutput: false, errorMsg: '' }
 
       const onClientAbort = () => {
@@ -411,24 +458,23 @@ export async function handleMessages(request: Request, headers: Record<string, s
           messageId,
           streaming: true,
           elapsedMs: Date.now() - startTime,
+          bytesReceived: ctx.bytesReceived,
+          lastCcEvent: ctx.lastCcEvent || '(none)',
+          inputTokens: ctx.inputTokens,
+          outputTokens: ctx.outputTokens,
+          cachedInputTokens: ctx.cachedInputTokens,
         })
       }
       flow.setGracefulClose(onClientAbort)
 
+      const heartbeat = startSseHeartbeat(pipeline)
       const pump = async (): Promise<void> => {
         try {
           messageId = 'msg_' + uuid().slice(0, 12)
           const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx)
           for await (const event of generator) {
             if (aborted()) break
-            if (!pipeline.started) {
-              pipeline.emit([event])
-              if (event.includes('"text_delta"') || event.includes('"tool_use"') || event.includes('"thinking_delta"')) {
-                pipeline.start()
-              }
-            } else {
-              pipeline.writeNow(event)
-            }
+            pipeline.emitAnthropic([event])
           }
 
           if (!aborted()) {
@@ -448,6 +494,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
             log('warn', 'Stream idle timeout', {
               path: '/v1/messages',
               model,
+              messageId,
               streaming: true,
               timeoutMs: STREAM_IDLE_TIMEOUT_MS,
               elapsedMs: Date.now() - startTime,
@@ -466,13 +513,26 @@ export async function handleMessages(request: Request, headers: Record<string, s
             }
           } else {
             state.errorMsg = e?.message ?? String(e)
-            log('error', 'Anthropic stream error', { message: state.errorMsg })
+            log('error', 'Anthropic stream error', {
+              path: '/v1/messages',
+              model,
+              messageId,
+              streaming: true,
+              message: state.errorMsg,
+              lastCcEvent: ctx.lastCcEvent || '(none)',
+              bytesReceived: ctx.bytesReceived,
+              inputTokens: ctx.inputTokens,
+              outputTokens: ctx.outputTokens,
+              cachedInputTokens: ctx.cachedInputTokens,
+              elapsedMs: Date.now() - startTime,
+            })
             try { abortController.abort() } catch {}
             if (pipeline.started) {
               pipeline.writeNow(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: state.errorMsg } })}\n\n`)
             }
           }
         } finally {
+          clearInterval(heartbeat)
           pipeline.close()
         }
       }
@@ -487,18 +547,63 @@ export async function handleMessages(request: Request, headers: Record<string, s
       if (outcome === 'terminal') {
         flow.setGracefulClose(null)
         if (state.upstreamError) {
+          log('warn', 'CC stream error (terminal JSON)', {
+            path: '/v1/messages',
+            model,
+            messageId,
+            streaming: true,
+            message: state.upstreamError.body?.error?.message,
+            mappedStatus: state.upstreamError.status,
+            mappedType: state.upstreamError.body?.error?.type,
+            lastCcEvent: ctx.lastCcEvent || '(none)',
+            bytesReceived: ctx.bytesReceived,
+            inputTokens: ctx.inputTokens,
+            outputTokens: ctx.outputTokens,
+            cachedInputTokens: ctx.cachedInputTokens,
+            started: pipeline.started,
+          })
           return sendAnthropicError(state.upstreamError.status, state.upstreamError.body.error.type, state.upstreamError.body.error.message)
         }
         if (state.timedOut) {
           return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(apiKey))
         }
         if (state.zeroOutput) {
-          return sendAnthropicError(429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', { retryAfter: 10 })
+          const rawUsage = {
+            input_tokens: ctx.inputTokens,
+            output_tokens: ctx.outputTokens,
+            cached_tokens: ctx.cachedInputTokens,
+          }
+          log('warn', 'Zero-output 429 (stream terminal)', {
+            path: '/v1/messages',
+            model,
+            messageId,
+            streaming: true,
+            bytesReceived: ctx.bytesReceived,
+            lastCcEvent: ctx.lastCcEvent || '(none)',
+            rawUsage,
+            started: pipeline.started,
+          })
+          return sendAnthropicErrorWithRawUsage(429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', rawUsage, 10)
         }
         if (state.errorMsg) {
           return sendAnthropicError(502, 'proxy_error', `Upstream error: ${state.errorMsg}`, { retryAfter: 10 })
         }
-        return sendAnthropicError(429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', { retryAfter: 10 })
+        const rawUsageFallback = {
+          input_tokens: ctx.inputTokens,
+          output_tokens: ctx.outputTokens,
+          cached_tokens: ctx.cachedInputTokens,
+        }
+        log('warn', 'Zero-output 429 (stream terminal)', {
+          path: '/v1/messages',
+          model,
+          messageId,
+          streaming: true,
+          bytesReceived: ctx.bytesReceived,
+          lastCcEvent: ctx.lastCcEvent || '(none)',
+          rawUsage: rawUsageFallback,
+          started: pipeline.started,
+        })
+        return sendAnthropicErrorWithRawUsage(429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', rawUsageFallback, 10)
       }
 
       return new Response(pipeline.stream, { status: 200, headers: SSE_HEADERS })
@@ -528,11 +633,22 @@ export async function handleMessages(request: Request, headers: Record<string, s
       },
       'finish': (event: any) => {
         finishReason = mapFinishReason(event.finishReason || 'stop')
-        if (event.totalUsage) usage = event.totalUsage
+        if (event.totalUsage || event.usage) usage = event.totalUsage || event.usage
       },
       'error': (event: any) => {
-        log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message })
+        const message = event.error?.message || event.message || 'Unknown error'
         state.upstreamError = mapCcEventError(event)
+        log('warn', 'CC error (Anthropic non-stream)', {
+          path: '/v1/messages',
+          model,
+          messageId,
+          streaming: false,
+          message,
+          mappedStatus: state.upstreamError.status,
+          mappedType: state.upstreamError.body?.error?.type,
+          lastCcEvent: parser.lastCcEvent || '(none)',
+          bytesReceived,
+        })
       },
     }
     const processBytes = (bytes: Uint8Array): void => {
@@ -554,6 +670,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
         return new Response(null, { status: 499 })
       }
       if (e?.message === 'STREAM_IDLE_TIMEOUT') {
+        const timeoutRawUsage = rawUsageFromCcUsageAnthropic(usage)
         log('warn', 'Stream idle timeout', {
           path: '/v1/messages',
           model,
@@ -564,13 +681,24 @@ export async function handleMessages(request: Request, headers: Record<string, s
           bytesReceived,
           lastCcEvent: lastCcEvent || '(none)',
           partialLen: fullText ? fullText.length : 0,
+          inputTokens: timeoutRawUsage.input_tokens,
+          outputTokens: timeoutRawUsage.output_tokens,
+          cachedInputTokens: timeoutRawUsage.cached_tokens,
         })
         reader.cancel().catch(() => {})
         try { abortController.abort() } catch {}
         recordTimeout(apiKey)
         return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(apiKey), { retryAfter: 5, headerOnly: true })
       }
-      log('error', 'Upstream error', { message: e?.message })
+      log('error', 'Upstream error', {
+        path: '/v1/messages',
+        model,
+        messageId,
+        streaming: false,
+        message: e?.message,
+        bytesReceived,
+        lastCcEvent: lastCcEvent || '(none)',
+      })
       try { abortController.abort() } catch {}
       return sendAnthropicError(502, 'proxy_error', `Upstream error: ${e?.message}`, { retryAfter: 10 })
     }
@@ -580,15 +708,52 @@ export async function handleMessages(request: Request, headers: Record<string, s
     }
 
     if (state.upstreamError) {
+      log('warn', 'CC error (non-stream JSON)', {
+        path: '/v1/messages',
+        model,
+        messageId,
+        streaming: false,
+        message: state.upstreamError.body?.error?.message,
+        mappedStatus: state.upstreamError.status,
+        mappedType: state.upstreamError.body?.error?.type,
+        lastCcEvent: lastCcEvent || '(none)',
+        bytesReceived,
+        rawUsage: rawUsageFromCcUsageAnthropic(usage),
+      })
       return sendAnthropicError(state.upstreamError.status, state.upstreamError.body.error.type, state.upstreamError.body.error.message)
     }
 
-    if ((usage?.outputTokens ?? 0) === 0) {
+    if (!fullText && !thinkingText && !toolCalls) {
       try { if (!abortController.signal.aborted) abortController.abort() } catch {}
-      return sendAnthropicError(429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', { retryAfter: 10 })
+      const rawUsage = rawUsageFromCcUsageAnthropic(usage)
+      log('warn', 'Zero-output 429 (non-stream)', {
+        path: '/v1/messages',
+        model,
+        messageId,
+        streaming: false,
+        bytesReceived,
+        lastCcEvent: lastCcEvent || '(none)',
+        rawUsage,
+      })
+      return sendAnthropicErrorWithRawUsage(429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', rawUsage, 10)
     }
 
     recordTimeoutSuccess(apiKey)
+    if (!usage) usage = {}
+    normalizeUsage(usage)
+    const rawUsage = rawUsageFromCcUsageAnthropic(usage)
+    log('info', 'Anthropic non-stream finish', {
+      path: '/v1/messages',
+      model,
+      messageId,
+      streaming: false,
+      finishReason,
+      inputTokens: rawUsage.input_tokens,
+      outputTokens: rawUsage.output_tokens,
+      cachedInputTokens: rawUsage.cached_tokens,
+      lastCcEvent: lastCcEvent || '(none)',
+      bytesReceived,
+    })
     return sendJSON(200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText))
   } catch (e: any) {
     if (aborted() || abortController.signal.aborted) {

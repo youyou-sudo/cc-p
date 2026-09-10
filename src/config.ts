@@ -9,6 +9,7 @@ export interface AppConfig {
   useProviderModels: boolean
   modelRefreshIntervalMs: number
   zdr: boolean
+  emptySystemPlaceholder: boolean
 }
 
 function die(message: string): never {
@@ -73,6 +74,14 @@ const envBool = (key: string): boolean | undefined => {
   return value === '1' || value.toLowerCase() === 'true'
 }
 
+const envBoolDefaultTrue = (key: string): boolean | undefined => {
+  const value = envString(key)
+  if (value === undefined) return undefined
+  const v = value.toLowerCase()
+  if (v === 'false' || v === '0' || v === 'no') return false
+  return true
+}
+
 async function loadConfig(): Promise<AppConfig> {
   // Builtin defaults. These match the tracked config.json (which is baked into
   // Docker images / Release binaries), so every distribution shares one truth.
@@ -87,6 +96,7 @@ async function loadConfig(): Promise<AppConfig> {
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,
     zdr: false,
+    emptySystemPlaceholder: true,
   }
 
   const fileConfig = await findConfigJson()
@@ -111,6 +121,7 @@ async function loadConfig(): Promise<AppConfig> {
   if (envBool('CC_USE_PROVIDER_MODELS') !== undefined) config.useProviderModels = envBool('CC_USE_PROVIDER_MODELS')!
   if (envNumber('CC_MODEL_REFRESH_INTERVAL_MS') !== undefined) config.modelRefreshIntervalMs = envNumber('CC_MODEL_REFRESH_INTERVAL_MS')!
   if (envBool('CMD_ZDR') !== undefined) config.zdr = envBool('CMD_ZDR')!
+  if (envBoolDefaultTrue('CC_EMPTY_SYSTEM_PLACEHOLDER') !== undefined) config.emptySystemPlaceholder = envBoolDefaultTrue('CC_EMPTY_SYSTEM_PLACEHOLDER')!
 
   return config
 }

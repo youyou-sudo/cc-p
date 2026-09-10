@@ -3,6 +3,24 @@ import { getSessionId } from './session'
 import { CC_VERSION } from './version'
 import { fakeProjectSlug, generateTraceparent, getDateStr, getEnvironment, tryParseJSON } from './util'
 
+function isEphemeralCacheControl(v: any): boolean {
+  return !!v && v.type === 'ephemeral'
+}
+
+function pickEphemeralCacheControl(v: any): { type: 'ephemeral' } | undefined {
+  return isEphemeralCacheControl(v) ? { type: 'ephemeral' } : undefined
+}
+
+/** 白名单剥离：仅保留 {type:'ephemeral'}，其他 type 一律丢弃（避免上游 422→400）。 */
+function stripNonEphemeralCacheControl<T extends Record<string, any>>(part: T): T {
+  if (!part || typeof part !== 'object' || !('cache_control' in part)) return part
+  if (isEphemeralCacheControl((part as any).cache_control)) {
+    return { ...(part as any), cache_control: { type: 'ephemeral' } }
+  }
+  const { cache_control: _dropped, ...rest } = part as any
+  return rest as T
+}
+
 export function buildCcRequest(openaiReq: any): any {
   const { model, messages, max_tokens, temperature, tools, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key, top_p, stop, user, seed } = openaiReq
 
@@ -34,9 +52,12 @@ export function buildCcRequest(openaiReq: any): any {
         const parts = msg.content.map((part: any) => {
           if (part.type === 'image_url') {
             const url = part.image_url?.url || ''
-            return { type: 'image', image: url }
+            const img: any = { type: 'image', image: url }
+            const cc = pickEphemeralCacheControl(part?.cache_control)
+            if (cc) img.cache_control = cc
+            return img
           }
-          return part
+          return stripNonEphemeralCacheControl(part)
         }).filter(Boolean)
         return { role: 'user', content: parts }
       }
@@ -48,7 +69,7 @@ export function buildCcRequest(openaiReq: any): any {
         parts.push({ type: 'text', text: msg.content })
       } else if (msg.content && Array.isArray(msg.content)) {
         for (const part of msg.content) {
-          if (part.type === 'text') parts.push(part)
+          if (part.type === 'text') parts.push(stripNonEphemeralCacheControl(part))
         }
       }
       if (msg.tool_calls) {
@@ -109,8 +130,13 @@ export function buildCcRequest(openaiReq: any): any {
     },
   }
 
+  // fixes #17: no system/developer prompt -> send single-space placeholder,
+  // avoids upstream injecting ~7.5K default prompt (prompt_tokens 7653->85).
+  // Disable via config.json emptySystemPlaceholder=false or CC_EMPTY_SYSTEM_PLACEHOLDER=false.
   if (systemPrompt) {
     ;(body.params as any).system = systemPrompt
+  } else if (CFG.emptySystemPlaceholder) {
+    ;(body.params as any).system = ' '
   }
   if (temperature !== undefined) {
     ;(body.params as any).temperature = temperature

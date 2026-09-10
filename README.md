@@ -183,6 +183,64 @@ Upstream mapping (`src/errors.ts`): CC `402/429` → `429`, `401/403` → `401`,
 
 Client disconnects (`request.signal`) abort the upstream `fetch` immediately; unfinished streams are closed without leaking sockets.
 
+## Long Sessions / Context Management
+
+> The proxy is stateless: `src/cc.ts` forwards the full message history on
+> every request — no prune / trim / compact. History growth lives on the
+> caller (Claude Code, Cline, your agent loop), not in the proxy. So context
+> hygiene is a **client habit**, not a server setting. Facts that shape the
+> habits below: stream idle timeout 30s / non-stream 90s (per-key consecutive
+> counter, ≥3 → message tells you to reduce context); body cap 100MB
+> (`CC_MAX_BODY_MB`); over-long prompts are normalized to `400`
+> `context_window_exceeded` on both HTTP (`mapCcError`) and in-stream error
+> events (`mapCcEventError`, keyword match wins even over `<429>`); sessions
+> are per-key, 12h + ≤1h jitter — a new key or a new session resets to zero;
+> `GET /v1/models` exposes `context_window` (provider passthrough
+> `context_window` / `context_length` / `max_context_tokens` + static fallback
+> in `src/models.ts`), so pin a large-window model programmatically and fall
+> back to manual lookup only for models still without a window.
+
+1. **Pass file paths, don't paste contents.** Anything pasted into `messages`
+   is re-sent verbatim on every turn and can never be trimmed by the proxy.
+   Prefer `Read`-style tool calls (`/path/to/file`, offset/limit) over
+   inlining whole files.
+2. **Narrow subagent scope + read-only tools.** One task per subagent, with
+   only the tools it needs (e.g. read/grep, no write/edit/exec). A wide
+   subagent drags its whole transcript back into your main context.
+3. **Cap each tool result.** Truncate / head / grep before returning: large
+   `tool_result` blocks are history too and compound every round-trip. If a
+   result is huge, summarize it and drop the raw text in the next turn.
+4. **New task → new session (≈ `/clear`).** At a task boundary, start a fresh
+   conversation instead of reusing a long one. Switching API key (new per-key
+   session) has the same reset effect. Reusing `x-session-id` /
+   `prompt_cache_key` headers keeps the session — omit them when you want a
+   clean slate.
+5. **Pin a large-window model for context-heavy work.** `GET /v1/models` now
+   carries `context_window` (provider fields `context_window` /
+   `context_length` / `max_context_tokens`, static fallback for known ids in
+   `src/models.ts`). Query it and hardcode the model id on tasks that need
+   long context (repo-wide refactors, big log dives). Manual lookup is only
+   needed for ids still without a published window.
+6. **Watch `finish` usage, not just errors.** On stream / non-stream paths
+   the final chunk carries `usage` (`prompt_tokens` / `inputTokens`
+   climbing turn after turn is your early warning). If `inputTokens` keeps
+   rising with no task progress, trim or restart before you hit the wall.
+
+### Error cheat sheet (check `message` + `retry_after` / `Retry-After`)
+
+| Signal | Meaning | Do this (don't blind-retry) |
+|--------|---------|-----------------------------|
+| `400` `context_window_exceeded` | Prompt matched `CONTEXT_WINDOW_EXCEEDED_PATTERN` (`src/errors.ts`) on HTTP or in-stream error — over-long by keyword even if upstream said `429` | Trim history / summarize / start a new session. Retrying the same payload always fails. |
+| `429` `Empty response` / zero output, `retry_after: 10` | Upstream returned zero output tokens | Safe to retry once with backoff; if it repeats, shrink context and simplify the last turn. |
+| `429` idle timeout, `retry_after: 5` | No upstream bytes for 30s (stream) / 90s (non-stream); per-key consecutive counter, ≥3 → message tells you to reduce context | Retry with smaller context; split the task; avoid huge single tool calls. |
+| `429` true rate limit, `retry_after: 30` | Real upstream `402/429` mapped through `src/errors.ts` | Back off and honor `Retry-After`. Trimming won't help — wait, then retry. |
+| `502/503` other | Genuine upstream error (`CC_STATUS_MAP`; unlisted → `502 upstream_error`) | Retry / backoff. |
+
+How to tell the three `429`s apart: read the body — `message` text plus the
+numeric `retry_after` (`10` = zero-output, `5` = idle timeout, `30` = real
+rate limit). `sendJSON` also mirrors `retry_after` as a `Retry-After`
+response header, so SDK auto-retry works when the case is actually retryable.
+
 ## How It Emulates the CLI
 
 Per API key, before the first upstream call (and every ~8h after):

@@ -189,6 +189,53 @@ CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64
 
 客户端断开（`request.signal`）会立刻 abort 上游 `fetch`，未完成的流直接关闭，不泄漏连接。
 
+## 长会话 / 上下文管理（Context）
+
+> 本代理是无状态的：`src/cc.ts` 每次都把完整历史全量透传上游——不做
+> prune / trim / compact。历史膨胀在调用方（Claude Code、Cline、你的 agent
+> 循环），不在代理里。所以上下文卫生是**客户端习惯**，不是服务端开关。
+> 决定下述习惯的既定事实：流式空闲超时 30s / 非流式 90s（按 Key 记连续超时，
+> ≥3 次后消息提示压缩上下文）；包体上限 100MB（`CC_MAX_BODY_MB`）；超长
+> prompt 在 HTTP（`mapCcError`）与流内 error 事件（`mapCcEventError`，关键词
+> 优先、即使上游误标 `<429>`）统一归一化为 `400` `context_window_exceeded`；
+> session 按 Key 隔离 12h + ≤1h 抖动——换 Key 或新会话即清零；
+> `GET /v1/models` 已带 `context_window`（provider 透传
+> `context_window` / `context_length` / `max_context_tokens` + `src/models.ts`
+> 静态兜底），可程序化 pin 大窗口模型，仅无窗口的 id 才需人工查表。
+
+1. **传文件路径，不要粘贴全文。** 粘进 `messages` 的内容每轮都会原样重发，
+   代理永远不会帮你修剪。优先用 `Read` 类工具调用（路径 + offset/limit），
+   而不是把整个文件内联进对话。
+2. **子代理职责收窄 + 只读工具集。** 一个子代理只做一件事，只给它必需的工具
+   （如 read/grep，不给 write/edit/exec）。大而全的子代理会把整段 transcript
+   带回主上下文。
+3. **控制单条 tool 结果体积。** 返回前先截断 / head / grep：`tool_result` 大块
+   同样是历史，会在每轮往返中复利增长。结果太大就先总结，下一轮丢掉原文。
+4. **任务边界开新会话（等价 `/clear`）。** 到任务边界就开新对话，别复用超长
+   会话。换 API Key（新按 Key 会话）同样清零。透传 `x-session-id` /
+   `prompt_cache_key` 请求头会保持会话——想要干净起点就别带它们。
+5. **上下文敏感任务 pin 大窗口模型。** `GET /v1/models` 已带 `context_window`
+   （provider 字段 `context_window` / `context_length` / `max_context_tokens`，
+   已知 id 另有 `src/models.ts` 静态兜底）。查表后把长上下文任务（整仓重构、
+   大日志排查）的模型 id 写死。仅无窗口的 id 才需人工确认。
+6. **看 `finish` 的 usage 趋势，别只看报错。** 流式/非流式终包都带 `usage`
+   （`prompt_tokens` / `inputTokens` 逐轮爬升就是早期告警）。如果 inputTokens
+   只涨不见任务进展，先裁剪或重开，别等到撞墙。
+
+### 报错速查表（看 `message` + `retry_after` / `Retry-After`）
+
+| 信号 | 含义 | 动作（不要无脑重试） |
+|------|------|----------------------|
+| `400` `context_window_exceeded` | HTTP 或流内 error 命中 `CONTEXT_WINDOW_EXCEEDED_PATTERN`（`src/errors.ts`）——关键词判超长，即使上游误标 `429` | 裁剪历史 / 总结 / 开新会话。同样的包体重试必败。 |
+| `429` `Empty response` / 零输出，`retry_after: 10` | 上游零输出 token（zero-output） | 可退避重试一次；反复出现则压缩上下文、简化上一轮。 |
+| `429` 空闲超时，`retry_after: 5` | 上游 30s（流式）/ 90s（非流式）无字节；按 Key 记连续超时，≥3 次后消息提示压缩上下文 | 缩小上下文后重试；拆分任务；避免单次超大 tool 调用。 |
+| `429` 真限流，`retry_after: 30` | 真实上游 `402/429`，经 `src/errors.ts` 映射 | 按 `Retry-After` 退避等待。裁剪没用——等，再重试。 |
+| `502/503` 其他 | 真实上游错误（`CC_STATUS_MAP`；未列出 → `502 upstream_error`） | 重试 / 退避。 |
+
+区分三个 `429`：读包体——`message` 文案 + 数字 `retry_after`
+（`10` = 零输出，`5` = 空闲超时，`30` = 真限流）。`sendJSON` 会把
+`retry_after` 同步为 `Retry-After` 响应头，真正可重试的场景 SDK 会自动重试。
+
 ## CLI 仿真原理
 
 按 API Key，在首次调用上游前（之后约每 8h）执行：

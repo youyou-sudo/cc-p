@@ -3,6 +3,10 @@ import { mapCcEventError, mapFinishReason, normalizeUsage } from './errors'
 import { CcStreamParser } from './cc-events'
 import type { CcEventHooks } from './cc-events'
 
+export const SSE_HEARTBEAT_INTERVAL_MS = 5_000
+export const SSE_HEARTBEAT_IDLE_MS = 15_000
+export const SSE_PING_EVENT = `event: ping\ndata: {"type":"ping"}\n\n`
+
 export class SsePipeline {
   private encoder = new TextEncoder()
   private controller: ReadableStreamDefaultController<Uint8Array> | null = null
@@ -16,6 +20,8 @@ export class SsePipeline {
   started = false
   closed = false
   keepaliveCount = 0
+  pingCount = 0
+  lastSentAt = Date.now()
 
   constructor(private readonly autoStart: boolean) {
     this.firstOutput = new Promise((r) => { this.firstOutputResolve = r })
@@ -28,6 +34,7 @@ export class SsePipeline {
   private enqueue(text: string): void {
     try {
       this.controller?.enqueue(this.encoder.encode(text))
+      this.lastSentAt = Date.now()
     } catch {}
   }
 
@@ -40,10 +47,35 @@ export class SsePipeline {
     if (this.autoStart) this.start()
   }
 
+  /** Anthropic early-flush: keep `message_start` (+ trailing
+   *  message_delta/message_stop/error) buffered to preserve zero-output JSON
+   *  retry-ability; flush headers on the first content_block_* event (covers
+   *  thinking/text/tool_use start or delta). Upstream 487f219 spells this as
+   *  "first non-message_start flushes" — narrowed here to content blocks so
+   *  an empty-response `error` event can't flip the stream to SSE 200. */
+  emitAnthropic(events: string[]): void {
+    if (!events.length) return
+    for (const event of events) {
+      if (this.started) {
+        this.enqueue(event)
+      } else {
+        this.buffered.push(event)
+        if (event.startsWith('event: content_block_')) this.start()
+      }
+    }
+  }
+
   emitKeepalive(): void {
     if (!this.started || this.closed) return
     this.enqueue(': keepalive\n\n')
     this.keepaliveCount++
+  }
+
+  /** Idle heartbeat ping (standard SDKs ignore unknown `ping` events). */
+  sendPing(event: string = SSE_PING_EVENT): void {
+    if (!this.started || this.closed) return
+    this.enqueue(event)
+    this.pingCount++
   }
 
   writeNow(event: string): void {
@@ -78,6 +110,26 @@ export class SsePipeline {
   }
 }
 
+/** Shared idle-heartbeat: every `intervalMs`, if the pipeline has been
+ *  silent for `idleMs`, send an SSE ping. Caller clears the timer in
+ *  `finally` (both handlers do). Pings only go out after headers started;
+ *  while fully buffered, zero-output retry-ability is preserved. */
+export function startSseHeartbeat(
+  pipeline: SsePipeline,
+  opts?: { intervalMs?: number; idleMs?: number; pingEvent?: string },
+): ReturnType<typeof setInterval> {
+  const intervalMs = opts?.intervalMs ?? SSE_HEARTBEAT_INTERVAL_MS
+  const idleMs = opts?.idleMs ?? SSE_HEARTBEAT_IDLE_MS
+  const pingEvent = opts?.pingEvent ?? SSE_PING_EVENT
+  return setInterval(() => {
+    try {
+      if (pipeline.closed) return
+      if (!pipeline.started) return
+      if (Date.now() - pipeline.lastSentAt > idleMs) pipeline.sendPing(pingEvent)
+    } catch {}
+  }, intervalMs)
+}
+
 function makeChunk(id: string, created: number, model: string, delta: any, finishReason: string | null, usage: any): string {
   const chunk: any = {
     id,
@@ -103,6 +155,7 @@ export function createSseTranslator(model: string, completionId: string, created
   const inputTokens = { value: 0 }
   const outputTokens = { value: 0 }
   const cachedInputTokens = { value: 0 }
+  let bytesReceived = 0
 
   const hooks: CcEventHooks = {
     'text-delta': (event: any) => {
@@ -153,12 +206,31 @@ export function createSseTranslator(model: string, completionId: string, created
         total_tokens: (u.inputTokens ?? 0) + (u.outputTokens ?? 0),
         prompt_tokens_details: { cached_tokens: u.cachedInputTokens ?? 0 },
       }
+      log('info', 'OpenAI stream finish', {
+        path: '/v1/chat/completions',
+        model,
+        completionId,
+        streaming: true,
+        inputTokens: inputTokens.value,
+        outputTokens: outputTokens.value,
+        cachedInputTokens: cachedInputTokens.value,
+      })
       return makeChunk(completionId, created, model, {}, fr, openaiUsage)
     },
     'error': (event: any) => {
       const msg = event.error?.message || event.message || 'Unknown error'
-      log('warn', 'CC stream error', { message: msg })
       state.upstreamError = mapCcEventError(event)
+      log('warn', 'CC stream error', {
+        path: '/v1/chat/completions',
+        model,
+        completionId,
+        streaming: true,
+        message: msg,
+        lastCcEvent: parser.lastCcEvent || '(none)',
+        bytesReceived,
+        mappedStatus: state.upstreamError.status,
+        mappedType: state.upstreamError.body?.error?.type,
+      })
     },
   }
 
@@ -178,8 +250,23 @@ export function createSseTranslator(model: string, completionId: string, created
     get cachedInputTokens() {
       return cachedInputTokens.value
     },
+    get bytesReceived() {
+      return bytesReceived
+    },
+    get rawUsage() {
+      const toNum = (v: any): number => {
+        const n = Number(v)
+        return Number.isFinite(n) ? n : 0
+      }
+      return {
+        input_tokens: toNum(inputTokens.value),
+        output_tokens: toNum(outputTokens.value),
+        cached_tokens: toNum(cachedInputTokens.value),
+      }
+    },
 
     parseChunk(bytes: Uint8Array): string[] {
+      bytesReceived += bytes.byteLength
       return parser.push(bytes, hooks)
     },
 

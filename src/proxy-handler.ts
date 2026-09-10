@@ -84,7 +84,13 @@ export async function callUpstream<T>(
   const ccResponse = await forwardToCC(ccBody, apiKey, headers, signal, promptCacheKey)
   if (!ccResponse.ok) {
     const errorText = await ccResponse.text().catch(() => '')
-    log('error', label, { status: ccResponse.status })
+    const bodySnippet = errorText.slice(0, 200)
+    let model: unknown = undefined
+    try {
+      model = (ccBody as any)?.params?.model ?? (ccBody as any)?.model
+    } catch { model = undefined }
+    const apiKeySuffix = typeof apiKey === 'string' && apiKey.length > 4 ? apiKey.slice(-4) : '****'
+    log('error', label, { status: ccResponse.status, bodySnippet, model, apiKeySuffix })
     return { ok: false, value: onCcError(mapCcError(ccResponse.status, errorText)) }
   }
   return { ok: true, response: ccResponse }

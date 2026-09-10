@@ -64,6 +64,7 @@ export function startServer() {
     zdr: CFG.zdr
       ? 'enabled (x-cmd-zdr: 1 on generation/init requests)'
       : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
+    emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on' : 'off',
     logFile: CFG.logFile || '(console only)',
   })
 

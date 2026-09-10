@@ -126,6 +126,30 @@ OpenAI 路径（`/v1/chat/completions`）结构相同，区别在于：
 | 超限排水上限 | 32 MB（防慢速攻击） | `src/http.ts:58` |
 | 监听端口/地址 | 3050 / 0.0.0.0 | `src/config.ts:80-81` |
 
+## 7. 长会话 / 上下文管理（客户端止血习惯）
+
+> 代理无状态：`src/cc.ts:buildCcRequest` 每请求全量透传完整历史，不做
+> prune / trim / compact。历史膨胀在调用方。超时：流式 30s / 非流式 90s
+>（`src/runtime.ts`，按 Key 记连续超时，≥3 次提示压缩上下文）；包体上限
+> 100MB（`CC_MAX_BODY_MB`）；超长在 HTTP 与流内 error 事件统一归一化为
+> `400 context_window_exceeded`（`src/errors.ts`，关键词优先、即使误标
+> `<429>`）；session 按 Key 12h + ≤1h 抖动（`src/session.ts`），换 Key 或
+> 新会话即清零；`GET /v1/models` 已带 `context_window`（provider 透传 +
+> `src/models.ts` 静态兜底）。详见 `README.md#long-sessions--context-management`
+> 与 `README_zh.md#长会话--上下文管理context`。
+
+1. 传文件路径，不粘贴全文（粘贴永不被修剪）。
+2. 子代理职责收窄 + 只读工具集。
+3. 控制单条 tool 结果体积（截断/总结后再回传）。
+4. 任务边界开新会话（等价 `/clear`；换 Key 亦可；想干净起点就别带
+   `x-session-id` / `prompt_cache_key`）。
+5. 上下文敏感任务查 `GET /v1/models` 的 `context_window` 后 pin 大窗口模型。
+6. 看 `finish` 终包 `usage` 趋势（`prompt_tokens` / `inputTokens` 逐轮爬升即告警）。
+7. 报错速查：`400 context_window_exceeded`→裁剪/新会话勿重试；
+   `429 retry_after:10`=零输出、`retry_after:5`=空闲超时、`retry_after:30`=真限流
+  （看 `message` + `retry_after` / `Retry-After` 区分）；
+   超长不再是 `502`（已归一化为 `400`），其余 `502/503` 才重试/退避。
+
 ## 7. 测试与运行
 
 | 命令 | 说明 |

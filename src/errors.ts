@@ -16,6 +16,15 @@ export interface MappedError {
   body: any
 }
 
+export const CONTEXT_WINDOW_EXCEEDED_PATTERN =
+  /prompt.*too long|context.*(too long|exceed|limit|length)|max.*tokens|input.*too (long|large)|message.*too long/i
+
+export function isContextWindowExceeded(message: string): boolean {
+  return CONTEXT_WINDOW_EXCEEDED_PATTERN.test(message || '')
+}
+
+export const CONTEXT_WINDOW_ERROR = { status: 400, type: 'context_window_exceeded' }
+
 export function mapCcError(ccStatus: number, ccBody?: string): MappedError {
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' }
   let message = `CC API error (${ccStatus})`
@@ -26,6 +35,15 @@ export function mapCcError(ccStatus: number, ccBody?: string): MappedError {
       message = parsed.error?.message || parsed.message || message
     } catch {
       message = ccBody.slice(0, 200) || message
+    }
+  }
+
+  // prompt-too-long must NOT be 429 (SDK auto-retries 429); use explicit 400.
+  // 超长关键词优先：即使上游误报 429 也按 400 不可重试处理。
+  if (isContextWindowExceeded(message)) {
+    return {
+      status: CONTEXT_WINDOW_ERROR.status,
+      body: { error: { message, type: CONTEXT_WINDOW_ERROR.type } },
     }
   }
 
@@ -44,6 +62,13 @@ export function mapCcError(ccStatus: number, ccBody?: string): MappedError {
 
 export function mapCcEventError(event: any): MappedError {
   const message = event.error?.message || event.message || 'Unknown CC error'
+  // 超长关键词优先于 <NNN> 显式码：即使上游误标状态码也按 400 不可重试处理。
+  if (isContextWindowExceeded(message)) {
+    return {
+      status: CONTEXT_WINDOW_ERROR.status,
+      body: { error: { message, type: CONTEXT_WINDOW_ERROR.type } },
+    }
+  }
   const statusMatch = message.match(/^<(\d{3})>/)
   const ccStatus = statusMatch ? Number(statusMatch[1]) : 502
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' }
@@ -67,13 +92,11 @@ export function mapFinishReason(reason: string): string {
   }
 }
 
+// 保留上游真实上报的 usage 口径：outputTokens 缺失/0 也不清零
+// inputTokens/cachedInputTokens（调用方需容忍 undefined/NaN）。纯函数式空操作。
 export function normalizeUsage(u: any): void {
   if (!u) return
-  const ot = Number(u.outputTokens)
-  if (!ot) {
-    u.inputTokens = 0
-    u.cachedInputTokens = 0
-  }
+  return
 }
 
 export function mapAnthropicStopReason(finishReason: string): string {
