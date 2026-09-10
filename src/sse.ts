@@ -6,6 +6,7 @@ import type { CcEventHooks } from './cc-events'
 export const SSE_HEARTBEAT_INTERVAL_MS = 5_000
 export const SSE_HEARTBEAT_IDLE_MS = 15_000
 export const SSE_PING_EVENT = `event: ping\ndata: {"type":"ping"}\n\n`
+export const SSE_KEEPALIVE_COMMENT = `: keepalive\n\n`
 
 export class SsePipeline {
   private encoder = new TextEncoder()
@@ -67,11 +68,15 @@ export class SsePipeline {
 
   emitKeepalive(): void {
     if (!this.started || this.closed) return
-    this.enqueue(': keepalive\n\n')
+    this.enqueue(SSE_KEEPALIVE_COMMENT)
     this.keepaliveCount++
   }
 
-  /** Idle heartbeat ping (standard SDKs ignore unknown `ping` events). */
+  /** Idle heartbeat ping. Defaults to the Anthropic-native `ping` event
+   *  (Anthropic side must keep it). OpenAI path overrides with the
+   *  spec-safe SSE comment heartbeat (SSE_KEEPALIVE_COMMENT), because
+   *  plain OpenAI SDKs only look at `data:` lines and would misparse
+   *  `{"type":"ping"}` as a chunk. */
   sendPing(event: string = SSE_PING_EVENT): void {
     if (!this.started || this.closed) return
     this.enqueue(event)

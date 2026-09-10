@@ -437,6 +437,33 @@ console.log('--- anthropic stream ---')
   check('anthropic message_delta stop_reason + usage', msgDelta?.data?.delta?.stop_reason === 'tool_use' && msgDelta?.data?.usage?.output_tokens === 20, msgDelta)
 }
 
+console.log('--- anthropic zero output / upstream errors ---')
+{
+  const r = await fetch(BASE + '/v1/messages', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
+    body: JSON.stringify({ model: 'mock/zero', max_tokens: 100, messages: [{ role: 'user', content: 'q' }] }),
+  })
+  const body = await r.json()
+  check('anthropic zero output 429 non-stream', r.status === 429 && body.type === 'error' && body.error.type === 'rate_limit_error' && body.retry_after === 10 && r.headers.get('retry-after') === '10', body)
+}
+{
+  const r = await fetch(BASE + '/v1/messages', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
+    body: JSON.stringify({ model: 'mock/upstream-429', max_tokens: 100, messages: [{ role: 'user', content: 'q' }] }),
+  })
+  const body = await r.json()
+  check('anthropic upstream 429 mapped', r.status === 429 && body.type === 'error' && body.error.type === 'rate_limit_error' && body.retry_after === 30 && r.headers.get('retry-after') === '30', body)
+}
+{
+  const r = await fetch(BASE + '/v1/messages', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
+    body: JSON.stringify({ model: 'mock/event-error', max_tokens: 100, stream: true, messages: [{ role: 'user', content: 'q' }] }),
+  })
+  const ct = r.headers.get('content-type') || ''
+  const body = await r.json()
+  check('anthropic stream error before output → JSON 429', r.status === 429 && ct.includes('json') && !ct.includes('event-stream') && body.type === 'error' && body.error.type === 'rate_limit_error' && body.retry_after === 30, { ct, body })
+}
+
 console.log('--- client disconnect ---')
 {
   const ac = new AbortController()

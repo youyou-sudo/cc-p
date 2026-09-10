@@ -31,6 +31,11 @@ function rawUsageFromCcUsageAnthropic(u: any): { input_tokens: number; output_to
 }
 
 /** 与 sendAnthropicError 同形，仅多带 error.rawUsage（供零输出 429 可重试回包用）。 */
+function anthropicRetryOpts(body: any): { retryAfter: number } | undefined {
+  const v = (body as any)?.retry_after;
+  return v !== undefined ? { retryAfter: Number(v) } : undefined;
+}
+
 function sendAnthropicErrorWithRawUsage(
   status: number,
   type: string,
@@ -342,7 +347,8 @@ export async function* createAnthropicSseTranslator(
         lastCcEvent: parser.lastCcEvent || '(none)',
         bytesReceived: ctx.bytesReceived,
       })
-      return `event: error\ndata: ${JSON.stringify({ type: 'error', error: upstreamError.body.error })}\n\n`
+      const retry = (upstreamError.body as any)?.retry_after;
+      return `event: error\ndata: ${JSON.stringify({ type: 'error', error: upstreamError.body.error, ...(retry !== undefined ? { retry_after: retry } : {}) })}\n\n`
     },
   }
 
@@ -432,7 +438,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
       signal: flow.signal,
       promptCacheKey: openaiReq.prompt_cache_key,
       label: 'CC API error (Anthropic)',
-      onCcError: (mapped) => sendAnthropicError(mapped.status, mapped.body.error.type, mapped.body.error.message),
+      onCcError: (mapped) => sendAnthropicError(mapped.status, mapped.body.error.type, mapped.body.error.message, anthropicRetryOpts(mapped.body)),
     })
     if (!upstream.ok) return upstream.value
     const ccResponse = upstream.response
@@ -562,7 +568,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
             cachedInputTokens: ctx.cachedInputTokens,
             started: pipeline.started,
           })
-          return sendAnthropicError(state.upstreamError.status, state.upstreamError.body.error.type, state.upstreamError.body.error.message)
+          return sendAnthropicError(state.upstreamError.status, state.upstreamError.body.error.type, state.upstreamError.body.error.message, anthropicRetryOpts(state.upstreamError.body))
         }
         if (state.timedOut) {
           return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(apiKey), { retryAfter: 5 })
@@ -720,7 +726,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
         bytesReceived,
         rawUsage: rawUsageFromCcUsageAnthropic(usage),
       })
-      return sendAnthropicError(state.upstreamError.status, state.upstreamError.body.error.type, state.upstreamError.body.error.message)
+      return sendAnthropicError(state.upstreamError.status, state.upstreamError.body.error.type, state.upstreamError.body.error.message, anthropicRetryOpts(state.upstreamError.body))
     }
 
     if (!fullText && !thinkingText && !toolCalls) {
