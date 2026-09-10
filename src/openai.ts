@@ -8,7 +8,7 @@ import { log } from './logger'
 import { callUpstream, createUpstreamFlow, readRequestJson } from './proxy-handler'
 import type { JsonParseErrorKind } from './proxy-handler'
 import { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, recordTimeout, recordTimeoutSuccess, timeoutMessage } from './runtime'
-import { createSseTranslator, SsePipeline } from './sse'
+import { createSseTranslator, SsePipeline, startSseHeartbeat } from './sse'
 import { nowUnix, uuid } from './util'
 
 interface TerminalState {
@@ -88,6 +88,7 @@ export async function handleChatCompletions(request: Request, headers: Record<st
     if (stream) {
       const translator = createSseTranslator(model, completionId, created)
       const pipeline = new SsePipeline(true)
+      const heartbeat = startSseHeartbeat(pipeline)
       const state: TerminalState = { upstreamError: null, timedOut: false, zeroOutput: false, errorMsg: '' }
 
       const onClientAbort = () => {
@@ -103,6 +104,7 @@ export async function handleChatCompletions(request: Request, headers: Record<st
           bytesReceived,
           lastCcEvent: lastCcEvent || '(none)',
           keepaliveCount: pipeline.keepaliveCount,
+          pingCount: pipeline.pingCount,
           inputTokens: translator.inputTokens,
           outputTokens: translator.outputTokens,
           cachedInputTokens: translator.cachedInputTokens,
@@ -197,6 +199,7 @@ export async function handleChatCompletions(request: Request, headers: Record<st
             }
           }
         } finally {
+          clearInterval(heartbeat)
           pipeline.close()
         }
       }

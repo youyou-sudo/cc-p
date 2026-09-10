@@ -565,7 +565,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
           return sendAnthropicError(state.upstreamError.status, state.upstreamError.body.error.type, state.upstreamError.body.error.message)
         }
         if (state.timedOut) {
-          return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(apiKey))
+          return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(apiKey), { retryAfter: 5 })
         }
         if (state.zeroOutput) {
           const rawUsage = {
@@ -688,7 +688,7 @@ export async function handleMessages(request: Request, headers: Record<string, s
         reader.cancel().catch(() => {})
         try { abortController.abort() } catch {}
         recordTimeout(apiKey)
-        return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(apiKey), { retryAfter: 5, headerOnly: true })
+        return sendAnthropicError(429, 'rate_limit_error', timeoutMessage(apiKey), { retryAfter: 5 })
       }
       log('error', 'Upstream error', {
         path: '/v1/messages',
