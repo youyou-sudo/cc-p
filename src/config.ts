@@ -1,4 +1,4 @@
-import { ApiKeyPool } from '../api-keys'
+import { ApiKeyPool } from './api-keys'
 
 export interface AppConfig {
   port: number
@@ -18,7 +18,6 @@ export interface AppConfig {
   retryMax: number
   retryBaseMs: number
   retryCapMs: number
-  emptySystemPlaceholder: boolean
 }
 
 function die(message: string): never {
@@ -36,9 +35,9 @@ function candidateDirs(): string[] {
     dirs.push(process.cwd())
     if (import.meta.dir) dirs.push(import.meta.dir)
   } else {
-    // Source runs (bun run / bun test): project root sits two levels above src/shared/.
+    // Source runs (bun run / bun test): project root sits one level above src/.
     if (import.meta.dir && !import.meta.dir.includes('$bunfs')) {
-      dirs.push(import.meta.dir + '/../..')
+      dirs.push(import.meta.dir + '/..')
     }
     dirs.push(process.cwd())
   }
@@ -83,14 +82,6 @@ const envBool = (key: string): boolean | undefined => {
   return value === '1' || value.toLowerCase() === 'true'
 }
 
-const envBoolDefaultTrue = (key: string): boolean | undefined => {
-  const value = envString(key)
-  if (value === undefined) return undefined
-  const v = value.toLowerCase()
-  if (v === 'false' || v === '0' || v === 'no') return false
-  return true
-}
-
 async function loadConfig(): Promise<AppConfig> {
   // Builtin defaults. These match the tracked config.json (which is baked into
   // Docker images / Release binaries), so every distribution shares one truth.
@@ -112,7 +103,6 @@ async function loadConfig(): Promise<AppConfig> {
     retryMax: 5,
     retryBaseMs: 1_000,
     retryCapMs: 30_000,
-    emptySystemPlaceholder: true,
   }
 
   const fileConfig = await findConfigJson()
@@ -137,11 +127,11 @@ async function loadConfig(): Promise<AppConfig> {
   if (envBool('CC_USE_PROVIDER_MODELS') !== undefined) config.useProviderModels = envBool('CC_USE_PROVIDER_MODELS')!
   if (envNumber('CC_MODEL_REFRESH_INTERVAL_MS') !== undefined) config.modelRefreshIntervalMs = envNumber('CC_MODEL_REFRESH_INTERVAL_MS')!
   if (envBool('CMD_ZDR') !== undefined) config.zdr = envBool('CMD_ZDR')!
+
   const rawStrategy = envString('CC_KEY_SELECTION_STRATEGY')
   if (rawStrategy) {
     config.keySelectionStrategy = rawStrategy === 'round-robin' ? 'roundRobin' : rawStrategy === 'affinity' ? 'affinity' : 'roundRobin'
   }
-  if (envBoolDefaultTrue('CC_EMPTY_SYSTEM_PLACEHOLDER') !== undefined) config.emptySystemPlaceholder = envBoolDefaultTrue('CC_EMPTY_SYSTEM_PLACEHOLDER')!
 
   return config
 }
@@ -151,18 +141,4 @@ export const CFG = await loadConfig()
 export const MAX_BODY_SIZE = (() => {
   const mb = envNumber('CC_MAX_BODY_MB')
   return mb !== undefined && mb > 0 ? mb * 1024 * 1024 : 100 * 1024 * 1024
-})()
-
-export const STREAM_IDLE_TIMEOUT_MS = (() => {
-  const v = envNumber('CC_STREAM_IDLE_MS')
-  return v !== undefined && v > 0 ? v : 30_000
-})()
-export const NONSTREAM_IDLE_TIMEOUT_MS = (() => {
-  const v = envNumber('CC_NONSTREAM_IDLE_MS')
-  return v !== undefined && v > 0 ? v : 90_000
-})()
-// 容忍 reasoning 长 prefill / 首 token 停顿，默认 120s；设 0/空回默认，非法数字沿用 die()。
-export const THINKING_IDLE_TIMEOUT_MS = (() => {
-  const v = envNumber('CC_THINKING_IDLE_MS')
-  return v !== undefined && v > 0 ? v : 120_000
 })()
