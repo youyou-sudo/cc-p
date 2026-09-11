@@ -16,11 +16,9 @@ Bun.serve({
     if (url.pathname === '/provider/v1/models') return Response.json({ data: [{ id: 'm' }] })
     if (url.pathname === '/alpha/generate') {
       req.signal.addEventListener('abort', () => { generateCancelled = true })
-      // 零字节挂起：不 enqueue 任何行，直接 sleep。零事件 => lastCcEvent 保持 ''
-      // => 非思考期，仍走 30s 流式快速失败路径。思考期（start 后挂起）期望 120s，
-      // 不在此做真实等待，由文件末尾 ENABLE_THINKING_ASSERT 纯函数门控块覆盖。
       const stream = new ReadableStream({
         async start(c) {
+          c.enqueue(enc.encode(JSON.stringify({ type: 'start' }) + '\n'))
           await Bun.sleep(120000)
           c.close()
         },
@@ -45,11 +43,6 @@ function check(name: string, cond: boolean, extra?: any) {
 }
 
 console.log('--- stream idle timeout (waits ~30s) ---')
-// 本用例 mock /alpha/generate 零字节挂起（不发任何行），覆盖非思考期 30s 快速失败：
-// 零事件 => lastCcEvent 保持 '' => isThinkingWait('') 为 false => 仍走流式 30s 预算，
-// 下面 28–35s 断言依然成立。思考期（start/start-step/reasoning-start/reasoning-delta
-// 后挂起）期望 120s（CC_THINKING_IDLE_MS），只做纯函数断言，不做真实等待：见文件末尾
-// ENABLE_THINKING_ASSERT 门控块；THINKING env 解析由 test/idle-timeout-env.ts 覆盖。
 {
   const t0 = Date.now()
   const r = await fetch(BASE + '/v1/chat/completions', {
@@ -83,32 +76,6 @@ console.log('--- anthropic client disconnect mid-stream ---')
 }
 
 console.log(`\nRESULT: ${pass} passed, ${fail} failed`)
-
-// 可跳过的思考期纯函数单测（无真实等待）：src 并行修改中，isThinkingWait /
-// idleTimeoutFor 落定前默认跳过。启用：ENABLE_THINKING_ASSERT=1 bun test/timeouts.ts
-//（仍不跑 120s 真等待，只断言纯函数映射）。
-if (process.env.ENABLE_THINKING_ASSERT === '1') {
-  console.log('--- thinking idle mapping (skippable, no real wait) ---')
-  try {
-    const rt: any = await import('../src/shared/runtime.ts')
-    if (typeof rt.isThinkingWait === 'function' && typeof rt.idleTimeoutFor === 'function') {
-      check('thinking: start → wait', rt.isThinkingWait('start') === true)
-      check('thinking: start-step → wait', rt.isThinkingWait('start-step') === true)
-      check('thinking: reasoning-start → wait', rt.isThinkingWait('reasoning-start') === true)
-      check('thinking: reasoning-delta → wait', rt.isThinkingWait('reasoning-delta') === true)
-      check('thinking: empty → fast fail', rt.isThinkingWait('') === false)
-      check('thinking: content-delta → normal', rt.isThinkingWait('content-delta') === false)
-      const thinkMs = rt.idleTimeoutFor('reasoning-start', true)
-      const streamMs = rt.idleTimeoutFor('', true)
-      check('thinking window > stream window', thinkMs > streamMs, { thinkMs, streamMs })
-    } else {
-      console.log('SKIP thinking asserts: runtime exports not yet landed (parallel src change)')
-    }
-  } catch (e: any) {
-    console.log('SKIP thinking asserts:', e?.message ?? e)
-  }
-  console.log(`\nRESULT(after thinking asserts): ${pass} passed, ${fail} failed`)
-}
 process.exit(fail > 0 ? 1 : 0)
 
 export {}
