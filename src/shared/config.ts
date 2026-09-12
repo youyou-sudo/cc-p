@@ -96,6 +96,16 @@ async function loadConfig(): Promise<AppConfig> {
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,
     zdr: false,
+<<<<<<< Updated upstream
+=======
+    maxConcurrencyPerKey: 16,
+    maxQueuePerKey: 64,
+    queueTimeoutMs: 60_000,
+    keySelectionStrategy: 'roundRobin',
+    retryMax: 3,
+    retryBaseMs: 1_000,
+    retryCapMs: 30_000,
+>>>>>>> Stashed changes
     emptySystemPlaceholder: true,
   }
 
