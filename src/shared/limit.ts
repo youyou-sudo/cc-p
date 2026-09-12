@@ -1,8 +1,7 @@
+// Layer: domain（可依赖 kernel / toolkit，不可被 kernel 依赖）
 // Upstream limit classification: distinguish retryable rate limits from
 // non-retryable usage windows / context overflow / payment / auth failures.
 // Pure functions, no I/O — covered by test/unit.ts.
-
-import { isContextWindowExceeded } from './errors'
 
 export type UpstreamLimitKind =
   | 'rate_limit'
@@ -21,16 +20,32 @@ export interface LimitMeta {
 
 const USAGE_5H_PATTERN = /5-hour|5 hour|five hour/i
 const USAGE_WEEKLY_PATTERN = /week/i
+const PAYMENT_MESSAGE_PATTERN =
+  /insufficient\s+credits?|out\s+of\s+credits?|no\s+credits?|payment\s+required|billing|past\s+due|balance\s+(exhausted|insufficient)|insufficient\s+balance/i
+// Local overflow whitelist. Duplicated from errors.ts (CONTEXT_WINDOW_EXCEEDED_PATTERN)
+// on purpose to avoid an errors<->limit import cycle; keep the two in sync.
+const CONTEXT_OVERFLOW_PATTERN =
+  /context_window_exceeded|prompt\s+(is\s+)?too\s+(long|large)|prompt\s+exceeds?.*tokens?|input\s+(is\s+)?too\s+(long|large)|input\s+tokens?.*exceed|context\s+length\s+exceeded|context\s+(window\s+)?exceeded|context\s+too\s+(long|large)|context\s+limit.*exceed|too\s+many\s+tokens|maximum\s+context|message\s+(is\s+)?too\s+long/i
+
+function isOverflowMessage(message: string): boolean {
+  return CONTEXT_OVERFLOW_PATTERN.test(message || '')
+}
 
 export function classifyUpstreamLimit(status: number, message: string): UpstreamLimitKind {
   const msg = message || ''
   // Usage windows first: they arrive as 429 but must NOT be retried.
   if (status === 429 && USAGE_5H_PATTERN.test(msg)) return 'usage_window_5h'
   if (status === 429 && USAGE_WEEKLY_PATTERN.test(msg)) return 'usage_window_weekly'
-  // Single source of truth for overflow wording lives in errors.ts.
-  if (isContextWindowExceeded(msg)) return 'context_overflow'
+  // Payment wording wins even when upstream mislabels the status (e.g. 429
+  // with "insufficient credits"): retrying burns money, never retry.
+  if (PAYMENT_MESSAGE_PATTERN.test(msg)) return 'payment_required'
   if (status === 402) return 'payment_required'
   if (status === 401 || status === 403) return 'authed_session_refused'
+  // Overflow downgrade only for 4xx excluding 429: a true 429 rate limit must
+  // stay rate_limit instead of being demoted to 400 by an overbroad keyword.
+  if (status !== 429 && status >= 400 && status < 500 && isOverflowMessage(msg)) {
+    return 'context_overflow'
+  }
   if (status === 429) return 'rate_limit'
   return 'unknown'
 }

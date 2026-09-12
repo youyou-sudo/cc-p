@@ -127,6 +127,39 @@ console.log('--- basic endpoints ---')
   const healthBody = await r.json()
   check('health 200 + {ok:true}', r.status === 200 && healthBody.ok === true, healthBody)
   check('health CORS', r.headers.get('access-control-allow-origin') === '*')
+  check('health CORS never null', r.headers.get('access-control-allow-origin') !== 'null', r.headers.get('access-control-allow-origin'))
+  check('health Vary: Origin', (r.headers.get('vary') || '').includes('Origin'), r.headers.get('vary'))
+}
+{
+  const r = await fetch(BASE + '/readyz')
+  const raw = await r.text()
+  let readyzBody: any = null
+  try { readyzBody = JSON.parse(raw) } catch { readyzBody = null }
+  check('readyz 200 + {ok:true}', r.status === 200 && readyzBody?.ok === true, readyzBody)
+  check('readyz content-type json', (r.headers.get('content-type') || '').includes('application/json'), r.headers.get('content-type'))
+  check('readyz CORS *', r.headers.get('access-control-allow-origin') === '*', r.headers.get('access-control-allow-origin'))
+  check('readyz CORS never null', r.headers.get('access-control-allow-origin') !== 'null', r.headers.get('access-control-allow-origin'))
+  check('readyz Vary: Origin', (r.headers.get('vary') || '').includes('Origin'), r.headers.get('vary'))
+  const readyzGate = readyzBody?.gate
+  check('readyz gate fields + limits are numbers', readyzGate != null && typeof readyzGate === 'object'
+    && typeof readyzGate.inFlight === 'number' && typeof readyzGate.queued === 'number' && typeof readyzGate.keys === 'number'
+    && typeof readyzGate.maxInFlightPerKey === 'number' && typeof readyzGate.maxQueuePerKey === 'number' && typeof readyzGate.queueTimeoutMs === 'number', readyzGate)
+  check('readyz idle gate zero 0/0/0', readyzGate?.inFlight === 0 && readyzGate?.queued === 0 && readyzGate?.keys === 0, readyzGate)
+  check('readyz uptimeSeconds integer', typeof readyzBody?.uptimeSeconds === 'number' && Number.isInteger(readyzBody.uptimeSeconds) && readyzBody.uptimeSeconds >= 0, readyzBody?.uptimeSeconds)
+  const readyzMem = readyzBody?.memory
+  check('readyz memory rss/heapUsed/heapTotal numbers', readyzMem != null && typeof readyzMem === 'object'
+    && typeof readyzMem.rss === 'number' && Number.isFinite(readyzMem.rss) && readyzMem.rss > 0
+    && typeof readyzMem.heapUsed === 'number' && Number.isFinite(readyzMem.heapUsed) && readyzMem.heapUsed > 0
+    && typeof readyzMem.heapTotal === 'number' && Number.isFinite(readyzMem.heapTotal) && readyzMem.heapTotal > 0, readyzMem)
+  check('readyz JSON no placeholder', readyzBody !== null && !/n\/a|unknown|todo|tbd|placeholder|xxx/i.test(raw), raw.slice(0, 300))
+  try {
+    const gateMod = await import('../src/infra/proxy-handler.ts') as any
+    const direct = gateMod.getGateStats()
+    check('readyz gate equals getGateStats()', readyzGate?.inFlight === direct?.inFlight && readyzGate?.queued === direct?.queued && readyzGate?.keys === direct?.keys
+      && readyzGate?.maxInFlightPerKey === direct?.maxInFlightPerKey && readyzGate?.maxQueuePerKey === direct?.maxQueuePerKey && readyzGate?.queueTimeoutMs === direct?.queueTimeoutMs, { gate: readyzGate, direct })
+  } catch (e: any) {
+    check('readyz gate equals getGateStats()', false, String(e?.message ?? e))
+  }
 }
 {
   const r = await fetch(BASE + '/')
@@ -141,6 +174,19 @@ console.log('--- basic endpoints ---')
   const r = await fetch(BASE + '/nope')
   const body = await r.json()
   check('404 JSON', r.status === 404 && body.error.type === 'not_found')
+  check('404 CORS never null', r.headers.get('access-control-allow-origin') !== 'null', r.headers.get('access-control-allow-origin'))
+  check('404 Vary: Origin', (r.headers.get('vary') || '').includes('Origin'), r.headers.get('vary'))
+}
+{
+  try {
+    const r = await fetch(BASE + '/v1/messages/xxx')
+    const body = await r.json()
+    check('404 /v1/messages/xxx always OpenAI shape', r.status === 404 && body.error?.type === 'not_found' && (body as any).type === undefined, body)
+    check('404 /v1/messages/xxx CORS never null', r.headers.get('access-control-allow-origin') !== 'null', r.headers.get('access-control-allow-origin'))
+    check('404 /v1/messages/xxx Vary: Origin', (r.headers.get('vary') || '').includes('Origin'), r.headers.get('vary'))
+  } catch (e: any) {
+    check('404 /v1/messages/xxx always OpenAI shape', false, String(e?.message ?? e))
+  }
 }
 
 console.log('--- auth / parse errors ---')
@@ -150,6 +196,8 @@ console.log('--- auth / parse errors ---')
   })
   const body = await r.json()
   check('missing key 401', r.status === 401 && body.error.type === 'auth_error')
+  check('401 openai CORS never null', r.headers.get('access-control-allow-origin') !== 'null', r.headers.get('access-control-allow-origin'))
+  check('401 openai Vary: Origin', (r.headers.get('vary') || '').includes('Origin'), r.headers.get('vary'))
 }
 {
   const r = await fetch(BASE + '/v1/messages', {
@@ -157,6 +205,8 @@ console.log('--- auth / parse errors ---')
   })
   const body = await r.json()
   check('messages missing key 401', r.status === 401 && body.error.type === 'authentication_error')
+  check('401 anthropic CORS never null', r.headers.get('access-control-allow-origin') !== 'null', r.headers.get('access-control-allow-origin'))
+  check('401 anthropic Vary: Origin', (r.headers.get('vary') || '').includes('Origin'), r.headers.get('vary'))
 }
 {
   const r = await fetch(BASE + '/v1/chat/completions', {
@@ -179,6 +229,22 @@ console.log('--- auth / parse errors ---')
   })
   const body = await r.json()
   check('413 body too large', r.status === 413 && body.error.message.includes('1MB'), body)
+  check('413 CORS never null', r.headers.get('access-control-allow-origin') !== 'null', r.headers.get('access-control-allow-origin'))
+  check('413 Vary: Origin', (r.headers.get('vary') || '').includes('Origin'), r.headers.get('vary'))
+}
+{
+  try {
+    const big = 'x'.repeat(2 * 1024 * 1024)
+    const r = await fetch(BASE + '/v1/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY }, body: JSON.stringify({ model: 'm', max_tokens: 5, messages: [{ role: 'user', content: 'hi' }], pad: big }),
+    })
+    const body = await r.json()
+    check('413 anthropic shape', r.status === 413 && body.type === 'error' && body.error.type === 'invalid_request_error', body)
+    check('413 anthropic CORS never null', r.headers.get('access-control-allow-origin') !== 'null', r.headers.get('access-control-allow-origin'))
+    check('413 anthropic Vary: Origin', (r.headers.get('vary') || '').includes('Origin'), r.headers.get('vary'))
+  } catch (e: any) {
+    check('413 anthropic shape', false, String(e?.message ?? e))
+  }
 }
 {
   const r = await fetch(BASE + '/v1/models')
@@ -299,6 +365,7 @@ console.log('--- param passthrough ---')
   check('stop passed through as array', Array.isArray(b.params.stop) && b.params.stop[0] === 'END' && b.params.stop[1] === '\n\n', b.params.stop)
   check('user passed through', b.params.user === 'u_abc', b.params.user)
   check('seed passed through', b.params.seed === 42, b.params.seed)
+  check('empty system placeholder injected', b.params.system === ' ', b.params.system)
 }
 {
   const before = (await statsFetch()).generate
@@ -337,7 +404,7 @@ console.log('--- zero output / upstream errors ---')
     body: JSON.stringify({ model: 'mock/upstream-429', messages: [{ role: 'user', content: 'q' }] }),
   })
   const body = await r.json()
-  check('upstream 429 mapped', r.status === 429 && body.error.message === 'rate limited upstream' && body.retry_after === 30, body)
+  check('upstream 429 mapped (no fabricated retry_after)', r.status === 429 && body.error.message === 'rate limited upstream' && body.retry_after === undefined, body)
 }
 {
   const r = await fetch(BASE + '/v1/chat/completions', {
@@ -345,7 +412,7 @@ console.log('--- zero output / upstream errors ---')
     body: JSON.stringify({ model: 'mock/event-error', stream: true, messages: [{ role: 'user', content: 'q' }] }),
   })
   const body = await r.json()
-  check('stream error event before output → JSON 429', r.status === 429 && body.error.type === 'rate_limit_error' && body.retry_after === 30, body)
+  check('stream error event before output → JSON 429', r.status === 429 && body.error.type === 'rate_limit_error' && body.retry_after === undefined, body)
 }
 {
   const r = await fetch(BASE + '/v1/chat/completions', {
@@ -353,7 +420,7 @@ console.log('--- zero output / upstream errors ---')
     body: JSON.stringify({ model: 'mock/event-error', messages: [{ role: 'user', content: 'q' }] }),
   })
   const body = await r.json()
-  check('non-stream error event → JSON 429', r.status === 429 && body.error.type === 'rate_limit_error' && body.retry_after === 30, body)
+  check('non-stream error event → JSON 429', r.status === 429 && body.error.type === 'rate_limit_error' && body.retry_after === undefined, body)
 }
 {
   const r = await fetch(BASE + '/v1/chat/completions', {
@@ -452,7 +519,7 @@ console.log('--- anthropic zero output / upstream errors ---')
     body: JSON.stringify({ model: 'mock/upstream-429', max_tokens: 100, messages: [{ role: 'user', content: 'q' }] }),
   })
   const body = await r.json()
-  check('anthropic upstream 429 mapped', r.status === 429 && body.type === 'error' && body.error.type === 'rate_limit_error' && body.retry_after === 30 && r.headers.get('retry-after') === '30', body)
+  check('anthropic upstream 429 mapped (no fabricated retry_after)', r.status === 429 && body.type === 'error' && body.error.type === 'rate_limit_error' && body.retry_after === undefined && r.headers.get('retry-after') === null, body)
 }
 {
   const r = await fetch(BASE + '/v1/messages', {
@@ -461,7 +528,7 @@ console.log('--- anthropic zero output / upstream errors ---')
   })
   const ct = r.headers.get('content-type') || ''
   const body = await r.json()
-  check('anthropic stream error before output → JSON 429', r.status === 429 && ct.includes('json') && !ct.includes('event-stream') && body.type === 'error' && body.error.type === 'rate_limit_error' && body.retry_after === 30, { ct, body })
+  check('anthropic stream error before output → JSON 429', r.status === 429 && ct.includes('json') && !ct.includes('event-stream') && body.type === 'error' && body.error.type === 'rate_limit_error' && body.retry_after === undefined, { ct, body })
 }
 
 console.log('--- client disconnect ---')

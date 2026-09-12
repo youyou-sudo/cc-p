@@ -1,3 +1,4 @@
+// Layer: domain（可依赖 kernel / toolkit，不可被 kernel 依赖）
 // Retry helpers: Retry-After parsing and capped exponential backoff with
 // jitter. Pure functions, no I/O — covered by test/unit.ts.
 

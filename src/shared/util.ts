@@ -1,3 +1,4 @@
+// Layer: toolkit（零依赖叶，谁都可依赖，谁都不依赖）
 export function sha256hex(input: string): string {
   return new Bun.CryptoHasher('sha256').update(input).digest('hex')
 }
@@ -46,6 +47,26 @@ export function tryParseJSON(str: string): any {
     return JSON.parse(str)
   } catch {
     return {}
+  }
+}
+
+/** Strict JSON parse result: on failure returns a sentinel instead of silent {}. */
+export interface JSONParseFailure {
+  __parseError: true
+  raw: string
+  message: string
+}
+
+export function isJSONParseFailure(v: any): v is JSONParseFailure {
+  return !!v && typeof v === 'object' && (v as any).__parseError === true
+}
+
+/** Strict variant: never silently returns {}. Caller decides (passthrough raw + log). */
+export function tryParseJSONStrict(str: string): any | JSONParseFailure {
+  try {
+    return JSON.parse(str)
+  } catch (e: any) {
+    return { __parseError: true, raw: str, message: e?.message ?? 'Invalid JSON' }
   }
 }
 

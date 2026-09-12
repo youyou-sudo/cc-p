@@ -146,19 +146,21 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('404 keeps not_found', p404.status === 404 && p404.body.error.type === 'not_found', p404)
 
   const p429 = mapCcError(429, JSON.stringify({ error: { message: 'rate limit exceeded' } }))
-  check('429 default retry_after 30', p429.status === 429 && p429.body.error.type === 'rate_limit_error' && p429.body.retry_after === 30, p429)
+  check('429 without Retry-After omits retry_after', p429.status === 429 && p429.body.error.type === 'rate_limit_error' && p429.body.retry_after === undefined, p429)
 
   const p429passthrough = mapCcError(429, JSON.stringify({ error: { message: 'slow down' } }), 120_000)
   check('429 passes upstream Retry-After through (never lies)', p429passthrough.body.retry_after === 120, p429passthrough)
 
   check('toRetryAfterSeconds ceils sub-second windows', toRetryAfterSeconds(500) === 1)
-  check('toRetryAfterSeconds defaults to 30', toRetryAfterSeconds(null) === 30 && toRetryAfterSeconds(undefined) === 30)
+  check('toRetryAfterSeconds absent -> null (omit field)', toRetryAfterSeconds(null) === null && toRetryAfterSeconds(undefined) === null)
 
   const p500 = mapCcError(500, '')
   check('500 => 502 upstream_error', p500.status === 502 && p500.body.error.type === 'upstream_error', p500)
 
   const ev = mapCcEventError({ error: { message: '<429> slow down' } })
-  check('event <429> => 429 rate_limit_error', ev.status === 429 && ev.body.error.type === 'rate_limit_error' && ev.body.retry_after === 30, ev)
+  check('event <429> without retry_after omits retry_after', ev.status === 429 && ev.body.error.type === 'rate_limit_error' && ev.body.retry_after === undefined, ev)
+  const evPassthrough = mapCcEventError({ error: { message: '<429> slow down' }, retry_after: 45 })
+  check('event <429> passes event.retry_after through', evPassthrough.status === 429 && evPassthrough.body.retry_after === 45, evPassthrough)
 }
 
 console.log(`\nUNIT RESULT: ${passed} passed, ${failed} failed`)

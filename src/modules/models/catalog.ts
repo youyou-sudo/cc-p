@@ -62,21 +62,37 @@ const STATIC_WINDOW_BY_ID = new Map<string, number>(
 
 let dynamicModels: ModelEntry[] | null = null
 let modelsLastFetch = 0
+// 失败退避：上次失败时刻；30s 内不重试，直接 stale 返回，避免失败惊群打爆上游。
+let modelsLastFailureAt = 0
+const FETCH_FAIL_BACKOFF_MS = 30_000
+// 过期单飞：缓存过期后的并发 fetchModels 共用同一个 in-flight promise 去重，防惊群。
+let inFlight: Promise<ModelEntry[]> | null = null
 
-export async function fetchModels(apiKey?: string | null): Promise<ModelEntry[]> {
-  const now = Date.now()
-  if (dynamicModels && now - modelsLastFetch < CFG.modelRefreshIntervalMs) {
-    return dynamicModels
+// NOTE（跨 key 复用风险，文档化）：dynamicModels / lastFetch / inFlight 是进程级
+// 全局单例，不按 apiKey 分桶。不同客户端 key（getApiKey 结果）会复用同一份缓存：
+// key A 触发拉取后，key B 在刷新间隔内直接拿到 A 拉到的列表（含 A 可见模型）。
+// 当前上游 /provider/v1/models 返回全局模型目录（与 key 无关），复用可接受；
+// 若未来上游按 key 返回差异化模型（订阅/权限隔离），必须改为按 key 分桶
+// （Map<keyHash, {models,lastFetch}> + 分桶 inFlight），否则会串权。
+// 按 key 分桶本次未做（key 空间无界需 LRU/TTL，复杂度超本次范围），特此记录。
+
+async function doFetchModels(apiKey: string | null | undefined): Promise<ModelEntry[]> {
+  // 配置性短路（无 key / 开关关闭）：不是上游失败，不记 failure backoff，
+  // 否则一次无 key 请求会毒化随后 30s 内的有 key 拉取（e2e 先调无 key models
+  // 再调有 key models，必挂）。有 stale 缓存则保留返回。
+  if (!apiKey || !CFG.useProviderModels) {
+    if (dynamicModels) return dynamicModels
+    return MODELS
   }
-
   try {
-    if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled')
 
     const response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'x-cli-environment': 'production',
         'x-command-code-version': CC_VERSION,
+        // ZDR 透传：全局开关开时模型拉取同样走 ZDR 路由，与 cc.ts / fingerprint.ts 一致。
+        ...(CFG.zdr ? { 'x-cmd-zdr': '1' } : {}),
       },
       signal: AbortSignal.timeout(10000),
     })
@@ -87,14 +103,17 @@ export async function fetchModels(apiKey?: string | null): Promise<ModelEntry[]>
         const models: ModelEntry[] = data.data.map((m: any) => {
           const entry: ModelEntry = { id: m.id, name: m.id }
           const upstreamWindow = pickContextWindow(m)
-          entry.context_window = upstreamWindow ?? STATIC_WINDOW_BY_ID.get(m.id)
+          // 形状稳定：STATIC 优先（已知 id 用静态 canonical 值，避免上游误报/波动），
+          // 缺失才用上游 parsed，再缺失保留 0 而不 delete，保证 dynamic 条目恒带
+          // context_window 字段，下游 handleModels / 客户端无需处理“字段时有时无”。
+          // 上游 NaN/缺失 → toOptionalNumber 已归一为 undefined，走后备分支。
+          entry.context_window = STATIC_WINDOW_BY_ID.get(m.id) ?? upstreamWindow ?? 0
           const maxOut = pickMaxOutputTokens(m)
           if (maxOut !== undefined) entry.max_output_tokens = maxOut
-          if (entry.context_window === undefined) delete entry.context_window
           return entry
         })
         dynamicModels = models
-        modelsLastFetch = now
+        modelsLastFetch = Date.now()
         log('info', 'Fetched models from Provider API', { count: models.length })
         return models
       }
@@ -104,7 +123,29 @@ export async function fetchModels(apiKey?: string | null): Promise<ModelEntry[]>
     log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message })
   }
 
+  // 失败路径：不更新 lastFetch（下次按退避窗口决定是否重试），但记录失败时刻；
+  // stale-while-revalidate：有旧 dynamicModels 则保留返回，不回退到硬编码 MODELS。
+  modelsLastFailureAt = Date.now()
+  if (dynamicModels) return dynamicModels
   return MODELS
+}
+
+export async function fetchModels(apiKey?: string | null): Promise<ModelEntry[]> {
+  const now = Date.now()
+  if (dynamicModels && now - modelsLastFetch < CFG.modelRefreshIntervalMs) {
+    return dynamicModels
+  }
+  // 失败退避：30s 内失败过则直接 stale 返回，不再拨上游。
+  if (now - modelsLastFailureAt < FETCH_FAIL_BACKOFF_MS) {
+    if (dynamicModels) return dynamicModels
+    return MODELS
+  }
+  // 过期单飞：并发过期请求共用一个 promise。
+  if (inFlight) return inFlight
+  inFlight = doFetchModels(apiKey).finally(() => {
+    inFlight = null
+  })
+  return inFlight
 }
 
 export async function handleModels(headers: Record<string, string | undefined>): Promise<Response> {

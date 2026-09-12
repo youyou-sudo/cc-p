@@ -1,42 +1,19 @@
 import { Elysia } from 'elysia'
 import { authErrorMessage, getApiKey } from '../shared/auth'
 
-// Shim over the legacy pure auth helpers (src/auth.ts).
-// Old call sites (openai.ts / anthropic.ts hand-rolled 401s) keep working:
-// this plugin only re-exports getApiKey as a decorator and adds an opt-in
-// `requireAuth` macro — nothing is enforced unless a route opts in.
+// Shim over the legacy pure auth helpers (src/shared/auth.ts).
+// Enforcement is via createAuthPreCheck below (onTransform/derive).
+// No route references a `requireAuth` macro (verified: no usages),
+// so no macro is provided.
 //
-// Dual-protocol note: src/auth.ts keyFormatError/authErrorMessage returns a
+// Dual-protocol note: src/shared/auth.ts authErrorMessage returns a
 // single message string (no per-path OpenAI/Anthropic split there — the split
-// lives in the protocol handlers). The macro mirrors that: the 401 body
-// carries both shapes at once ({ error: OpenAI } + top-level type: Anthropic)
-// so either client parses it. resolve failures use status(401, …) (thrown, so
-// resolve maps it to a short-circuit response) — never `new Response`.
-export function authErrorBody(headers: Record<string, string | undefined>): {
-  error: { message: string; type: string }
-  type: string
-} {
-  return {
-    error: { message: authErrorMessage(headers), type: 'auth_error' },
-    type: 'error',
-  }
-}
-
+// lives in createAuthPreCheck below, which picks the per-protocol body).
 export const authPlugin = new Elysia({ name: 'auth' })
   .decorate('getApiKey', getApiKey)
-  .macro({
-    requireAuth: {
-      resolve({ headers, status }: { headers: Record<string, string | undefined>; status: any }) {
-        const apiKey = getApiKey(headers)
-        if (!apiKey) throw status(401, authErrorBody(headers))
-        return { apiKey }
-      },
-    },
-  })
 
 // Per-protocol 401 bodies — byte-identical literals to the old hand-rolled
-// handlers (openai.ts:62 / anthropic.ts:418). authErrorBody above is a merged
-// shape (top-level type + error.type) and must NOT be reused here.
+// handlers (openai.ts:62 / anthropic.ts:418).
 export const openAI401Body = (msg: string) => ({ error: { message: msg, type: 'auth_error' as const } })
 export const anthropic401Body = (msg: string) => ({
   type: 'error' as const,

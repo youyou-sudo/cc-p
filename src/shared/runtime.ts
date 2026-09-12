@@ -1,10 +1,14 @@
+// Layer: domain（可依赖 kernel / toolkit，不可被 kernel 依赖）
 // Consecutive-timeout tracking.
 //
 // State is isolated per API key: one client's slow requests must not inflate
 // another client's timeout guidance, and successful requests from unrelated
 // keys must not reset it either. Entries live only while a key is actively
 // failing - a successful response deletes the entry, and entries idle for
-// TIMEOUT_STATE_TTL_MS are pruned lazily, so the map stays bounded.
+// TIMEOUT_STATE_TTL_MS are pruned lazily on every read/write path plus a
+// soft cap (MAX_TIMEOUT_STATES) evicts the oldest keys. Without the cap the
+// map would grow unbounded with distinct attacker-controlled keys; TTL alone
+// only bounds idle entries, not active cardinality.
 
 export { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, THINKING_IDLE_TIMEOUT_MS } from './config'
 import { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, THINKING_IDLE_TIMEOUT_MS } from './config'
@@ -22,10 +26,39 @@ interface TimeoutEntry {
 
 const timeoutStates = new Map<string, TimeoutEntry>()
 
+/** Soft cap: distinct attacker-controlled (key, session) pairs must not grow
+ *  the map without bound. Evicts oldest-lastUpdated first when exceeded. */
+export const MAX_TIMEOUT_STATES = 100_000
+
+export function evictOldestTimeoutStates(): number {
+  if (timeoutStates.size <= MAX_TIMEOUT_STATES) return 0
+  const entries = [...timeoutStates.entries()].sort((a, b) => a[1].lastUpdatedAt - b[1].lastUpdatedAt)
+  const drop = timeoutStates.size - MAX_TIMEOUT_STATES
+  for (let i = 0; i < drop; i++) timeoutStates.delete(entries[i]![0])
+  return drop
+}
+
+/** Prune physically-delete helper exported for session cleanup (dynamic
+ *  import from session would cycle; runtime is a leaf). */
+export function pruneTimeoutStates(): number {
+  const now = Date.now()
+  let dropped = 0
+  for (const [key, entry] of timeoutStates) {
+    if (now - entry.lastUpdatedAt > TIMEOUT_STATE_TTL_MS) {
+      timeoutStates.delete(key)
+      dropped++
+    }
+  }
+  return dropped
+}
+
 /** Scoped counter key: one bucket per (apiKey, session). Missing session
- *  falls back to the 'default' bucket so old single-arg calls keep working. */
+ *  falls back to the 'default' bucket so old single-arg calls keep working.
+ *  sessionId is enumerable client input: truncate to 128 chars so a hostile
+ *  10MB prompt_cache_key cannot inflate every Map key forever. */
 export function scopeKey(apiKey: string, sessionId?: string): string {
-  return `${apiKey}::${sessionId || 'default'}`
+  const sid = sessionId ? sessionId.slice(0, 128) : 'default'
+  return `${apiKey}::${sid || 'default'}`
 }
 
 /** Legacy pre-scope storage key (bare apiKey, no '::' suffix). Kept only as
@@ -62,10 +95,13 @@ export function recordTimeout(apiKey: string, sessionId?: string): void {
   const entry = entryFor(scopeKey(apiKey, sessionId), now)
   entry.consecutiveTimeouts++
   entry.lastUpdatedAt = now
+  if (timeoutStates.size > MAX_TIMEOUT_STATES) evictOldestTimeoutStates()
 }
 
 /** A request for this key completed successfully: clear its scoped counter. */
 export function recordTimeoutSuccess(apiKey: string, sessionId?: string): void {
+  const now = Date.now()
+  if (timeoutStates.size > 0) pruneStale(now)
   timeoutStates.delete(scopeKey(apiKey, sessionId))
   if (sessionId === undefined) {
     // Drop legacy bare-key entry left by pre-scope versions.
@@ -76,6 +112,7 @@ export function recordTimeoutSuccess(apiKey: string, sessionId?: string): void {
 /** Current consecutive-timeout count for the scoped key (0 when absent/stale). */
 export function consecutiveTimeouts(apiKey: string, sessionId?: string): number {
   const now = Date.now()
+  if (timeoutStates.size > 0) pruneStale(now)
   const scoped = freshCount(scopeKey(apiKey, sessionId), now)
   if (sessionId !== undefined) return scoped
   // Rollout fallback: honour legacy bare-key entries written before scoping.

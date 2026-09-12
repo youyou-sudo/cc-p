@@ -99,25 +99,50 @@ export interface KeyState {
 
 export const keyStateStore = new Map<string, KeyState>()
 
+/** Soft cap for fingerprint states: apiKey is attacker-influenced cardinality.
+ *  Evict oldest-inserted when exceeded (Map preserves insertion order). */
+export const MAX_KEY_STATES = 100_000
+
+function keyHash(apiKey: string): string {
+  try {
+    return sha256hex(apiKey).slice(0, 6)
+  } catch {
+    return 'unknown'
+  }
+}
+
 export function getOrCreateKeyState(apiKey: string): KeyState {
   let state = keyStateStore.get(apiKey)
   if (!state) {
+    // Soft-cap eviction before insert to keep the map bounded.
+    if (keyStateStore.size >= MAX_KEY_STATES) {
+      const oldest = keyStateStore.keys().next()
+      if (!oldest.done) keyStateStore.delete(oldest.value)
+    }
     state = {
       fingerprint: generateFingerprint(),
       nextInitAt: 0,
     }
     keyStateStore.set(apiKey, state)
-    log('info', 'Fingerprint generated for key', { keyPrefix: apiKey.slice(0, 8) })
+    log('info', 'Fingerprint generated for key', { keyHash: keyHash(apiKey) })
   }
   return state
 }
 
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000
 const INIT_JITTER_MS = 2 * 60 * 60 * 1000
+/** Failure backoff: retry soon but not hot-loop; randomized 5s..60s. */
+const INIT_FAIL_BASE_MS = 5_000
+const INIT_FAIL_JITTER_MS = 55_000
 
 const inFlightInit = new Map<string, Promise<void>>()
 
-export async function ensureInitialized(apiKey: string, signal: AbortSignal): Promise<void> {
+export interface EnsureInitOptions {
+  /** Per-request ZDR flag (e.g. from `x-cmd-zdr: 1` header). Unified with CFG.zdr. */
+  zdr?: boolean
+}
+
+export async function ensureInitialized(apiKey: string, signal: AbortSignal, opts?: EnsureInitOptions): Promise<void> {
   const state = getOrCreateKeyState(apiKey)
   const now = Date.now()
   if (now < state.nextInitAt) return
@@ -125,12 +150,12 @@ export async function ensureInitialized(apiKey: string, signal: AbortSignal): Pr
   const existing = inFlightInit.get(apiKey)
   if (existing) return existing
 
-  const init = doInit(apiKey, state, signal)
+  const init = doInit(apiKey, state, signal, opts)
     .catch((e: any) => {
       // Never let a failed init poison callers; the key stays stale and the
-      // next request retries.
+      // next request retries after a short backoff (set inside doInit).
       if (e?.name !== 'AbortError') {
-        log('warn', 'Fingerprint/lifecycle refresh error, will retry next request', { error: e?.message })
+        log('warn', 'Fingerprint/lifecycle refresh error, will retry next request', { error: e?.message, keyHash: keyHash(apiKey) })
       }
     })
     .finally(() => {
@@ -140,13 +165,25 @@ export async function ensureInitialized(apiKey: string, signal: AbortSignal): Pr
   return init
 }
 
-async function doInit(apiKey: string, state: KeyState, signal: AbortSignal): Promise<void> {
+/** Consume (and discard) a Response body so the socket can be reused.
+ *  Must be called for every fingerprint/lifecycle response, ok or not. */
+async function consumeBody(r: Response): Promise<void> {
+  try {
+    // text() drains the stream; catch() covers already-disturbed bodies.
+    await r.text().catch(() => {})
+  } catch {
+    try { await r.body?.cancel().catch(() => {}) } catch {}
+  }
+}
+
+async function doInit(apiKey: string, state: KeyState, signal: AbortSignal, opts?: EnsureInitOptions): Promise<void> {
+  const zdr = CFG.zdr || opts?.zdr === true
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'x-cli-environment': 'production',
     'Authorization': `Bearer ${apiKey}`,
     'x-command-code-version': CC_VERSION,
-    ...(CFG.zdr ? { 'x-cmd-zdr': '1' } : {}),
+    ...(zdr ? { 'x-cmd-zdr': '1' } : {}),
   }
   const fingerprint = state.fingerprint ?? ({} as Fingerprint)
 
@@ -155,11 +192,17 @@ async function doInit(apiKey: string, state: KeyState, signal: AbortSignal): Pro
     headers,
     signal,
     body: JSON.stringify(fingerprint),
-  }).then((r) => {
-    if (!r.ok) log('warn', 'Fingerprint record failed', { status: r.status })
-    else log('info', 'Fingerprint recorded')
+  }).then(async (r) => {
+    await consumeBody(r)
+    if (!r.ok) {
+      log('warn', 'Fingerprint record failed', { status: r.status, keyHash: keyHash(apiKey) })
+      return false
+    }
+    log('info', 'Fingerprint recorded', { keyHash: keyHash(apiKey) })
+    return true
   }).catch((e: any) => {
-    if (e.name !== 'AbortError') log('warn', 'Fingerprint record error', { error: e.message })
+    if (e?.name !== 'AbortError') log('warn', 'Fingerprint record error', { error: e?.message, keyHash: keyHash(apiKey) })
+    return e?.name === 'AbortError' ? null : false
   })
 
   const lifecycle = fetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
@@ -175,16 +218,33 @@ async function doInit(apiKey: string, state: KeyState, signal: AbortSignal): Pro
         os: `${fingerprint.components?.platform}-${fingerprint.components?.arch}`,
       },
     }),
-  }).then((r) => {
-    if (!r.ok) log('warn', 'Lifecycle event failed', { status: r.status })
-    else log('info', 'Lifecycle event sent')
+  }).then(async (r) => {
+    await consumeBody(r)
+    if (!r.ok) {
+      log('warn', 'Lifecycle event failed', { status: r.status, keyHash: keyHash(apiKey) })
+      return false
+    }
+    log('info', 'Lifecycle event sent', { keyHash: keyHash(apiKey) })
+    return true
   }).catch((e: any) => {
-    if (e.name !== 'AbortError') log('warn', 'Lifecycle event error', { error: e.message })
+    if (e?.name !== 'AbortError') log('warn', 'Lifecycle event error', { error: e?.message, keyHash: keyHash(apiKey) })
+    return e?.name === 'AbortError' ? null : false
   })
 
-  await Promise.all([record, lifecycle])
+  const [recordOk, lifecycleOk] = await Promise.all([record, lifecycle])
 
-  const jitter = Math.floor(Math.random() * INIT_JITTER_MS)
-  state.nextInitAt = Date.now() + INIT_REFRESH_MS + jitter
-  log('info', 'Fingerprint/lifecycle next refresh', { nextIn: `${(INIT_REFRESH_MS + jitter) / 3600000}h` })
+  // Only a full success pushes the 8h window; any failure keeps the key
+  // retryable with a short backoff so the next request retries soon.
+  if (recordOk === true && lifecycleOk === true) {
+    const jitter = Math.floor(Math.random() * INIT_JITTER_MS)
+    state.nextInitAt = Date.now() + INIT_REFRESH_MS + jitter
+    log('info', 'Fingerprint/lifecycle next refresh', { nextIn: `${(INIT_REFRESH_MS + jitter) / 3600000}h`, keyHash: keyHash(apiKey) })
+  } else if (recordOk === null || lifecycleOk === null) {
+    // Aborted (client disconnect): keep nextInitAt at 0 so the next real
+    // request retries immediately; do not apply failure backoff.
+  } else {
+    const backoff = INIT_FAIL_BASE_MS + Math.floor(Math.random() * INIT_FAIL_JITTER_MS)
+    state.nextInitAt = Date.now() + backoff
+    log('info', 'Fingerprint/lifecycle retry scheduled', { backoffMs: backoff, keyHash: keyHash(apiKey) })
+  }
 }

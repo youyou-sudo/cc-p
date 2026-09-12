@@ -9,20 +9,34 @@ let generateCancelled = false
 Bun.serve({
   port: 4110,
   idleTimeout: 120,
-  fetch(req) {
+  fetch: async (req) => {
     const url = new URL(req.url)
     if (url.pathname === '/alpha/fingerprint/record') return Response.json({})
     if (url.pathname === '/alpha/lifecycle-events') return Response.json({})
     if (url.pathname === '/provider/v1/models') return Response.json({ data: [{ id: 'm' }] })
     if (url.pathname === '/alpha/generate') {
       req.signal.addEventListener('abort', () => { generateCancelled = true })
-      // 零字节挂起：不 enqueue 任何行，直接 sleep。零事件 => lastCcEvent 保持 ''
-      // => 非思考期，仍走 30s 流式快速失败路径。思考期（start 后挂起）期望 120s，
-      // 不在此做真实等待，由文件末尾 ENABLE_THINKING_ASSERT 纯函数门控块覆盖。
+      // disconnect 用例用 mock/hang-started：先发 text-delta 使下游 start()
+      // （客户端 headers 到达、可 abort），再挂起；默认走 ":" 保活行挂起。
+      let hangStarted = false
+      try {
+        const body: any = await req.clone().json()
+        hangStarted = body?.params?.model === 'mock/hang-started'
+      } catch {}
       const stream = new ReadableStream({
-        async start(c) {
-          await Bun.sleep(120000)
-          c.close()
+        start(c) {
+          // Bun buffers response headers until the first body bytes: enqueue a
+          // parser-ignored ":" keepalive so forwardToCC receives headers
+          // immediately. CcStreamParser skips ":" lines, so lastCcEvent stays
+          // '' → 30s non-thinking budget (thinking 120s: pure-fn asserts below).
+          // disconnect 用例用 mock/hang-started（text-delta 先发 → Anthropic 侧
+          // content_block_start → pipeline.start() → 客户端 headers 到达可 abort）。
+          if (hangStarted) {
+            c.enqueue(enc.encode(JSON.stringify({ type: 'text-delta', text: 'hi' }) + '\n'))
+          } else {
+            c.enqueue(enc.encode(':\n'))
+          }
+          setTimeout(() => { try { c.close() } catch {} }, 120000)
         },
         cancel() { generateCancelled = true },
       })
@@ -45,9 +59,12 @@ function check(name: string, cond: boolean, extra?: any) {
 }
 
 console.log('--- stream idle timeout (waits ~30s) ---')
-// 本用例 mock /alpha/generate 零字节挂起（不发任何行），覆盖非思考期 30s 快速失败：
-// 零事件 => lastCcEvent 保持 '' => isThinkingWait('') 为 false => 仍走流式 30s 预算，
-// 下面 28–35s 断言依然成立。思考期（start/start-step/reasoning-start/reasoning-delta
+// 本用例 mock /alpha/generate ":" 保活行挂起（parser 忽略 ":" 行，零事件 =>
+// lastCcEvent 保持 '' => isThinkingWait('') 为 false => 仍走流式 30s 预算，
+// 下面 28–35s 断言依然成立）。此前"零字节挂起（不发任何行）"写法在 Bun 下
+// headers 被缓冲 120s 才到达，代理 30s 计时从 headers 到达才开始，导致 120s
+// 超时 + 502（见 CC fetch failed 日志）；":" 保活首字节使 headers 即时到达。
+// 思考期（start/start-step/reasoning-start/reasoning-delta
 // 后挂起）期望 120s（CC_THINKING_IDLE_MS），只做纯函数断言，不做真实等待：见文件末尾
 // ENABLE_THINKING_ASSERT 门控块；THINKING env 解析由 test/idle-timeout-env.ts 覆盖。
 {
@@ -70,7 +87,7 @@ console.log('--- anthropic client disconnect mid-stream ---')
   const ac = new AbortController()
   const r = await fetch(BASE + '/v1/messages', {
     method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
-    body: JSON.stringify({ model: 'mock/hang', max_tokens: 100, stream: true, messages: [{ role: 'user', content: 'q' }] }),
+    body: JSON.stringify({ model: 'mock/hang-started', max_tokens: 100, stream: true, messages: [{ role: 'user', content: 'q' }] }),
     signal: ac.signal,
   })
   const reader = r.body!.getReader()

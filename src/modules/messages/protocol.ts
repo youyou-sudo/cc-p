@@ -1,4 +1,4 @@
-export { handleMessages, handleMessagesBody } from './handler'
+export { handleMessagesBody } from './handler'
 export { convertAnthropicToOpenAI, createAnthropicSseTranslator, fakeThinkingSignature } from './translator'
 export type { AnthropicStreamContext } from './translator'
 export { buildAnthropicResponse, createMessagesAggregator, rawUsageFromCcUsageAnthropic } from './aggregator'
