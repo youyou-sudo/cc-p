@@ -1,54 +1,15 @@
-import { Elysia } from 'elysia'
-import { CFG, MAX_BODY_SIZE } from './config'
-import { CORS_HEADERS } from './http'
-import { log } from './logger'
-import { handleMessages } from './anthropic'
-import { handleModels, MODELS } from './models'
-import { handleChatCompletions } from './openai'
-import { startSessionCleanup } from './session'
-import { startVersionRefresh } from './version'
-
-function jsonResponse(status: number, body: any): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  })
-}
+import { CFG } from './shared/config'
+import { log } from './shared/logger'
+import { MODELS } from './modules/models/catalog'
+import { startSessionCleanup } from './infra/session'
+import { startVersionRefresh } from './shared/version'
+import { createApp } from './app'
 
 export function startServer() {
   startVersionRefresh()
   startSessionCleanup()
 
-  const app = new Elysia()
-    .onRequest(({ request, set }) => {
-      Object.assign(set.headers, CORS_HEADERS)
-      if (request.method === 'OPTIONS') {
-        return new Response(null, { status: 204, headers: CORS_HEADERS })
-      }
-    })
-    .get('/', () => new Response('OK', { headers: { 'Content-Type': 'text/plain' } }))
-    .get('/health', () => jsonResponse(200, { ok: true }))
-    .get('/v1/models', ({ headers }) => handleModels(headers))
-    .post('/v1/chat/completions', ({ request, headers }) => handleChatCompletions(request, headers))
-    .post('/v1/messages', ({ request, headers }) => handleMessages(request, headers))
-    .onError(({ code, error, request }) => {
-      const status = (error as any)?.status
-      if (code === 'NOT_FOUND') {
-        return jsonResponse(404, { error: { message: 'Not found', type: 'not_found' } })
-      }
-      if (status === 413 || code === 'PARSE' || code === 'VALIDATION') {
-        const path = new URL(request.url).pathname
-        if (status === 413) {
-          return jsonResponse(413, { error: { message: `Request body exceeds ${Math.round(MAX_BODY_SIZE / 1024 / 1024)}MB limit`, type: 'invalid_request_error' } })
-        }
-        if (path === '/v1/messages') {
-          return jsonResponse(400, { type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON body' } })
-        }
-        return jsonResponse(400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } })
-      }
-      const message = (error as any)?.message ?? 'Internal error'
-      return jsonResponse(500, { error: { message, type: 'internal_error' } })
-    })
+  const app = createApp()
     .listen({ port: CFG.port, hostname: CFG.host })
 
   log('info', 'CC Proxy started', {
@@ -64,6 +25,7 @@ export function startServer() {
     zdr: CFG.zdr
       ? 'enabled (x-cmd-zdr: 1 on generation/init requests)'
       : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
+    emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on' : 'off',
     logFile: CFG.logFile || '(console only)',
   })
 
