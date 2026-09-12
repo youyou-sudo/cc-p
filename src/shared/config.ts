@@ -1,3 +1,5 @@
+import type { ApiKeyPool } from './api-keys'
+
 export interface AppConfig {
   port: number
   host: string
@@ -9,6 +11,13 @@ export interface AppConfig {
   useProviderModels: boolean
   modelRefreshIntervalMs: number
   zdr: boolean
+  maxConcurrencyPerKey: number
+  maxQueuePerKey: number
+  queueTimeoutMs: number
+  keySelectionStrategy: ApiKeyPool['strategy']
+  retryMax: number
+  retryBaseMs: number
+  retryCapMs: number
   emptySystemPlaceholder: boolean
 }
 
@@ -105,7 +114,6 @@ async function loadConfig(): Promise<AppConfig> {
     retryMax: 3,
     retryBaseMs: 1_000,
     retryCapMs: 30_000,
->>>>>>> Stashed changes
     emptySystemPlaceholder: true,
   }
 
@@ -120,6 +128,17 @@ async function loadConfig(): Promise<AppConfig> {
   if (!Number.isFinite(config.modelRefreshIntervalMs) || config.modelRefreshIntervalMs < 0) {
     die('config.json "modelRefreshIntervalMs" must be a non-negative number')
   }
+  const mustBePositiveInt = (name: keyof AppConfig, value: number) => {
+    if (!Number.isFinite(value) || value <= 0) die(`config.json "${name}" must be a positive number`)
+  }
+  mustBePositiveInt('maxConcurrencyPerKey', config.maxConcurrencyPerKey)
+  mustBePositiveInt('maxQueuePerKey', config.maxQueuePerKey)
+  mustBePositiveInt('queueTimeoutMs', config.queueTimeoutMs)
+  if (!Number.isFinite(config.retryMax) || config.retryMax < 0) {
+    die('config.json "retryMax" must be a non-negative number')
+  }
+  mustBePositiveInt('retryBaseMs', config.retryBaseMs)
+  mustBePositiveInt('retryCapMs', config.retryCapMs)
 
   if (envNumber('PORT') !== undefined) config.port = envNumber('PORT')!
   if (envString('HOST') !== undefined) config.host = envString('HOST')!
@@ -131,7 +150,41 @@ async function loadConfig(): Promise<AppConfig> {
   if (envBool('CC_USE_PROVIDER_MODELS') !== undefined) config.useProviderModels = envBool('CC_USE_PROVIDER_MODELS')!
   if (envNumber('CC_MODEL_REFRESH_INTERVAL_MS') !== undefined) config.modelRefreshIntervalMs = envNumber('CC_MODEL_REFRESH_INTERVAL_MS')!
   if (envBool('CMD_ZDR') !== undefined) config.zdr = envBool('CMD_ZDR')!
+  const rawStrategy = envString('CC_KEY_SELECTION_STRATEGY')
+  if (rawStrategy) {
+    config.keySelectionStrategy = rawStrategy === 'round-robin' ? 'roundRobin' : rawStrategy === 'affinity' ? 'affinity' : 'roundRobin'
+  }
   if (envBoolDefaultTrue('CC_EMPTY_SYSTEM_PLACEHOLDER') !== undefined) config.emptySystemPlaceholder = envBoolDefaultTrue('CC_EMPTY_SYSTEM_PLACEHOLDER')!
+  if (envNumber('CC_MAX_CONCURRENCY_PER_KEY') !== undefined) {
+    const v = envNumber('CC_MAX_CONCURRENCY_PER_KEY')!
+    if (v <= 0) die(`Invalid value for CC_MAX_CONCURRENCY_PER_KEY: must be positive, got '${process.env.CC_MAX_CONCURRENCY_PER_KEY}'`)
+    config.maxConcurrencyPerKey = v
+  }
+  if (envNumber('CC_MAX_QUEUE_PER_KEY') !== undefined) {
+    const v = envNumber('CC_MAX_QUEUE_PER_KEY')!
+    if (v <= 0) die(`Invalid value for CC_MAX_QUEUE_PER_KEY: must be positive, got '${process.env.CC_MAX_QUEUE_PER_KEY}'`)
+    config.maxQueuePerKey = v
+  }
+  if (envNumber('CC_QUEUE_TIMEOUT_MS') !== undefined) {
+    const v = envNumber('CC_QUEUE_TIMEOUT_MS')!
+    if (v <= 0) die(`Invalid value for CC_QUEUE_TIMEOUT_MS: must be positive, got '${process.env.CC_QUEUE_TIMEOUT_MS}'`)
+    config.queueTimeoutMs = v
+  }
+  if (envNumber('CC_RETRY_MAX') !== undefined) {
+    const v = envNumber('CC_RETRY_MAX')!
+    if (v < 0) die(`Invalid value for CC_RETRY_MAX: must be non-negative, got '${process.env.CC_RETRY_MAX}'`)
+    config.retryMax = Math.floor(v)
+  }
+  if (envNumber('CC_RETRY_BASE_MS') !== undefined) {
+    const v = envNumber('CC_RETRY_BASE_MS')!
+    if (v <= 0) die(`Invalid value for CC_RETRY_BASE_MS: must be positive, got '${process.env.CC_RETRY_BASE_MS}'`)
+    config.retryBaseMs = v
+  }
+  if (envNumber('CC_RETRY_CAP_MS') !== undefined) {
+    const v = envNumber('CC_RETRY_CAP_MS')!
+    if (v <= 0) die(`Invalid value for CC_RETRY_CAP_MS: must be positive, got '${process.env.CC_RETRY_CAP_MS}'`)
+    config.retryCapMs = v
+  }
 
   return config
 }
