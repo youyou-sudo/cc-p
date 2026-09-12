@@ -1,4 +1,4 @@
-import { ApiKeyPool } from '../api-keys'
+import type { ApiKeyPool } from './api-keys'
 
 export interface AppConfig {
   port: number
