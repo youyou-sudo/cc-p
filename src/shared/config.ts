@@ -105,8 +105,6 @@ async function loadConfig(): Promise<AppConfig> {
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,
     zdr: false,
-<<<<<<< Updated upstream
-=======
     maxConcurrencyPerKey: 16,
     maxQueuePerKey: 64,
     queueTimeoutMs: 60_000,
