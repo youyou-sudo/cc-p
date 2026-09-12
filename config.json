@@ -7,5 +7,11 @@
   "logLevel": "info",
   "useProviderModels": true,
   "modelRefreshIntervalMs": 300000,
-  "zdr": false
+  "zdr": false,
+  "maxConcurrencyPerKey": 16,
+  "maxQueuePerKey": 64,
+  "queueTimeoutMs": 60000,
+  "retryMax": 3,
+  "retryBaseMs": 1000,
+  "retryCapMs": 30000
 }

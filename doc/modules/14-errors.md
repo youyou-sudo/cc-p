@@ -24,10 +24,11 @@
 | 19-20 | `CONTEXT_WINDOW_EXCEEDED_PATTERN` | 常量 | E | 超长识别正则：`/prompt.*too long\|context.*(too long\|exceed\|limit\|length)\|max.*tokens\|input.*too (long\|large)\|message.*too long/i` |
 | 22-24 | `isContextWindowExceeded` | 函数 | E | `CONTEXT_WINDOW_EXCEEDED_PATTERN.test(message \|\| '')`，空消息 → `false` |
 | 26 | `CONTEXT_WINDOW_ERROR` | 常量 | E | `{ status: 400, type: 'context_window_exceeded' }`（仅状态与类型，message 用上游原文） |
-| 28-61 | `mapCcError` | 函数 | E | HTTP 非 2xx 响应体 → `MappedError`；先取映射（L29，缺省 502 upstream_error），解析 body 取 message（L32-39），再走超长/429/默认三分支 |
+| `toRetryAfterSeconds` | 函数 | E | 上游 Retry-After（ms）→ 客户端 `retry_after`（秒）：正值 ceil 到秒，否则回退 30；显式值原样透传（不撒谎），供 `mapCcError` 与调用方复用 |
+| 28-70 | `mapCcError` | 函数 | E | HTTP 非 2xx 响应体 → `MappedError`；新增可选第三参 `retryAfterMs`（上游 Retry-After，ms）；先取映射（缺省 502 upstream_error），解析 body 取 message，再走超长/429/默认三分支 |
 | 32-39 | └ 消息解析 | 逻辑 | P | `JSON.parse(ccBody)` → `parsed.error?.message \|\| parsed.message`；解析失败 → `ccBody.slice(0,200)`；均无 → 默认 `CC API error (${ccStatus})` |
 | 41-48 | └ 超长优先 | 逻辑 | P | `isContextWindowExceeded(message)` 命中即返回 `{status:400, body:{error:{message, type:'context_window_exceeded'}}}`，**先于** 429 判断（即使上游报 429 也归 400） |
-| 50-58 | └ 429 分支 | 逻辑 | P | `ccStatus===429` → `{status:429, body:{error:{message,type:'rate_limit_error'}, retry_after:30}}` |
+| 429 分支 | 逻辑 | P | `ccStatus===429` → `{status:429, body:{error:{message,type:'rate_limit_error'}, retry_after: toRetryAfterSeconds(retryAfterMs)}}`（无值回退 30；`sendJSON` 自动同步 `Retry-After` 响应头） |
 | 60 | └ 默认返回 | 逻辑 | P | `{ status: mapped.status, body: { error: { message, type: mapped.type } } }` |
 | 63-84 | `mapCcEventError` | 函数 | E | 流内 `type:'error'` 事件 → `MappedError`；message 取 `event.error?.message \|\| event.message \|\| 'Unknown CC error'` |
 | 65-71 | └ 超长优先 | 逻辑 | P | 同 mapCcError，超长命中即返回 400 `context_window_exceeded`，**先于** `<NNN>` 状态码解析 |

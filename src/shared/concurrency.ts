@@ -1,6 +1,10 @@
 // Per-key concurrency gate: bound in-flight requests per upstream key, queue
 // the overflow with a deadline, fail fast when the queue is full. Covered by
 // test/unit.ts.
+//
+// Isolation key is the effective upstream key (the same `apiKey` string that
+// session.ts / fingerprint.ts / runtime.ts already scope on): one Map bucket
+// per key, keys never share slots. Single-process singleton via proxy-handler.
 
 export class ConcurrencyAborted extends Error {
   constructor(message = 'Concurrency acquire aborted') {
