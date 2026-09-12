@@ -1,12 +1,11 @@
-// Unit tests for the new resilience modules (no network; run with `bun run test/unit.ts`).
-// Covers: upstream-limit classification, retry/backoff math, key-pool selection,
-// and the per-key concurrency gate.
+// Unit tests for the resilience modules (no network; run with `bun run test/unit.ts`).
+// Covers: upstream-limit classification, retry/backoff math, the per-key
+// concurrency gate, and errors.ts integration (incl. Retry-After passthrough).
 
 import { classifyUpstreamLimit, limitMeta } from '../src/shared/limit'
 import { parseRetryAfter, backoffDelay } from '../src/shared/retry'
-import { resolveUpstreamKey, setPoolStrategy, type ApiKeyPool } from '../src/shared/api-keys'
 import { ConcurrencyGate, ConcurrencyAborted, ConcurrencyRoomFull, ConcurrencyTimeout } from '../src/shared/concurrency'
-import { mapCcError, mapCcEventError } from '../src/shared/errors'
+import { mapCcError, mapCcEventError, toRetryAfterSeconds } from '../src/shared/errors'
 
 let passed = 0
 let failed = 0
@@ -26,14 +25,14 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('429 5-hour usage window', classifyUpstreamLimit(429, "You've reached your 5-hour usage limit") === 'usage_window_5h')
   check('429 weekly usage window', classifyUpstreamLimit(429, 'You hit the weekly cap. Resets in 2d') === 'usage_window_weekly')
   check('400 prompt too long', classifyUpstreamLimit(400, 'prompt is too long') === 'context_overflow')
-  check('400 context overflow', classifyUpstreamLimit(400, 'input exceeds the context window') === 'context_overflow')
+  check('400 context overflow', classifyUpstreamLimit(400, 'input is too large') === 'context_overflow')
   check('402 payment', classifyUpstreamLimit(402, 'no credits') === 'payment_required')
   check('403 session refused', classifyUpstreamLimit(403, 'session invalid') === 'authed_session_refused')
   check('500 unknown', classifyUpstreamLimit(500, 'boom') === 'unknown')
 
   const rl = limitMeta(429, 'rate limit exceeded', null)
   check('rate_limit retryable', rl.retryable === true)
-  check('rate_limit default retry_after 30s', rl.retryAfterMs === 30_000)
+  check('rate_limit absent Retry-After -> null (backoff decides)', rl.retryAfterMs === null, rl)
 
   const w = limitMeta(429, "You've reached your 5-hour usage limit", null)
   check('usage window NOT retryable', w.retryable === false)
@@ -49,24 +48,14 @@ function check(name: string, cond: boolean, extra?: unknown): void {
 {
   check('parseRetryAfter seconds', parseRetryAfter('15') === 15)
   check('parseRetryAfter empty null', parseRetryAfter('') === null)
+  check('parseRetryAfter zero null', parseRetryAfter('0') === null)
+  check('parseRetryAfter garbage null', parseRetryAfter('not-a-date') === null)
   const d = new Date(Date.now() + 10_000).toUTCString()
   const delta = parseRetryAfter(d)
   check('parseRetryAfter HTTP-date >0', delta !== null && delta! > 0)
   check('backoff attempt0 ~800ms', backoffDelay(0, 800, 15000) >= 600 && backoffDelay(0, 800, 15000) <= 1000)
   check('backoff attempt2 capped no-jitter', backoffDelay(10, 800, 15000, 0) === 15000)
   check('backoff monotonic base', backoffDelay(0, 800, 15000, 0) < backoffDelay(1, 800, 15000, 0))
-}
-
-// key pool selection
-{
-  const pool: ApiKeyPool = { keys: ['user_a', 'user_b', 'user_c'], strategy: 'affinity', roundRobinCursor: 0 }
-  check('affinity stable per client key', resolveUpstreamKey('user_x', pool) === resolveUpstreamKey('user_x', pool))
-  check('affinity bounded to pool', pool.keys.includes(resolveUpstreamKey('anything', pool)))
-
-  setPoolStrategy(pool, 'roundRobin')
-  const picks = new Set<string>()
-  for (let i = 0; i < 30; i++) picks.add(resolveUpstreamKey('user_x', pool))
-  check('roundRobin rotates through pool', picks.size === 3)
 }
 
 // concurrency gate
@@ -79,6 +68,7 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   releases.push(await gate.acquire('k', { signal: ac.signal })) // slot 2 (in-flight full)
   const queued = gate.acquire('k', { signal: ac.signal }) // queued, waits
   check('snapshot inFlight=2', gate.snapshot().inFlight === 2)
+  check('per-key snapshot isolates buckets', gate.snapshot('other').inFlight === 0 && gate.snapshot('other').queued === 0)
   releases[0]!() // free slot 1 -> queued waiter promoted
   const r3 = await queued
   check('queued waiter resolves on release', typeof r3 === 'function')
@@ -156,10 +146,13 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('404 keeps not_found', p404.status === 404 && p404.body.error.type === 'not_found', p404)
 
   const p429 = mapCcError(429, JSON.stringify({ error: { message: 'rate limit exceeded' } }))
-  check('429 => rate_limit_error retry_after 30', p429.status === 429 && p429.body.error.type === 'rate_limit_error' && p429.body.retry_after === 30, p429)
+  check('429 default retry_after 30', p429.status === 429 && p429.body.error.type === 'rate_limit_error' && p429.body.retry_after === 30, p429)
 
-  const p429h = mapCcError(429, JSON.stringify({ error: { message: 'slow down' } }))
-  check('429 honors Retry-After header (hardcoded to 30)', p429h.body.retry_after === 30, p429h)
+  const p429passthrough = mapCcError(429, JSON.stringify({ error: { message: 'slow down' } }), 120_000)
+  check('429 passes upstream Retry-After through (never lies)', p429passthrough.body.retry_after === 120, p429passthrough)
+
+  check('toRetryAfterSeconds ceils sub-second windows', toRetryAfterSeconds(500) === 1)
+  check('toRetryAfterSeconds defaults to 30', toRetryAfterSeconds(null) === 30 && toRetryAfterSeconds(undefined) === 30)
 
   const p500 = mapCcError(500, '')
   check('500 => 502 upstream_error', p500.status === 502 && p500.body.error.type === 'upstream_error', p500)

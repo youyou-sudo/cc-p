@@ -9,6 +9,10 @@ import type { MappedError } from '../shared/errors'
 import { ensureInitialized } from './fingerprint'
 import { BodyTooLargeError, readJsonBody } from '../shared/http'
 import { log } from '../shared/logger'
+import { CFG } from '../shared/config'
+import { ConcurrencyGate, ConcurrencyRoomFull, ConcurrencyTimeout } from '../shared/concurrency'
+import { limitMeta } from '../shared/limit'
+import { backoffDelay, parseRetryAfter } from '../shared/retry'
 
 export type JsonParseErrorKind = 'too-large' | 'invalid'
 
@@ -75,23 +79,91 @@ export interface UpstreamCallArgs<T> {
   onCcError: (mapped: MappedError) => T
 }
 
-/** ensureInitialized → POST /alpha/generate → map non-2xx (protocol-specific). */
+/** Process-wide gate: one in-flight/queue bucket per effective upstream key
+ *  (the same key string session/fingerprint/runtime already scope on).
+ *  Limits are read from CFG once at module load (CFG itself is frozen after
+ *  loadConfig, same as CORS_HEADERS in shared/http). */
+const gate = new ConcurrencyGate({
+  maxInFlightPerKey: CFG.maxConcurrencyPerKey,
+  maxQueuePerKey: CFG.maxQueuePerKey,
+  queueTimeoutMs: CFG.queueTimeoutMs,
+})
+
+/** Abort-aware sleep for the 429 retry loop. Rejects on abort so a client
+ *  disconnect stops the wait instead of firing one more upstream POST. */
+function sleepCancellable(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve()
+  if (signal.aborted) return Promise.reject(new Error('Upstream aborted'))
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new Error('Upstream aborted'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/** ensureInitialized → gate → POST /alpha/generate (retry rate_limit) → map non-2xx. */
 export async function callUpstream<T>(
   args: UpstreamCallArgs<T>,
 ): Promise<{ ok: true; response: Response } | { ok: false; value: T }> {
   const { apiKey, headers, ccBody, signal, promptCacheKey, label, onCcError } = args
+  let model: unknown = undefined
+  try {
+    model = (ccBody as any)?.params?.model ?? (ccBody as any)?.model
+  } catch { model = undefined }
+  const apiKeySuffix = typeof apiKey === 'string' && apiKey.length > 4 ? apiKey.slice(-4) : '****'
+
   await ensureInitialized(apiKey, signal)
-  const ccResponse = await forwardToCC(ccBody, apiKey, headers, signal, promptCacheKey)
-  if (!ccResponse.ok) {
-    const errorText = await ccResponse.text().catch(() => '')
-    const bodySnippet = errorText.slice(0, 200)
-    let model: unknown = undefined
+
+  let release: (() => void) | null = null
+  try {
     try {
-      model = (ccBody as any)?.params?.model ?? (ccBody as any)?.model
-    } catch { model = undefined }
-    const apiKeySuffix = typeof apiKey === 'string' && apiKey.length > 4 ? apiKey.slice(-4) : '****'
-    log('error', label, { status: ccResponse.status, bodySnippet, model, apiKeySuffix })
-    return { ok: false, value: onCcError(mapCcError(ccResponse.status, errorText)) }
+      release = await gate.acquire(apiKey, { signal })
+    } catch (e: any) {
+      const retryAfter = e instanceof ConcurrencyTimeout ? 2 : 1
+      log('warn', 'Concurrency gate rejected', {
+        label, model, apiKeySuffix,
+        reason: e instanceof ConcurrencyTimeout ? 'queue_timeout' : 'queue_full',
+      })
+      return { ok: false, value: onCcError({ status: 429, body: { error: { message: e?.message ?? 'Concurrency limit exceeded', type: 'rate_limit_error' }, retry_after: retryAfter } }) }
+    }
+
+    const retryMax = Math.max(0, Math.floor(CFG.retryMax))
+    for (let attempt = 0; ; attempt++) {
+      if (signal.aborted) throw new Error('Upstream aborted')
+      let ccResponse: Response
+      try {
+        ccResponse = await forwardToCC(ccBody, apiKey, headers, signal, promptCacheKey)
+      } catch (e: any) {
+        // Client disconnect / handler abort: propagate so the handler returns
+        // 499 / stops the pump; must NOT become a 502 JSON (see timeouts.ts).
+        if (e?.name === 'AbortError' || signal.aborted) throw e
+        log('error', label, { status: 'fetch_error', bodySnippet: e?.message ?? String(e), model, apiKeySuffix, attempt })
+        return { ok: false, value: onCcError(mapCcError(502, e?.message ?? 'Upstream fetch failed')) }
+      }
+      if (ccResponse.ok) return { ok: true, response: ccResponse }
+
+      const errorText = await ccResponse.text().catch(() => '')
+      const headerValue = ccResponse.headers.get('retry-after')
+      const headerSecs = parseRetryAfter(headerValue)
+      const meta = limitMeta(ccResponse.status, errorText, headerSecs)
+      const retryAfterMs = meta.retryAfterMs
+      log('error', label, { status: ccResponse.status, bodySnippet: errorText.slice(0, 200), model, apiKeySuffix, attempt, kind: meta.kind, retryable: meta.retryable })
+      if (!meta.retryable || attempt >= retryMax || signal.aborted) {
+        // Never lie to the client: pass the upstream Retry-After through even
+        // when the local retry loop gives up (e.g. retryAfter > retryCapMs).
+        return { ok: false, value: onCcError(mapCcError(ccResponse.status, errorText, retryAfterMs)) }
+      }
+      // Upstream Retry-After wins; otherwise 1s-start exponential backoff + jitter.
+      const waitMs = retryAfterMs ?? backoffDelay(attempt, Math.max(1, CFG.retryBaseMs), Math.max(1, CFG.retryCapMs))
+      await sleepCancellable(waitMs, signal)
+    }
+  } finally {
+    release?.()
   }
-  return { ok: true, response: ccResponse }
 }

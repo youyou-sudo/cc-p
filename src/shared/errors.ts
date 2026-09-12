@@ -25,7 +25,18 @@ export function isContextWindowExceeded(message: string): boolean {
 
 export const CONTEXT_WINDOW_ERROR = { status: 400, type: 'context_window_exceeded' }
 
-export function mapCcError(ccStatus: number, ccBody?: string): MappedError {
+/** Upstream Retry-After (ms) → client-facing `retry_after` seconds. Falls
+ *  back to 30s when absent; ceils so the client never waits less than the
+ *  upstream window. Never lies: an explicit upstream value is passed through
+ *  even when the local retry loop gives up on it (see proxy-handler). */
+export function toRetryAfterSeconds(retryAfterMs?: number | null): number {
+  if (retryAfterMs != null && Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+    return Math.ceil(retryAfterMs / 1000)
+  }
+  return 30
+}
+
+export function mapCcError(ccStatus: number, ccBody?: string, retryAfterMs?: number | null): MappedError {
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' }
   let message = `CC API error (${ccStatus})`
 
@@ -52,7 +63,7 @@ export function mapCcError(ccStatus: number, ccBody?: string): MappedError {
       status: 429,
       body: {
         error: { message, type: 'rate_limit_error' },
-        retry_after: 30,
+        retry_after: toRetryAfterSeconds(retryAfterMs),
       },
     }
   }
@@ -76,7 +87,7 @@ export function mapCcEventError(event: any): MappedError {
   if (mapped.status === 429) {
     return {
       status: 429,
-      body: { error: { message, type: 'rate_limit_error' }, retry_after: 30 },
+      body: { error: { message, type: 'rate_limit_error' }, retry_after: toRetryAfterSeconds() },
     }
   }
 
