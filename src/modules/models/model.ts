@@ -10,6 +10,13 @@ export const modelEntry = t.Object(
     created: t.Optional(t.Number()),
     owned_by: t.Optional(t.String()),
     context_window: t.Optional(t.Number()),
+    // vision 声明（多别名兼容各客户端解析器，原有字段不动，additionalProperties 仍 true）。
+    modalities: t.Optional(t.Array(t.String())),
+    input_modalities: t.Optional(t.Array(t.String())),
+    supported_modalities: t.Optional(t.Array(t.String())),
+    supports_vision: t.Optional(t.Boolean()),
+    vision: t.Optional(t.Boolean()),
+    features: t.Optional(t.Array(t.String())),
   },
   { additionalProperties: true },
 )

@@ -259,6 +259,7 @@ console.log('--- models ---')
   check('models passthrough context_window', body.data[0]?.context_window === 128000, body.data?.[0])
   check('models alias context_length → context_window', body.data[1]?.context_window === 64000, body.data?.[1])
   check('models static fallback window', body.data[2]?.id === 'claude-sonnet-4-6' && body.data[2]?.context_window === 200000, body.data?.[2])
+  check('models vision default modalities', body.data.every((m: any) => Array.isArray(m.modalities) && m.modalities.includes('image')) && body.data[0]?.supports_vision === true && body.data[0]?.vision === true, body.data?.[0])
 }
 
 console.log('--- openai non-stream ---')

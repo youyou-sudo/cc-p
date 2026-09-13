@@ -42,6 +42,44 @@ function stringifyUnknownContent(content: any): string {
   }
 }
 
+/** Anthropic 形 image source → data:/plain URL（translator.ts 同款逻辑，cc 侧本地一份避免循环）。 */
+function anthropicSourceToUrl(source: any): string {
+  if (!source) return ''
+  if (typeof source === 'string') return source
+  if (typeof source.url === 'string' && source.url) return source.url
+  if (typeof source.data === 'string' && source.data) {
+    const media = source.media_type || source.mediaType || 'image/jpeg'
+    return `data:${media};base64,${source.data}`
+  }
+  return ''
+}
+
+/** 从任意疑似图片分片提取 URL：OpenAI image_url + Anthropic {type:image,source} 兼容。 */
+function extractImageUrl(part: any): string {
+  if (!part || typeof part !== 'object') return ''
+  if (part.type === 'image_url') {
+    const v = part.image_url
+    if (typeof v === 'string') return v
+    if (v && typeof v.url === 'string') return v.url
+    return ''
+  }
+  if (part.type === 'image') {
+    if (typeof part.image === 'string' && part.image) return part.image
+    if (part.image && typeof part.image.url === 'string' && part.image.url) return part.image.url
+    if (typeof part.image_url === 'string' && part.image_url) return part.image_url
+    if (part.image_url && typeof part.image_url.url === 'string') return part.image_url.url
+    if (typeof part.url === 'string' && part.url) return part.url
+    return anthropicSourceToUrl(part.source)
+  }
+  return ''
+}
+
+/** 日志/占位用 URL 缩写：data: URL 只留前缀，避免打爆日志。 */
+function shortUrl(url: string): string {
+  if (url.length <= 120) return url
+  return url.slice(0, 120) + '...'
+}
+
 function isEphemeralCacheControl(v: any): boolean {
   return !!v && v.type === 'ephemeral'
 }
@@ -141,7 +179,16 @@ export function buildCcRequest(openaiReq: any): any {
   const systemMsgs = messages.filter((m: any) => m.role === 'system' || m.role === 'developer')
   const systemPrompt = systemMsgs.map((m: any) => {
     if (typeof m.content === 'string') return m.content
-    if (Array.isArray(m.content)) return m.content.map((c: any) => c?.text ?? c?.content ?? '').join('\n')
+    if (Array.isArray(m.content)) return m.content.map((c: any) => {
+      if (c?.type === 'text') return c.text ?? ''
+      if (c?.type === 'image_url' || c?.type === 'image') {
+        // CC system param 只支持 string：图片转占位说明，不静默丢。
+        const url = extractImageUrl(c)
+        log('warn', 'cc system image demoted to placeholder', { url: url ? shortUrl(url) : '(empty)' })
+        return url ? `[image: ${shortUrl(url)}]` : '[image omitted: empty url]'
+      }
+      return c?.text ?? c?.content ?? ''
+    }).join('\n')
     return m.content == null ? '' : stringifyUnknownContent(m.content)
   }).join('\n')
   const chatMessages = messages.filter((m: any) => m.role !== 'system' && m.role !== 'developer')
@@ -164,14 +211,17 @@ export function buildCcRequest(openaiReq: any): any {
       }
       if (Array.isArray(msg.content)) {
         const parts = msg.content.map((part: any) => {
-          if (part.type === 'image_url') {
-            const url = part.image_url?.url || ''
+          if (part.type === 'image_url' || part.type === 'image') {
+            const url = extractImageUrl(part)
             if (!url) {
-              log('warn', 'cc image omitted: empty url', {})
-              return null
+              log('warn', 'cc image omitted: empty url', { partType: part?.type || '' })
+              return { type: 'text', text: '[image omitted: empty url]' }
             }
             if (typeof url === 'string' && url.startsWith('data:') && url.length > 10 * 1024 * 1024) {
               log('warn', 'cc image large dataURL', { bytes: url.length })
+            }
+            if (part.type === 'image') {
+              log('warn', 'cc anthropic-shape image normalized to image_url chain', { url: shortUrl(url) })
             }
             const img: any = { type: 'image', image: url }
             const cc = pickEphemeralCacheControl(part?.cache_control)
@@ -194,6 +244,20 @@ export function buildCcRequest(openaiReq: any): any {
       } else if (msg.content && Array.isArray(msg.content)) {
         for (const part of msg.content) {
           if (part.type === 'text') parts.push(stripNonEphemeralCacheControl(part))
+          else if (part.type === 'image_url' || part.type === 'image') {
+            const url = extractImageUrl(part)
+            if (!url) {
+              log('warn', 'cc assistant image omitted: empty url', {})
+              continue
+            }
+            log('warn', 'cc assistant image preserved', { url: shortUrl(url) })
+            const img: any = { type: 'image', image: url }
+            const cc = pickEphemeralCacheControl(part?.cache_control)
+            if (cc) img.cache_control = cc
+            parts.push(img)
+          } else if (part?.type) {
+            log('warn', 'cc assistant part dropped', { partType: part.type })
+          }
         }
       }
       if (msg.tool_calls) {
@@ -233,13 +297,32 @@ export function buildCcRequest(openaiReq: any): any {
       if (!hasExplicitName && !mappedName) {
         log('warn', 'cc tool-result unknown_tool fallback', { tool_call_id: msg.tool_call_id || '' })
       }
+      let toolText: string
+      if (typeof msg.content === 'string') {
+        toolText = msg.content
+      } else if (Array.isArray(msg.content)) {
+        toolText = msg.content.map((c: any) => {
+          if (c == null) return ''
+          if (typeof c === 'string') return c
+          if (c.type === 'text') return c.text || ''
+          if (c.type === 'image_url' || c.type === 'image') {
+            const url = extractImageUrl(c)
+            log('warn', 'cc tool image demoted to placeholder', { url: url ? shortUrl(url) : '(empty)' })
+            return url ? `[image: ${shortUrl(url)}]` : '[image omitted: empty url]'
+          }
+          if (typeof c.text === 'string') return c.text
+          try { return JSON.stringify(c) } catch { return String(c) }
+        }).join('\n')
+      } else {
+        toolText = JSON.stringify(msg.content)
+      }
       return {
         role: 'tool',
         content: [{
           type: 'tool-result',
           toolCallId: msg.tool_call_id,
           toolName,
-          output: { type: 'text', value: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) },
+          output: { type: 'text', value: toolText },
         }],
       }
     }

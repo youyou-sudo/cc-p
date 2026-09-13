@@ -10,6 +10,43 @@ export interface ModelEntry {
   name: string
   context_window?: number
   max_output_tokens?: number
+  // vision 归一化字段：上游透传保留，缺失则默认 text+image（见 VISION_DEFAULT_MODALITIES）。
+  modalities?: string[]
+  input_modalities?: string[]
+  capabilities?: Record<string, unknown> | string[]
+}
+
+// 为什么默认全系 vision：上游 CC 的 image 分片是通用透传
+// （src/infra/cc.ts image_url→{type:image} 无条件），不按模型名黑白名单卡控。
+// 若上游显式声明了 modalities/capabilities 则保留归一，否则默认 text+image。
+export const VISION_DEFAULT_MODALITIES = ['text', 'image'] as const
+
+function hasVision(m: any): boolean {
+  if (!m || typeof m !== 'object') return false
+  const mods: unknown[] = [m.modalities, m.input_modalities, m.supported_modalities, m.output_modalities]
+  for (const v of mods) {
+    if (Array.isArray(v) && v.map(String).map((s: string) => s.toLowerCase()).includes('image')) return true
+  }
+  const caps = m.capabilities
+  if (Array.isArray(caps) && caps.map(String).map((s: string) => s.toLowerCase()).some((s: string) => s.includes('vision') || s.includes('image'))) return true
+  if (caps && typeof caps === 'object' && ((caps as any).vision === true || (caps as any).image === true)) return true
+  if (m.supports_vision === true || m.vision === true) return true
+  if (Array.isArray(m.features) && m.features.map(String).map((s: string) => s.toLowerCase()).includes('vision')) return true
+  return false
+}
+
+function pickModalities(m: any): string[] {
+  const raw = m.modalities ?? m.input_modalities ?? m.supported_modalities
+  if (Array.isArray(raw) && raw.length > 0) {
+    const norm = [...new Set(raw.map(String).map((s: string) => s.toLowerCase()))]
+    if (!norm.includes('text')) norm.unshift('text')
+    // 上游显式声明了 modalities：若含 image/vision 能力则补齐 image，否则原样保留
+    //（避免把纯文本模型误标 vision）；上游完全没声明时由调用方默认 text+image。
+    if (hasVision(m) && !norm.includes('image')) norm.push('image')
+    return norm
+  }
+  // 上游无声明：默认全系 vision（通用透传）。
+  return [...VISION_DEFAULT_MODALITIES]
 }
 
 export const MODELS: ModelEntry[] = [
@@ -110,6 +147,12 @@ async function doFetchModels(apiKey: string | null | undefined): Promise<ModelEn
           entry.context_window = STATIC_WINDOW_BY_ID.get(m.id) ?? upstreamWindow ?? 0
           const maxOut = pickMaxOutputTokens(m)
           if (maxOut !== undefined) entry.max_output_tokens = maxOut
+          // vision 归一：上游有声明则保留归一，无声明默认 text+image（通用透传）。
+          entry.modalities = pickModalities(m)
+          entry.input_modalities = [...entry.modalities]
+          // 上游 capabilities 若为对象/数组则透传归一，否则默认 vision 标记。
+          if (m.capabilities && typeof m.capabilities === 'object') entry.capabilities = m.capabilities
+          else entry.capabilities = { vision: true }
           return entry
         })
         dynamicModels = models
@@ -154,12 +197,25 @@ export async function handleModels(headers: Record<string, string | undefined>):
   const now = nowUnix()
   return sendJSON(200, {
     object: 'list',
-    data: models.map((m) => ({
-      id: m.id,
-      object: 'model',
-      created: now,
-      owned_by: 'command-code',
-      ...(m.context_window !== undefined ? { context_window: m.context_window } : {}),
-    })),
+    data: models.map((m) => {
+      // 响应层统一 vision 声明：entry 自带则用之，否则默认 text+image。
+      // 多别名兼容不同客户端解析器（opencode/OpenAI 生态各取所需），原有字段不动。
+      const mods = m.modalities && m.modalities.length > 0 ? m.modalities : [...VISION_DEFAULT_MODALITIES]
+      const inMods = m.input_modalities && m.input_modalities.length > 0 ? m.input_modalities : [...mods]
+      return {
+        id: m.id,
+        object: 'model',
+        created: now,
+        owned_by: 'command-code',
+        ...(m.context_window !== undefined ? { context_window: m.context_window } : {}),
+        modalities: mods,
+        input_modalities: inMods,
+        supported_modalities: [...mods],
+        capabilities: m.capabilities ?? { vision: true },
+        features: ['vision'],
+        supports_vision: true,
+        vision: true,
+      }
+    }),
   })
 }

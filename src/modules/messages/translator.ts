@@ -81,7 +81,11 @@ function toolResultContentToText(content: any): string {
       if (c == null) return ''
       if (typeof c === 'string') return c
       if (c.type === 'text') return c.text || ''
-      if (c.type === 'image') return '[image omitted]'
+      if (c.type === 'image') {
+        const url = anthropicSourceToUrl(c.source)
+        log('warn', 'tool_result image demoted to placeholder', { url: url ? (url.length <= 120 ? url : url.slice(0, 120) + '...') : '(empty)' })
+        return url ? `[image: ${url.length <= 120 ? url : url.slice(0, 120) + '...'}]` : '[image omitted]'
+      }
       if (c.text) return c.text
       return ''
     }).join('')
@@ -117,10 +121,19 @@ export function convertAnthropicToOpenAI(anthropicReq: any): any {
       const textParts: string[] = []
       const reasoningParts: string[] = []
       const toolCalls: any[] = []
+      const imageParts: any[] = []
       const blocks = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content || '' }]
       for (const block of blocks) {
         if (block.type === 'text') {
           if (block.text) textParts.push(block.text)
+        } else if (block.type === 'image') {
+          // Assistant 历史图片不断点：收为 image_url 由 cc.ts 原样透传（与 user 路一致）。
+          const url = anthropicSourceToUrl(block.source)
+          if (url) {
+            const imgPart: any = { type: 'image_url', image_url: { url } }
+            if (block.cache_control?.type === 'ephemeral') imgPart.cache_control = { type: 'ephemeral' }
+            imageParts.push(imgPart)
+          }
         } else if (block.type === 'tool_use') {
           toolNameFromId[block.id] = block.name
           toolCalls.push({
@@ -140,7 +153,15 @@ export function convertAnthropicToOpenAI(anthropicReq: any): any {
       }
       // Multi-text blocks joined with \n\n (preserve paragraph boundaries).
       const textContent = textParts.join('\n\n')
-      const assistantMsg: any = { role: 'assistant', content: textContent || null }
+      // assistant content 形：纯文本走 string/null；含图片走数组（cc.ts assistant 分支透传 image_url）。
+      let assistantContent: any = textContent || null
+      if (imageParts.length > 0) {
+        const arr: any[] = []
+        if (textContent) arr.push({ type: 'text', text: textContent })
+        arr.push(...imageParts)
+        assistantContent = arr
+      }
+      const assistantMsg: any = { role: 'assistant', content: assistantContent }
       if (reasoningParts.length > 0) assistantMsg.reasoning_content = reasoningParts.join('\n\n')
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls
       openaiMessages.push(assistantMsg)
