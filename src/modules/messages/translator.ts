@@ -1,6 +1,7 @@
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
 import { mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
+import { createToolCallIdGuard } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { uuid } from '../../shared/util'
 
@@ -365,7 +366,15 @@ export function createAnthropicSseTranslator(
     return startBlock('thinking', { type: 'thinking', thinking: '' })
   }
 
+  const isDuplicateToolCallId = createToolCallIdGuard()
+
   function emitToolUseBlock(id: string, name: string, inputJson: string): string[] {
+    // 同一 id 二次出现必须跳过（见 createToolCallIdGuard），否则客户端回传重复
+    // tool_use id，上游 400。
+    if (isDuplicateToolCallId(id)) {
+      log('warn', 'cc duplicate tool-call id suppressed (stream)', { toolCallId: id })
+      return []
+    }
     const out: string[] = []
     const close = closeBlock()
     if (close) out.push(close)

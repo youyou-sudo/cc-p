@@ -1,6 +1,8 @@
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
 import { mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
+import { createToolCallIdGuard } from '../../shared/cc-types'
+import { log } from '../../shared/logger'
 import { uuid } from '../../shared/util'
 import { EMPTY_THINKING_SIGNATURE } from './translator'
 
@@ -128,7 +130,14 @@ export function createMessagesAggregator(opts?: { onEventError?: (event: any, ma
   // tool-input-* incremental accumulation for large params.
   let pendingToolInput: { id: string; name: string; json: string } | null = null
 
+  const isDuplicateToolCallId = createToolCallIdGuard()
+
   function pushToolCall(id: string, name: string, argsStr: string): void {
+    // 同一 id 二次出现必须丢弃（见 createToolCallIdGuard）。
+    if (isDuplicateToolCallId(id)) {
+      log('warn', 'cc duplicate tool-call id suppressed (aggregate)', { toolCallId: id })
+      return
+    }
     toolCalls = toolCalls || []
     toolCalls.push({
       id: id || ('call_' + uuid().slice(0, 8)),

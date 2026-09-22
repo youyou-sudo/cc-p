@@ -51,6 +51,24 @@ export function normalizeCcUsage(raw: any): CcUsage | undefined {
   return out
 }
 
+/** 上游会重复投递同一个 tool call：同一个 id 既可能出现在权威的 `tool-call`
+ *  事件里，又可能在后随的 `tool-input-end` 里再出现一次（两条路径各自独立发射），
+ *  重连/重试时也可能被重放。参考实现（cmdcode2api 的 toolCallDeduper）同样按 id 去重。
+ *  一旦重复 id 流到客户端，客户端会把两条同 id 的 tool call 回传，上游随即用
+ *  "Duplicate value for 'tool_call_id' of X in message[N]" 400 掉整个会话。
+ *
+ *  返回 true = 该 id 已出现过，调用方必须跳过这一次发射/收集。
+ *  空 id 一律放行（调用方会生成唯一兜底 id，不是上游的重复投递）。 */
+export function createToolCallIdGuard(): (id: string) => boolean {
+  const seen = new Set<string>()
+  return (id: string): boolean => {
+    if (!id) return false
+    if (seen.has(id)) return true
+    seen.add(id)
+    return false
+  }
+}
+
 // ── NDJSON stream events ────────────────────────────────────────────────
 
 export interface CcStartEvent { type: 'start' }

@@ -100,6 +100,18 @@ Bun.serve({
             { type: 'abort' },
             { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 200, outputTokens: 30, inputTokenDetails: { cacheReadTokens: 120, cacheWriteTokens: 40, cacheWriteTokens1h: 10 } } },
           ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        case 'mock/dup-tool':
+          // 上游对同一个 tool call 重复投递：权威的 tool-call 之后又跟一份
+          // tool-input-* 携带同一 id（真实上游如此，cmdcode2api 也为此做了去重）。
+          return new Response(ndjson([
+            { type: 'start' },
+            { type: 'text-delta', text: 'go' },
+            { type: 'tool-call', toolCallId: 'call_dup_1', toolName: 'get_weather', input: { city: 'SF' } },
+            { type: 'tool-input-start', toolCallId: 'call_dup_1', toolName: 'get_weather' },
+            { type: 'tool-input-delta', toolCallId: 'call_dup_1', delta: '{"city":"SF"}' },
+            { type: 'tool-input-end', toolCallId: 'call_dup_1', input: { city: 'SF' } },
+            { type: 'finish', finishReason: 'tool-calls', totalUsage: { inputTokens: 5, outputTokens: 3, cachedInputTokens: 0 } },
+          ]), { headers: { 'content-type': 'application/x-ndjson' } })
         case 'mock/structured-error':
           // 官方 1.62.1 流式错误形状（statusCode/isRetryable）+ 终局标记。
           return new Response(ndjson([
@@ -477,6 +489,71 @@ console.log('--- upstream wire shape: usage / tool-result / abort / structured e
   check('thinking history replayed as {type:reasoning}', assistantMsg?.content?.[0]?.type === 'reasoning' && assistantMsg.content[0].text === 'because reasons', assistantMsg)
 }
 
+console.log('--- duplicate tool_call_id: response-side dedupe + request-side repair ---')
+{
+  // 非流式：上游重复投递同一 call，客户端只能看到一条
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/dup-tool', messages: [{ role: 'user', content: 'q' }] }),
+  })
+  const body = await r.json()
+  const tcs = body.choices?.[0]?.message?.tool_calls
+  check('dup tool-call deduped (non-stream)', Array.isArray(tcs) && tcs.length === 1 && tcs[0].id === 'call_dup_1', tcs)
+}
+{
+  // 流式：tool-call 之后不得再为同一 id 补发一条 tool_calls chunk
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/dup-tool', stream: true, messages: [{ role: 'user', content: 'q' }] }),
+  })
+  const text = await r.text()
+  const chunks = text.split('\n').filter((l) => l.startsWith('data: ') && !l.includes('[DONE]'))
+    .map((l) => JSON.parse(l.slice(6)))
+  const emitted = chunks.flatMap((c: any) => c.choices?.[0]?.delta?.tool_calls ?? [])
+  check('dup tool-call deduped (stream)', emitted.length === 1 && emitted[0].id === 'call_dup_1', emitted)
+}
+{
+  // Anthropic 侧同一去重：只能出现一个 tool_use 块
+  const r = await fetch(BASE + '/v1/messages', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
+    body: JSON.stringify({ model: 'mock/dup-tool', max_tokens: 100, messages: [{ role: 'user', content: 'q' }] }),
+  })
+  const body = await r.json()
+  const uses = (body.content ?? []).filter((b: any) => b.type === 'tool_use')
+  check('dup tool-call deduped (anthropic)', uses.length === 1 && uses[0].id === 'call_dup_1', body.content)
+}
+{
+  // 请求侧修复：历史里已沉淀重复 id（客户端曾收到重复 call 后回传），
+  // 代理必须换发唯一 id 并按序重新配对 tool-result，而不是把 400 透传给用户。
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({
+      model: 'mock/params',
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          tool_calls: [
+            { id: 'call_dup_hist', type: 'function', function: { name: 'get_weather', arguments: '{"city":"SF"}' } },
+            { id: 'call_dup_hist', type: 'function', function: { name: 'get_weather', arguments: '{"city":"NY"}' } },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'call_dup_hist', name: 'get_weather', content: 'SF sunny' },
+        { role: 'tool', tool_call_id: 'call_dup_hist', name: 'get_weather', content: 'NY rain' },
+        { role: 'user', content: 'and?' },
+      ],
+    }),
+  })
+  await r.json()
+  const s = await statsFetch()
+  const msgs = s.lastGenerateBody.params.messages
+  const parts = msgs.flatMap((m: any) => (Array.isArray(m.content) ? m.content : []))
+  const callIds = parts.filter((p: any) => p.type === 'tool-call').map((p: any) => p.toolCallId)
+  const resultIds = parts.filter((p: any) => p.type === 'tool-result').map((p: any) => p.toolCallId)
+  check('history dup tool_call_id repaired to unique', callIds.length === 2 && new Set(callIds).size === 2, callIds)
+  check('history tool results re-paired in order', resultIds.length === 2 && resultIds[0] === callIds[0] && resultIds[1] === callIds[1], { callIds, resultIds })
+}
+
 console.log('--- zero output / upstream errors ---')
 {
   const r = await fetch(BASE + '/v1/chat/completions', {
@@ -716,7 +793,7 @@ console.log('--- responses params passthrough ---')
   check('responses top_p withheld from CLI wire', b.params.top_p === undefined, b.params)
   check('responses reasoning.effort → reasoning_effort', b.params.reasoning_effort === 'high', b.params)
   check('responses metadata.user_id withheld from CLI wire', b.params.user === undefined, b.params.user)
-  check('responses tool_choice withheld from CLI wire', b.params.tool_choice === undefined, b.params.tool_choice)
+  check('responses tool_choice forwarded (tool semantics never dropped)', b.params.tool_choice?.type === 'tool' && b.params.tool_choice?.name === 'get_weather', b.params.tool_choice)
   check('responses stateless fields ignored', b.params.store === undefined && b.params.previous_response_id === undefined && b.params.include === undefined, b.params)
 }
 

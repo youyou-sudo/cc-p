@@ -13,7 +13,7 @@ import { classifyUpstreamLimit, limitMeta } from '../src/shared/limit'
 import { parseRetryAfter, backoffDelay } from '../src/shared/retry'
 import { ConcurrencyGate, ConcurrencyAborted, ConcurrencyRoomFull, ConcurrencyTimeout } from '../src/shared/concurrency'
 import { mapCcError, mapCcEventError, toRetryAfterSeconds } from '../src/shared/errors'
-import { normalizeCcUsage } from '../src/shared/cc-types'
+import { normalizeCcUsage, createToolCallIdGuard } from '../src/shared/cc-types'
 import { generateSessionId, uuidFromSeed } from '../src/shared/util'
 
 let passed = 0
@@ -83,6 +83,12 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('generateSessionId sess_ + 16 hex', sid.length === 21 && sid.startsWith('sess_') && /^[0-9a-f]+$/.test(sid.slice(5)))
   const tid = uuidFromSeed('sess_0123456789abcdef')
   check('uuidFromSeed deterministic v4 shape', tid.length === 36 && tid === uuidFromSeed('sess_0123456789abcdef') && tid[14] === '4' && '89ab'.includes(tid[19]), tid)
+
+  const guard = createToolCallIdGuard()
+  check('tool-call guard: first id passes', guard('call_a') === false)
+  check('tool-call guard: repeat id suppressed', guard('call_a') === true)
+  check('tool-call guard: other id passes', guard('call_b') === false)
+  check('tool-call guard: empty id always passes', guard('') === false && guard('') === false)
 }
 
 // retry / backoff

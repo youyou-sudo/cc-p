@@ -162,6 +162,72 @@ function normalizeStop(stop: any): any {
   badRequest(`Invalid stop: expected string|string[], got ${JSON.stringify(stop)}`)
 }
 
+/** 上游对重复 tool_call_id 零容忍：一旦历史里出现重复，整个会话会被
+ *  "Duplicate value for 'tool_call_id' of X in message[N]" 永久 400。
+ *  重复主要来自上游重复投递 tool-call（各 translator 已按 id 去重，见
+ *  createToolCallIdGuard），但客户端历史里可能已经沉淀了重复，所以这里再做一层
+ *  收敛修复：
+ *   - 设某 id 在 assistant tool-call 中出现 A 次、在 tool-result 中出现 R 次；
+ *   - R < A：丢弃多余的重复调用（只留前 R 个），避免出现无结果的裸调用；
+ *   - R >= A：保留全部调用，第 2..A 次换发新 id，并按出现顺序重新配对
+ *     tool-result（不丢任何工具结果）。
+ *  没有重复时是纯 no-op，不触碰任何 id。 */
+function repairDuplicateToolCallIds(ccMessages: any[]): number {
+  const callSlots = new Map<string, Array<{ msg: any; part: any }>>()
+  const resultSlots = new Map<string, Array<{ msg: any; part: any }>>()
+  for (const msg of ccMessages) {
+    if (!Array.isArray(msg?.content)) continue
+    for (const part of msg.content) {
+      const id = typeof part?.toolCallId === 'string' ? part.toolCallId : ''
+      if (!id) continue
+      const bucket = part.type === 'tool-call' ? callSlots
+        : part.type === 'tool-result' ? resultSlots
+          : null
+      if (!bucket) continue
+      const list = bucket.get(id) ?? []
+      list.push({ msg, part })
+      bucket.set(id, list)
+    }
+  }
+
+  let repaired = 0
+  for (const [id, calls] of callSlots) {
+    if (calls.length <= 1) continue
+    const results = resultSlots.get(id) ?? []
+    const keep = Math.min(calls.length, Math.max(results.length, 1))
+    log('warn', 'cc duplicate tool_call_id in history', { toolCallId: id, calls: calls.length, results: results.length, keep })
+
+    // 多余重复：整块移除（无对应结果的裸调用上游同样会拒）。
+    const touched = new Set<any>()
+    for (let i = keep; i < calls.length; i++) {
+      const { msg, part } = calls[i]!
+      msg.content = msg.content.filter((p: any) => p !== part)
+      touched.add(msg)
+      repaired++
+    }
+
+    // 保留的重复调用：第 2..keep 次换新 id，并按序重映射对应结果。
+    for (let i = 1; i < keep; i++) {
+      const newId = `call_${randHex(10)}`
+      calls[i]!.part.toolCallId = newId
+      const target = results[i]
+      if (target) target.part.toolCallId = newId
+      repaired++
+    }
+
+    // 被清空的 assistant 消息整条移除，避免上游收到空 content。
+    for (const msg of touched) {
+      if (Array.isArray(msg.content) && msg.content.length === 0) {
+        const idx = ccMessages.indexOf(msg)
+        if (idx >= 0) ccMessages.splice(idx, 1)
+      }
+    }
+  }
+
+  if (repaired > 0) log('warn', 'cc repaired duplicate tool_call_id in history', { repaired })
+  return repaired
+}
+
 export function buildCcRequest(openaiReq: any): any {
   const { model, messages, max_tokens, temperature, tools, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key, top_p, stop, user, seed } = openaiReq
 
@@ -345,6 +411,9 @@ export function buildCcRequest(openaiReq: any): any {
     return { role: 'user', content: [{ type: 'text', text: stringifyUnknownContent(msg.content ?? '') }] }
   })
 
+  // 收敛历史里的重复 tool_call_id（上游对此零容忍，见 repairDuplicateToolCallIds）。
+  repairDuplicateToolCallIds(ccMessages)
+
   const hasMessageCacheMarker = ccMessages.some((msg: any) =>
     Array.isArray(msg.content) && msg.content.some((part: any) => part?.cache_control))
   if (prompt_cache_key && !hasMessageCacheMarker) {
@@ -419,33 +488,37 @@ export function buildCcRequest(openaiReq: any): any {
       return out
     })
   }
-  // 采样/工具控制参数默认不外发：官方 /alpha/generate 只带 model/messages/tools/
-  // system/max_tokens/stream/temperature?/reasoning_effort?，多带 top_p/stop/user/
-  // seed/tool_choice/parallel_tool_calls 会让请求体与真实 CLI 不一致（可被风控识别）。
-  // 客户端仍可传这些字段（schema 不变、非法值照旧 400），只是不再转发；
-  // CC_FORWARD_SAMPLING_PARAMS=true 可恢复旧行为（见 shared/config.ts）。
-  if (FORWARD_SAMPLING_PARAMS) {
-    if (tool_choice !== undefined) {
-      if (typeof tool_choice === 'string') {
-        const map: Record<string, string> = { 'auto': 'auto', 'none': 'none', 'required': 'any' }
-        ;(body.params as any).tool_choice = { type: map[tool_choice] || 'auto' }
-      } else if (tool_choice && tool_choice.type === 'function') {
-        const out: any = { type: 'tool', name: tool_choice.function?.name }
-        // 显式透传并行/白名单开关，未知键也不丢（避免静默降级）。
-        if (tool_choice.allowed_tools !== undefined) out.allowed_tools = tool_choice.allowed_tools
-        if (tool_choice.disable_parallel_tool_use !== undefined) out.disable_parallel_tool_use = tool_choice.disable_parallel_tool_use
-        for (const k of Object.keys(tool_choice)) {
-          if (!(k in out) && k !== 'type' && k !== 'function') out[k] = tool_choice[k]
-        }
-        ;(body.params as any).tool_choice = out
-      } else {
-        // 未知对象（含 allowed_tools / disable_parallel_tool_use）整体透传不丢。
-        ;(body.params as any).tool_choice = tool_choice
+  // 工具协议字段无条件转发：tool_choice / parallel_tool_calls 决定「怎么调用工具」，
+  // 丢掉会改变工具调用语义（客户端要求串行/强制某个工具时会被静默降级），
+  // 风险高于指纹收益。它们不在下面的采样参数收敛范围内。
+  if (tool_choice !== undefined) {
+    if (typeof tool_choice === 'string') {
+      const map: Record<string, string> = { 'auto': 'auto', 'none': 'none', 'required': 'any' }
+      ;(body.params as any).tool_choice = { type: map[tool_choice] || 'auto' }
+    } else if (tool_choice && tool_choice.type === 'function') {
+      const out: any = { type: 'tool', name: tool_choice.function?.name }
+      // 显式透传并行/白名单开关，未知键也不丢（避免静默降级）。
+      if (tool_choice.allowed_tools !== undefined) out.allowed_tools = tool_choice.allowed_tools
+      if (tool_choice.disable_parallel_tool_use !== undefined) out.disable_parallel_tool_use = tool_choice.disable_parallel_tool_use
+      for (const k of Object.keys(tool_choice)) {
+        if (!(k in out) && k !== 'type' && k !== 'function') out[k] = tool_choice[k]
       }
+      ;(body.params as any).tool_choice = out
+    } else {
+      // 未知对象（含 allowed_tools / disable_parallel_tool_use）整体透传不丢。
+      ;(body.params as any).tool_choice = tool_choice
     }
-    if (parallel_tool_calls !== undefined) {
-      ;(body.params as any).parallel_tool_calls = parallel_tool_calls
-    }
+  }
+  if (parallel_tool_calls !== undefined) {
+    ;(body.params as any).parallel_tool_calls = parallel_tool_calls
+  }
+
+  // 采样/提示参数默认不外发：官方 /alpha/generate 只带 model/messages/tools/
+  // system/max_tokens/stream/temperature?/reasoning_effort?，多带 top_p/stop/user/
+  // seed 会让请求体与真实 CLI 不一致（可被风控识别）。客户端仍可传这些字段
+  // （schema 不变、非法值照旧 400），只是不再转发；CC_FORWARD_SAMPLING_PARAMS=true
+  // 可恢复旧行为（见 shared/config.ts）。
+  if (FORWARD_SAMPLING_PARAMS) {
     if (top_p !== undefined) {
       ;(body.params as any).top_p = top_p
     }
@@ -459,10 +532,8 @@ export function buildCcRequest(openaiReq: any): any {
       ;(body.params as any).seed = seed
     }
   } else {
-    log('debug', 'cc sampling/tool-control params not forwarded (faithful CLI wire)', {
+    log('debug', 'cc sampling params not forwarded (faithful CLI wire)', {
       dropped: [
-        tool_choice !== undefined ? 'tool_choice' : '',
-        parallel_tool_calls !== undefined ? 'parallel_tool_calls' : '',
         top_p !== undefined ? 'top_p' : '',
         normalizedStop !== undefined ? 'stop' : '',
         user !== undefined ? 'user' : '',

@@ -2,6 +2,7 @@
 // Pure streaming translation, no I/O.
 
 import { mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
+import { createToolCallIdGuard } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
@@ -83,7 +84,15 @@ export function createSseTranslator(model: string, completionId: string, created
   const cachedInputTokens = { value: 0 }
   let bytesReceived = 0
 
+  const isDuplicateToolCallId = createToolCallIdGuard()
+
   function emitToolCallChunk(id: string, name: string, argsStr: string): string {
+    // 同一 id 二次出现（tool-call 后又来 tool-input-end，或上游重放）必须跳过：
+    // 重复 tool_call_id 会让客户端回传两份相同 id，上游 400 掉整个会话。
+    if (isDuplicateToolCallId(id)) {
+      log('warn', 'cc duplicate tool-call id suppressed (stream)', { toolCallId: id })
+      return ''
+    }
     hasToolCall = true
     const finalId = id || `call_${Date.now()}_${toolCallIndex}`
     const tcEntry = { index: toolCallIndex, id: finalId, type: 'function', function: { name: name || '', arguments: argsStr } }

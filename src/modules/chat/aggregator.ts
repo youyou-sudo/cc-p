@@ -1,6 +1,8 @@
 // Non-streaming aggregation + response building. Pure, no I/O.
 
 import { mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
+import { createToolCallIdGuard } from '../../shared/cc-types'
+import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
 import { uuid } from '../../shared/util'
@@ -103,7 +105,15 @@ export function createChatAggregator(opts?: { onEventError?: (event: any, mapped
   // tool-input-* incremental accumulation for large params (flushed on end or result()).
   let pendingToolInput: { id: string; name: string; json: string } | null = null
 
+  const isDuplicateToolCallId = createToolCallIdGuard()
+
   function pushToolCall(id: string, name: string, argsStr: string): void {
+    // 同一 id 二次出现必须丢弃（见 createToolCallIdGuard）：非流式下它会变成
+    // 响应里两条同 id 的 tool_calls，客户端回传后上游 400。
+    if (isDuplicateToolCallId(id)) {
+      log('warn', 'cc duplicate tool-call id suppressed (aggregate)', { toolCallId: id })
+      return
+    }
     toolCalls = toolCalls || []
     toolCalls.push({
       id: id || ('call_' + uuid().slice(0, 8)),

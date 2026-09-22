@@ -3,6 +3,8 @@
 // 多步 finish 优先级、tool-input-* 增量缓冲），仅出口对象换成 Responses 形。
 
 import { mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
+import { createToolCallIdGuard } from '../../shared/cc-types'
+import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
 import { uuid } from '../../shared/util'
@@ -80,7 +82,14 @@ export function createResponsesAggregator(opts?: { onEventError?: (event: any, m
   // tool-input-* incremental accumulation for large params (flushed on end or result()).
   let pendingToolInput: { id: string; name: string; json: string } | null = null
 
+  const isDuplicateToolCallId = createToolCallIdGuard()
+
   function pushToolCall(id: string, name: string, argsStr: string): void {
+    // 同一 id 二次出现必须丢弃（见 createToolCallIdGuard）。
+    if (isDuplicateToolCallId(id)) {
+      log('warn', 'cc duplicate tool-call id suppressed (aggregate)', { toolCallId: id })
+      return
+    }
     toolCalls = toolCalls || []
     toolCalls.push({
       id: id || ('call_' + uuid().slice(0, 8)),

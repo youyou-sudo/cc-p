@@ -179,7 +179,7 @@ Bun 启动时自动加载 `.env`。空值 = 沿用 `config.json`；真实 shell 
 | `CC_STREAM_IDLE_MS` | ——（仅环境变量） | `30000` |
 | `CC_NONSTREAM_IDLE_MS` | ——（仅环境变量） | `90000` |
 | `CC_THINKING_IDLE_MS` | ——（仅环境变量） | `120000`（思考期宽限：`start`/`start-step`/`reasoning-start`/`reasoning-delta`；深度推理/高 `reasoning_effort` 建议 `180000`；调大代价是真 hang 时失败感知更慢） |
-| `CC_FORWARD_SAMPLING_PARAMS` | ——（仅环境变量） | `false`（忠实复刻 CLI 线格式：`top_p` / `stop` / `user` / `seed` / `tool_choice` / `parallel_tool_calls` 仍接受但不外发，因为官方 CLI 从不发送；设 `true` 恢复透传） |
+| `CC_FORWARD_SAMPLING_PARAMS` | ——（仅环境变量） | `false`（忠实复刻 CLI 线格式：`top_p` / `stop` / `user` / `seed` 仍接受但不外发，因为官方 CLI 从不发送；设 `true` 恢复透传。工具协议字段 `tool_choice` / `parallel_tool_calls` 始终转发——丢弃会静默改变工具调用行为） |
 
 > **默认值说明：** 源码运行（`bun start`）、Docker 镜像、Release 二进制共用同一套
 > 内置默认值——`3050` / `0.0.0.0`，与入库的 `config.json` 一致。`PORT` / `HOST`

@@ -15,6 +15,7 @@
 // 429 JSON（与 messages 侧 message_start 缓冲语义一致）。
 
 import { mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
+import { createToolCallIdGuard } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
@@ -480,7 +481,15 @@ export function createResponsesSseTranslator(model: string, responseId: string, 
     return out
   }
 
+  const isDuplicateToolCallId = createToolCallIdGuard()
+
   function emitFunctionCall(callId: string, name: string, args: string): string[] {
+    // 同一 id 二次出现必须跳过（见 createToolCallIdGuard），否则客户端回传重复
+    // call_id，上游 400。
+    if (isDuplicateToolCallId(callId)) {
+      log('warn', 'cc duplicate tool-call id suppressed (stream)', { toolCallId: callId })
+      return []
+    }
     const out: string[] = []
     if (current) out.push(...closeCurrent())
     const item: OpenItem = {

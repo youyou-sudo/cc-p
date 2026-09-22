@@ -169,7 +169,7 @@ Precedence (low → high): **builtin defaults → `config.json` → `.env` / env
 | `CC_STREAM_IDLE_MS` | — (env only) | `30000` |
 | `CC_NONSTREAM_IDLE_MS` | — (env only) | `90000` |
 | `CC_THINKING_IDLE_MS` | — (env only) | `120000` (thinking-phase grace: `start`/`start-step`/`reasoning-start`/`reasoning-delta`; use `180000` for deep reasoning / high `reasoning_effort`; cost of raising is slower failure detection on true hangs) |
-| `CC_FORWARD_SAMPLING_PARAMS` | — (env only) | `false` (faithful CLI wire: `top_p` / `stop` / `user` / `seed` / `tool_choice` / `parallel_tool_calls` are accepted but **not** forwarded upstream, because the official CLI never sends them; set `true` to restore passthrough) |
+| `CC_FORWARD_SAMPLING_PARAMS` | — (env only) | `false` (faithful CLI wire: `top_p` / `stop` / `user` / `seed` are accepted but **not** forwarded upstream, because the official CLI never sends them; set `true` to restore passthrough. Tool-protocol fields `tool_choice` / `parallel_tool_calls` are always forwarded — dropping them would silently change tool-call behaviour) |
 
 > **Note on defaults:** source runs (`bun start`), Docker images, and Release
 > binaries all share one set of builtin defaults — `3050` / `0.0.0.0` — matching
