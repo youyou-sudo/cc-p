@@ -4,8 +4,10 @@
 // forwarding are identical, so they live here once.
 
 import { forwardToCC } from './cc'
-import { mapCcError } from '../shared/errors'
+import { mapCcError, mapCcEventError } from '../shared/errors'
 import type { MappedError } from '../shared/errors'
+import { CcStreamParser } from './cc-events'
+import { readWithTimeout } from '../shared/http'
 import { ensureInitialized } from './fingerprint'
 import { log } from '../shared/logger'
 import { CFG } from '../shared/config'
@@ -217,6 +219,128 @@ function wrapWithGate(response: Response, held: ReleaseFn, signal?: AbortSignal)
   return { response: out, release: doRelease }
 }
 
+// ── 输出前（pre-output）上游流错误的重试 ─────────────────────────────────
+// 上游网关自身故障时常以 **HTTP 200 流里的第一个 NDJSON 事件** 出现
+// （实测：`{"type":"error","error":{"message":"Invalid error response format:
+// Gateway request failed"}}`）。官方 CLI 对 408/429/5xx 一律重试
+// （isRetryableStatus），而本地此前完全不重试流内错误 —— 整轮对话直接 502。
+// 此时客户端尚未收到任何字节（started=false），重新发一次 POST 是安全的。
+//
+// 关键：peek 只缓冲到「可判定」为止，且 start / start-step / reasoning-start /
+// text-start 这些空事件本身不产生任何客户端输出，所以对正常流与挂起流
+// （首个 chunk 无完整事件，例如 ":" 保活行）都不增加可观测延迟。
+const PEEK_MAX_BYTES = 64 * 1024
+const PEEK_MAX_WAIT_MS = 10_000
+/** 重试等待封顶：重试期间 gate 槽位保持占用，避免长等待；同时天然限流。 */
+const PRE_OUTPUT_RETRY_MAX_WAIT_MS = 5_000
+/** 不产生客户端输出的「空」事件：peek 期间可以继续往后等更强的信号。 */
+const PEEK_THROUGH_EVENTS = new Set(['start', 'start-step', 'reasoning-start', 'text-start'])
+
+interface HeadPeek {
+  errorEvent: any | null
+  chunks: Uint8Array[]
+  reader: ReadableStreamDefaultReader<Uint8Array> | null
+  /** 因 peek 超时而仍挂起的那次 read：重建流时复用它，避免同一 reader 双重读。 */
+  pendingRead: Promise<ChunkRead> | null
+  eof: boolean
+}
+
+/** reader.read() 结果的最小结构（done/value），避开不同 lib 的命名差异。 */
+type ChunkRead = { done: boolean; value?: Uint8Array }
+
+/** 读上游流开头，判定是否「输出前错误」。判定不明时一律按原样透传。 */
+async function peekUpstreamHead(resp: Response): Promise<HeadPeek> {
+  const body = resp.body
+  if (!body) return { errorEvent: null, chunks: [], reader: null, pendingRead: null, eof: true }
+  const reader = body.getReader()
+  const parser = new CcStreamParser()
+  const chunks: Uint8Array[] = []
+  let bytes = 0
+  const deadline = Date.now() + PEEK_MAX_WAIT_MS
+  while (true) {
+    const pending = reader.read()
+    let result: ChunkRead
+    try {
+      result = await readWithTimeout(pending, Math.max(1, deadline - Date.now()), 'PEEK_TIMEOUT')
+    } catch (e: any) {
+      if (e?.message === 'PEEK_TIMEOUT') {
+        return { errorEvent: null, chunks, reader, pendingRead: pending, eof: false }
+      }
+      throw e
+    }
+    if (result.done) return { errorEvent: null, chunks, reader, pendingRead: null, eof: true }
+
+    const value = result.value
+    const before = parser.lastCcEvent
+    if (value && value.byteLength > 0) {
+      chunks.push(value)
+      bytes += value.byteLength
+      parser.push(value, {})
+    }
+    if (parser.errorEvent) {
+      return { errorEvent: parser.errorEvent, chunks, reader, pendingRead: null, eof: false }
+    }
+    const last = parser.lastCcEvent
+    // 本 chunk 未解析出完整事件（如 ":" 保活行 / 半行）→ 停止 peek，原样透传。
+    // 保守策略：判不出来就不重试，绝不为了让重试生效而吞掉上游字节。
+    if (last === before) {
+      return { errorEvent: null, chunks, reader, pendingRead: null, eof: false }
+    }
+    if (PEEK_THROUGH_EVENTS.has(last)) {
+      if (bytes >= PEEK_MAX_BYTES) return { errorEvent: null, chunks, reader, pendingRead: null, eof: false }
+      continue
+    }
+    // 真实内容（text-delta / tool-call / finish / …）→ 停止 peek，原样透传。
+    return { errorEvent: null, chunks, reader, pendingRead: null, eof: false }
+  }
+}
+
+/** 用 peek 已消费的 chunk + 剩余 reader 重建可读流（字节序与原始完全一致）。 */
+function rebuildHeadStream(peek: HeadPeek): ReadableStream<Uint8Array> {
+  let idx = 0
+  let pending = peek.pendingRead
+  let closed = false
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (closed) return
+      try {
+        if (idx < peek.chunks.length) {
+          const chunk = peek.chunks[idx++]!
+          if (chunk.byteLength > 0) controller.enqueue(chunk)
+          return
+        }
+        if (peek.eof || !peek.reader) {
+          closed = true
+          controller.close()
+          return
+        }
+        const r = pending ? await pending : await peek.reader.read()
+        pending = null
+        if (r.done) {
+          closed = true
+          controller.close()
+          return
+        }
+        if (r.value && r.value.byteLength > 0) controller.enqueue(r.value)
+      } catch (e) {
+        closed = true
+        try { controller.error(e) } catch {}
+      }
+    },
+    cancel(reason) {
+      closed = true
+      try { peek.reader?.cancel(reason) } catch {}
+    },
+  })
+}
+
+/** 输出前流错误是否值得重试：对齐官方 CLI 的可重试状态（408 / 5xx）。
+ *  业务终局类（usage window / payment / auth / plan / overflow）已被
+ *  mapCcEventError 映射成 4xx，天然不会命中这里。 */
+function isRetryablePreOutputError(mapped: MappedError): boolean {
+  return mapped.status === 408 || (mapped.status >= 500 && mapped.status <= 599)
+}
+
 /** ensureInitialized → gate → POST /alpha/generate (retry rate_limit) → map non-2xx.
  *
  *  Gate ownership: on 2xx the slot is NOT released here; the returned
@@ -304,10 +428,42 @@ export async function callUpstream<T>(
         return out
       }
       if (ccResponse.ok) {
+        const peek = await peekUpstreamHead(ccResponse)
+        if (peek.errorEvent) {
+          const mapped = mapCcEventError(peek.errorEvent)
+          if (isRetryablePreOutputError(mapped) && attempt < maxAttempts - 1 && !signal.aborted) {
+            // 输出前错误 + 可重试 + 还有额度：丢掉这次流，退避后重发。
+            // gate 槽位保持占用（等待上限已被 PRE_OUTPUT_RETRY_MAX_WAIT_MS 封顶）。
+            try { peek.reader?.cancel() } catch {}
+            log('warn', label, {
+              status: 'pre_output_stream_error_retry',
+              mappedStatus: mapped.status,
+              mappedType: mapped.body?.error?.type,
+              message: mapped.body?.error?.message,
+              model, keyHash: kh, attempt,
+            })
+            const waitMs = Math.min(backoffDelay(attempt, retryBaseMs, retryCapMs), PRE_OUTPUT_RETRY_MAX_WAIT_MS)
+            await sleepCancellable(waitMs, signal)
+            continue
+          }
+          // 不可重试 / 额度用尽：原样透传给 handler（保持既有的终端 JSON 语义与日志）。
+          log('warn', label, {
+            status: 'pre_output_stream_error',
+            mappedStatus: mapped.status,
+            mappedType: mapped.body?.error?.type,
+            message: mapped.body?.error?.message,
+            model, keyHash: kh, attempt,
+          })
+        }
         const held = release!
         release = null
         transferred = true
-        const wrapped = wrapWithGate(ccResponse, held, signal)
+        const rebuilt = new Response(rebuildHeadStream(peek), {
+          status: ccResponse.status,
+          statusText: ccResponse.statusText,
+          headers: ccResponse.headers,
+        })
+        const wrapped = wrapWithGate(rebuilt, held, signal)
         return { ok: true as const, response: wrapped.response, value: wrapped.response, release: wrapped.release }
       }
 

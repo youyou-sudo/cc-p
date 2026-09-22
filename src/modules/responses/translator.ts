@@ -487,7 +487,7 @@ export function createResponsesSseTranslator(model: string, responseId: string, 
     // 同一 id 二次出现必须跳过（见 createToolCallIdGuard），否则客户端回传重复
     // call_id，上游 400。
     if (isDuplicateToolCallId(callId)) {
-      log('warn', 'cc duplicate tool-call id suppressed (stream)', { toolCallId: callId })
+      log('debug', 'cc duplicate tool-call id suppressed (stream)', { toolCallId: callId })
       return []
     }
     const out: string[] = []

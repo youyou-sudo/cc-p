@@ -227,6 +227,12 @@ CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64
 
 客户端断开（`request.signal`）会立刻 abort 上游 `fetch`，未完成的流直接关闭，不泄漏连接。
 
+重试集合与官方 CLI 对齐（`408` / `429` / `5xx`）：真 429 走 HTTP 重试循环；
+**输出前流错误**——上游网关故障以 HTTP 200 流的首个 NDJSON 事件出现
+（如 `Gateway request failed`）——在客户端收到任何字节前重发。
+业务终局类（usage window / payment / model-not-in-plan / auth / context overflow）
+一律不重试。`CC_RETRY_MAX`（默认 `3`）限定上游总尝试次数。
+
 ## 长会话 / 上下文管理（Context）
 
 > 本代理是无状态的：`src/infra/cc.ts` 每次都把完整历史全量透传上游——不做

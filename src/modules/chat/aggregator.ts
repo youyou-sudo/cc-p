@@ -111,7 +111,7 @@ export function createChatAggregator(opts?: { onEventError?: (event: any, mapped
     // 同一 id 二次出现必须丢弃（见 createToolCallIdGuard）：非流式下它会变成
     // 响应里两条同 id 的 tool_calls，客户端回传后上游 400。
     if (isDuplicateToolCallId(id)) {
-      log('warn', 'cc duplicate tool-call id suppressed (aggregate)', { toolCallId: id })
+      log('debug', 'cc duplicate tool-call id suppressed (aggregate)', { toolCallId: id })
       return
     }
     toolCalls = toolCalls || []

@@ -13,6 +13,7 @@ const stats = {
   lastGenerateHeaders: {} as Record<string, string>,
   lastGenerateBody: null as any,
 }
+let gatewayRetryCount = 0
 
 function ndjson(events: any[]): ReadableStream<Uint8Array> {
   return new ReadableStream({
@@ -111,6 +112,20 @@ Bun.serve({
             { type: 'tool-input-delta', toolCallId: 'call_dup_1', delta: '{"city":"SF"}' },
             { type: 'tool-input-end', toolCallId: 'call_dup_1', input: { city: 'SF' } },
             { type: 'finish', finishReason: 'tool-calls', totalUsage: { inputTokens: 5, outputTokens: 3, cachedInputTokens: 0 } },
+          ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        case 'mock/gateway-retry':
+          // 输出前网关故障：第一次整轮流里只有一个 error 事件（官方 CLI 会重试），
+          // 第二次成功。验证 pre-output 重试。
+          gatewayRetryCount++
+          if (gatewayRetryCount === 1) {
+            return new Response(ndjson([
+              { type: 'error', error: { message: 'Invalid error response format: Gateway request failed' } },
+            ]), { headers: { 'content-type': 'application/x-ndjson' } })
+          }
+          return new Response(ndjson([
+            { type: 'start' },
+            { type: 'text-delta', text: 'recovered' },
+            { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 5, outputTokens: 3, cachedInputTokens: 0 } },
           ]), { headers: { 'content-type': 'application/x-ndjson' } })
         case 'mock/structured-error':
           // 官方 1.62.1 流式错误形状（statusCode/isRetryable）+ 终局标记。
@@ -552,6 +567,32 @@ console.log('--- duplicate tool_call_id: response-side dedupe + request-side rep
   const resultIds = parts.filter((p: any) => p.type === 'tool-result').map((p: any) => p.toolCallId)
   check('history dup tool_call_id repaired to unique', callIds.length === 2 && new Set(callIds).size === 2, callIds)
   check('history tool results re-paired in order', resultIds.length === 2 && resultIds[0] === callIds[0] && resultIds[1] === callIds[1], { callIds, resultIds })
+}
+
+console.log('--- pre-output upstream stream error: retry vs pass-through ---')
+{
+  // 可重试：网关故障（502 类）→ 退避后重发，客户端最终拿到成功流
+  const before = (await statsFetch()).generate
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/gateway-retry', messages: [{ role: 'user', content: 'q' }] }),
+  })
+  const body = await r.json()
+  check('pre-output gateway error retried → 200', r.status === 200 && body.choices?.[0]?.message?.content === 'recovered', body)
+  const after = (await statsFetch()).generate
+  check('pre-output retry used 2 upstream attempts', after === before + 2, { before, after })
+}
+{
+  // 不可重试：429 类输出前错误必须原样透传，不得重试
+  const before = (await statsFetch()).generate
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/event-error', messages: [{ role: 'user', content: 'q' }] }),
+  })
+  const body = await r.json()
+  check('non-retryable pre-output error still → 429', r.status === 429 && body.error?.type === 'rate_limit_error', body)
+  const after = (await statsFetch()).generate
+  check('non-retryable pre-output error not retried (1 attempt)', after === before + 1, { before, after })
 }
 
 console.log('--- zero output / upstream errors ---')

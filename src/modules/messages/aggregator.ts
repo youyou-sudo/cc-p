@@ -135,7 +135,7 @@ export function createMessagesAggregator(opts?: { onEventError?: (event: any, ma
   function pushToolCall(id: string, name: string, argsStr: string): void {
     // 同一 id 二次出现必须丢弃（见 createToolCallIdGuard）。
     if (isDuplicateToolCallId(id)) {
-      log('warn', 'cc duplicate tool-call id suppressed (aggregate)', { toolCallId: id })
+      log('debug', 'cc duplicate tool-call id suppressed (aggregate)', { toolCallId: id })
       return
     }
     toolCalls = toolCalls || []

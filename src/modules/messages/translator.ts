@@ -372,7 +372,7 @@ export function createAnthropicSseTranslator(
     // 同一 id 二次出现必须跳过（见 createToolCallIdGuard），否则客户端回传重复
     // tool_use id，上游 400。
     if (isDuplicateToolCallId(id)) {
-      log('warn', 'cc duplicate tool-call id suppressed (stream)', { toolCallId: id })
+      log('debug', 'cc duplicate tool-call id suppressed (stream)', { toolCallId: id })
       return []
     }
     const out: string[] = []

@@ -216,6 +216,8 @@ Upstream mapping (`src/shared/errors.ts`): CC true `429` → `429` (carries `ret
 
 Client disconnects (`request.signal`) abort the upstream `fetch` immediately; unfinished streams are closed without leaking sockets.
 
+Retries match the official CLI's retryable set (`408` / `429` / `5xx`): a true rate limit is retried in the HTTP retry loop, and a **pre-output stream error** — an upstream gateway failure that arrives as the first NDJSON event of an HTTP 200 stream (e.g. `Gateway request failed`) — is retried before anything reaches the client. Terminal business errors (usage window / payment / model-not-in-plan / auth / context overflow) are never retried. `CC_RETRY_MAX` (default `3`) bounds total upstream attempts.
+
 ## Long Sessions / Context Management
 
 > The proxy is stateless: `src/infra/cc.ts` forwards the full message history on
