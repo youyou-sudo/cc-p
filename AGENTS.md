@@ -33,7 +33,7 @@ bun build ./src/index.ts --compile --production --minify --outfile server
 src/
 ├── index.ts        # 启动/healthcheck CLI/脱敏, 薄
 ├── app.ts          # createApp(): 唯一组装点, 只 .use(), 顺序即语义, 不可乱调
-├── modules/<feat>/ # chat/ messages/ models/ health/ streaming/: {index,model,service}.ts
+├── modules/<feat>/ # chat/ responses/ messages/ models/ health/ streaming/: {index,model,service}.ts
 ├── plugins/        # cors/errors/body/auth: 无路由, 只贡献 hook/decorate
 ├── infra/          # 上游/会话/指纹/SSE
 └── shared/         # kernel.ts / domain.ts / toolkit.ts 三个 barrel + 各层实现
@@ -41,7 +41,7 @@ test/               # e2e.ts unit.ts timeouts.ts heartbeat.ts idle-timeout-env.t
 ```
 
 `app.ts` 的 `.use()` 顺序即语义:
-`cors → errors → bodyLimit → auth(decorate) → health → models → chat → messages`。
+`cors → errors → bodyLimit → auth(decorate) → health → models → chat → messages → responses`。
 
 ## 3. 约定在哪里 (只指路, 不重复写)
 

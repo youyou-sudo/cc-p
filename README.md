@@ -2,7 +2,7 @@
 
 > [中文文档](README_zh.md)
 
-A reverse proxy that exposes the Command Code API as **OpenAI Chat Completions** and **Anthropic Messages** compatible endpoints.
+A reverse proxy that exposes the Command Code API as **OpenAI Chat Completions**, **OpenAI Responses**, and **Anthropic Messages** compatible endpoints.
 
 Built by observing official CLI traffic to faithfully replicate the upstream protocol — device fingerprint, lifecycle events, session headers, versioning, and tracing.
 
@@ -10,7 +10,7 @@ Stack: **Bun + Elysia + TypeScript**. Single-file binary via `bun build --compil
 
 ## Features
 
-- **Dual protocol**: `POST /v1/chat/completions` (OpenAI) + `POST /v1/messages` (Anthropic)
+- **Triple protocol**: `POST /v1/chat/completions` (OpenAI) + `POST /v1/responses` (OpenAI Responses) + `POST /v1/messages` (Anthropic)
 - **Streaming & non-streaming**, tool calling, multimodal images, `reasoning_effort` / `thinking`
 - **Dynamic models**: `GET /v1/models` from Provider API (5 min cache) with builtin fallback
 - **CLI emulation**: per-key device fingerprint (8h + 2h jitter), lifecycle `cli_session_exists`, per-key session (12h + 1h jitter), `x-command-code-version` from npm (24h refresh), `traceparent`, `x-project-slug`
@@ -82,6 +82,15 @@ msg = client.messages.create(
 )
 ```
 
+```python
+# OpenAI SDK (Responses API)
+resp = client.responses.create(
+    model="deepseek/deepseek-v4-flash",
+    input="hi",
+    stream=True,
+)
+```
+
 Any OpenAI-compatible tool (Claude Code, Cline, Roo, NextChat, etc.) works by pointing `base_url` at `/v1` and using a `user_*` key.
 
 ## API Reference
@@ -92,6 +101,7 @@ Any OpenAI-compatible tool (Claude Code, Cline, Roo, NextChat, etc.) works by po
 | `GET` | `/health` | `{"ok":true}` |
 | `GET` | `/v1/models` | OpenAI-style model list |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
+| `POST` | `/v1/responses` | OpenAI Responses |
 | `POST` | `/v1/messages` | Anthropic Messages |
 
 ### `POST /v1/chat/completions`
@@ -113,6 +123,25 @@ Anthropic schema with automatic conversion:
 | CC `finishReason` | → `end_turn / max_tokens / tool_use` |
 
 Streaming emits `message_start / content_block_* / message_delta / message_stop`; `thinking` blocks get a synthetic `signature` so strict SDKs validate.
+
+### `POST /v1/responses`
+
+OpenAI Responses schema with automatic conversion:
+
+| Responses | Handling |
+|-----------|----------|
+| `instructions` | → OpenAI `system` message |
+| `input` (string / items) | → `messages`; `input_text` / `input_image` / `output_text` parts pass through |
+| `input[].type: function_call` | → assistant `tool_calls` |
+| `input[].type: function_call_output` | → `role: "tool"` message |
+| `tools[].{name,parameters,strict}` (flat) | → nested `{type:"function",function:{…}}` |
+| `tool_choice: auto / none / required / {function}` | → `auto / none / required / {function}` |
+| `reasoning.effort` | → `reasoning_effort` |
+| `max_output_tokens` | → `max_tokens` |
+| `metadata.user_id` | → `user` |
+| `store` / `previous_response_id` / `include` / `truncation` / `text` | ignored (stateless proxy; debug-logged) |
+
+Streaming emits `response.created / response.in_progress / response.output_item.added / response.output_text.delta / response.function_call_arguments.delta / … / response.completed` (no `[DONE]`; the SDK terminates on `response.completed`). Reasoning surfaces as a `{type:"reasoning",summary:[…]}` item with `response.reasoning_summary_text.delta` events. `finishReason: length` maps to `status: "incomplete"` + `incomplete_details.reason: "max_output_tokens"`. Built-in tools (web_search/file_search/…) have no CC equivalent and are dropped with a warning.
 
 ### `GET /v1/models`
 
@@ -302,6 +331,7 @@ Each `POST /alpha/generate` then carries `Authorization`, `x-cli-environment: pr
 │   ├── index.ts           # Routes, CORS, error mapping, startup, healthcheck CLI
 │   ├── config.ts          # config.json + env resolution, body-limit
 │   ├── openai.ts          # POST /v1/chat/completions (stream + non-stream)
+│   ├── responses.ts       # POST /v1/responses + Responses↔OpenAI conversion
 │   ├── anthropic.ts       # POST /v1/messages + Anthropic↔OpenAI conversion
 │   ├── cc.ts              # CC request building + forwarding (/alpha/generate)
 │   ├── sse.ts             # SSE pipeline + CC NDJSON → OpenAI chunks

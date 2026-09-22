@@ -209,11 +209,27 @@ console.log('--- auth / parse errors ---')
   check('401 anthropic Vary: Origin', (r.headers.get('vary') || '').includes('Origin'), r.headers.get('vary'))
 }
 {
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
+  })
+  const body = await r.json()
+  check('responses missing key 401 (OpenAI shape)', r.status === 401 && body.error.type === 'auth_error' && (body as any).type === undefined, body)
+  check('401 responses CORS never null', r.headers.get('access-control-allow-origin') !== 'null', r.headers.get('access-control-allow-origin'))
+  check('401 responses Vary: Origin', (r.headers.get('vary') || '').includes('Origin'), r.headers.get('vary'))
+}
+{
   const r = await fetch(BASE + '/v1/chat/completions', {
     method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer user_ok_1' }, body: 'not-json',
   })
   const body = await r.json()
   check('invalid JSON 400', r.status === 400 && body.error.message === 'Invalid JSON body')
+}
+{
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer user_ok_1' }, body: 'not-json',
+  })
+  const body = await r.json()
+  check('responses invalid JSON 400 openai shape', r.status === 400 && body.error.message === 'Invalid JSON body' && (body as any).type === undefined, body)
 }
 {
   const r = await fetch(BASE + '/v1/messages', {
@@ -532,6 +548,158 @@ console.log('--- anthropic zero output / upstream errors ---')
   check('anthropic stream error before output → JSON 429', r.status === 429 && ct.includes('json') && !ct.includes('event-stream') && body.type === 'error' && body.error.type === 'rate_limit_error' && body.retry_after === undefined, { ct, body })
 }
 
+console.log('--- responses non-stream ---')
+{
+  const before = (await statsFetch()).generate
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({
+      model: 'mock/model',
+      instructions: 'be brief',
+      prompt_cache_key: 'resp-cache-001',
+      input: [
+        { role: 'user', content: [{ type: 'input_text', text: 'weather?' }] },
+        { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"SF"}' },
+        { type: 'function_call_output', call_id: 'call_1', output: 'sunny 20C' },
+      ],
+      tools: [{ type: 'function', name: 'get_weather', description: 'w', parameters: { type: 'object', properties: {} } }],
+    }),
+  })
+  const body = await r.json()
+  check('responses 200', r.status === 200, body)
+  check('responses object shape', body.object === 'response' && typeof body.id === 'string' && body.id.startsWith('resp_') && body.status === 'completed', body)
+  check('responses output text item', body.output?.[0]?.type === 'message' && body.output?.[0]?.role === 'assistant' && body.output?.[0]?.content?.[0]?.type === 'output_text' && body.output?.[0]?.content?.[0]?.text === 'Hello world', body.output)
+  check('responses function_call item', body.output?.[1]?.type === 'function_call' && body.output?.[1]?.call_id === 'call_1' && body.output?.[1]?.name === 'get_weather' && body.output?.[1]?.arguments === '{"city":"SF"}', body.output)
+  check('responses usage mapped', body.usage?.input_tokens === 100 && body.usage?.output_tokens === 20 && body.usage?.total_tokens === 120 && body.usage?.input_tokens_details?.cached_tokens === 50, body.usage)
+
+  const s = await statsFetch()
+  check('responses generate incremented', s.generate === before + 1)
+  const b = s.lastGenerateBody
+  check('responses instructions → CC system', b.params.system === 'be brief', b.params.system)
+  check('responses input text wrapped', b.params.messages[0].role === 'user' && b.params.messages[0].content[0].text === 'weather?', b.params.messages[0])
+  check('responses function_call → CC tool-call', b.params.messages[1].role === 'assistant' && b.params.messages[1].content[0].type === 'tool-call' && b.params.messages[1].content[0].toolCallId === 'call_1', b.params.messages[1])
+  check('responses function_call_output → CC tool result', b.params.messages[2].role === 'tool' && b.params.messages[2].content[0].output.value === 'sunny 20C', b.params.messages[2])
+  check('responses flat tool → CC input_schema', b.params.tools?.[0]?.name === 'get_weather' && !!b.params.tools?.[0]?.input_schema, b.params.tools)
+  check('responses cache_control injected', b.params.messages[0].content.at(-1).cache_control?.type === 'ephemeral', b.params.messages[0].content)
+}
+
+console.log('--- responses reasoning ---')
+{
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/reason', input: 'q' }),
+  })
+  const body = await r.json()
+  check('responses reasoning item', body.output?.[0]?.type === 'reasoning' && body.output?.[0]?.summary?.[0]?.text === 'thinking hard', body.output)
+  check('responses text after reasoning', body.output?.[1]?.type === 'message' && body.output?.[1]?.content?.[0]?.text === 'Answer', body.output)
+}
+
+console.log('--- responses params passthrough ---')
+{
+  const before = (await statsFetch()).generate
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({
+      model: 'mock/params',
+      input: 'hi',
+      max_output_tokens: 123,
+      top_p: 0.7,
+      reasoning: { effort: 'high', summary: 'auto' },
+      tool_choice: { type: 'function', name: 'get_weather' },
+      metadata: { user_id: 'u_resp' },
+      store: true,
+      previous_response_id: 'resp_old',
+      include: ['reasoning.encrypted_content'],
+    }),
+  })
+  const body = await r.json()
+  check('responses params 200', r.status === 200 && body.output?.[0]?.content?.[0]?.text === 'params-ok', body)
+  const s = await statsFetch()
+  check('responses generate incremented (params)', s.generate === before + 1)
+  const b = s.lastGenerateBody
+  check('responses max_output_tokens → max_tokens', b.params.max_tokens === 123, b.params)
+  check('responses top_p passthrough', b.params.top_p === 0.7, b.params)
+  check('responses reasoning.effort → reasoning_effort', b.params.reasoning_effort === 'high', b.params)
+  check('responses metadata.user_id → user', b.params.user === 'u_resp', b.params.user)
+  check('responses tool_choice function → CC tool', b.params.tool_choice?.type === 'tool' && b.params.tool_choice?.name === 'get_weather', b.params.tool_choice)
+  check('responses stateless fields ignored', b.params.store === undefined && b.params.previous_response_id === undefined && b.params.include === undefined, b.params)
+}
+
+console.log('--- responses stream ---')
+{
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/model', stream: true, input: 'hi' }),
+  })
+  check('responses stream content-type', (r.headers.get('content-type') || '').includes('text/event-stream'))
+  const text = await r.text()
+  const events = text.split('\n\n').filter(Boolean).map((block) => {
+    const lines = block.split('\n')
+    const eventName = lines.find((l) => l.startsWith('event: '))?.slice(7)
+    const dataLine = lines.find((l) => l.startsWith('data: '))?.slice(6)
+    return { eventName, data: dataLine ? JSON.parse(dataLine) : null }
+  })
+  const names = events.map((e) => e.eventName)
+  check('responses stream event order', names[0] === 'response.created' && names[1] === 'response.in_progress'
+    && names.includes('response.output_item.added') && names.includes('response.content_part.added')
+    && names.includes('response.output_text.delta') && names.includes('response.function_call_arguments.done')
+    && names.at(-1) === 'response.completed', names)
+  check('responses stream no [DONE]', !text.includes('[DONE]'), text.slice(-80))
+  const deltas = events.filter((e) => e.eventName === 'response.output_text.delta').map((e) => e.data?.delta).join('')
+  check('responses stream text joined', deltas === 'Hello world', deltas)
+  const fcDone = events.find((e) => e.eventName === 'response.function_call_arguments.done')
+  check('responses stream function args', fcDone?.data?.arguments === '{"city":"SF"}', fcDone)
+  const completed = events.at(-1)
+  check('responses stream completed usage', completed?.data?.response?.status === 'completed' && completed?.data?.response?.usage?.input_tokens === 100 && completed?.data?.response?.usage?.output_tokens === 20, completed?.data?.response?.usage)
+  check('responses stream sequence numbers', events.every((e, i) => e.data?.sequence_number === i), events.map((e) => e.data?.sequence_number))
+}
+
+console.log('--- responses zero output / upstream errors ---')
+{
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/zero', input: 'q' }),
+  })
+  const body = await r.json()
+  check('responses zero output 429 non-stream', r.status === 429 && body.error.type === 'rate_limit_error' && body.retry_after === 10 && r.headers.get('retry-after') === '10', body)
+}
+{
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/zero', stream: true, input: 'q' }),
+  })
+  const ct = r.headers.get('content-type') || ''
+  const body = await r.json()
+  check('responses zero stream → JSON 429 (not SSE 200)', r.status === 429 && ct.includes('json') && !ct.includes('event-stream') && body.error.type === 'rate_limit_error' && body.retry_after === 10, { ct, body })
+}
+{
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/upstream-429', input: 'q' }),
+  })
+  const body = await r.json()
+  check('responses upstream 429 mapped', r.status === 429 && body.error.type === 'rate_limit_error' && body.retry_after === undefined, body)
+}
+{
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/event-error', stream: true, input: 'q' }),
+  })
+  const ct = r.headers.get('content-type') || ''
+  const body = await r.json()
+  check('responses stream error before output → JSON 429', r.status === 429 && ct.includes('json') && !ct.includes('event-stream') && body.error.type === 'rate_limit_error', { ct, body })
+}
+{
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/midstream-error', stream: true, input: 'q' }),
+  })
+  const text = await r.text()
+  check('responses midstream error keeps SSE 200', r.status === 200 && (r.headers.get('content-type') || '').includes('text/event-stream'), r.status)
+  check('responses midstream error has partial + error event', text.includes('"delta":"partial"') && text.includes('event: error') && !text.includes('response.completed'), text.slice(-200))
+}
+
 console.log('--- client disconnect ---')
 {
   const ac = new AbortController()
@@ -546,6 +714,22 @@ console.log('--- client disconnect ---')
   await Bun.sleep(600)
   const health = await fetch(BASE + '/health')
   check('server alive after disconnect', health.status === 200)
+}
+{
+  const ac = new AbortController()
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/slow', stream: true, input: 'hi' }),
+    signal: ac.signal,
+  })
+  const reader = r.body!.getReader()
+  await reader.read()
+  ac.abort()
+  await Bun.sleep(600)
+  const health = await fetch(BASE + '/health')
+  check('server alive after responses disconnect', health.status === 200)
+  const readyz = await (await fetch(BASE + '/readyz')).json()
+  check('responses disconnect released gate slot', readyz.gate?.inFlight === 0 && readyz.gate?.queued === 0, readyz.gate)
 }
 
 console.log(`\nRESULT: ${pass} passed, ${fail} failed`)

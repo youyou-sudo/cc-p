@@ -1,6 +1,13 @@
 // Unit tests for the resilience modules (no network; run with `bun run test/unit.ts`).
 // Covers: upstream-limit classification, retry/backoff math, the per-key
-// concurrency gate, and errors.ts integration (incl. Retry-After passthrough).
+// concurrency gate, errors.ts integration (incl. Retry-After passthrough),
+// and the responses protocol pure functions (request conversion / response
+// object / SSE terminal).
+
+// 本文件导入 responses 翻译层，会经 logger 传递加载 src/shared/config.ts；
+// 固定一个合法 PORT，避免调用方环境里的非法 PORT（如 PORT=0）触发 config
+// die() 让纯函数断言尚未执行就退出（其余测试脚本同样在顶部固定 env）。
+if (!/^\d+$/.test(process.env.PORT ?? '') || Number(process.env.PORT) < 1) process.env.PORT = '3050'
 
 import { classifyUpstreamLimit, limitMeta } from '../src/shared/limit'
 import { parseRetryAfter, backoffDelay } from '../src/shared/retry'
@@ -161,6 +168,74 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('event <429> without retry_after omits retry_after', ev.status === 429 && ev.body.error.type === 'rate_limit_error' && ev.body.retry_after === undefined, ev)
   const evPassthrough = mapCcEventError({ error: { message: '<429> slow down' }, retry_after: 45 })
   check('event <429> passes event.retry_after through', evPassthrough.status === 429 && evPassthrough.body.retry_after === 45, evPassthrough)
+}
+
+// responses protocol: request conversion + response object + SSE terminal (pure)
+{
+  const { convertResponsesToOpenAI, createResponsesSseTranslator } = await import('../src/modules/responses/translator')
+  const { buildResponsesObject } = await import('../src/modules/responses/aggregator')
+
+  const req = convertResponsesToOpenAI({
+    model: 'm1',
+    instructions: 'be nice',
+    max_output_tokens: 321,
+    top_p: 0.8,
+    temperature: 0.2,
+    parallel_tool_calls: false,
+    prompt_cache_key: 'pk',
+    metadata: { user_id: 'u_1' },
+    reasoning: { effort: 'high', summary: 'auto' },
+    store: true,
+    previous_response_id: 'resp_old',
+    include: ['reasoning.encrypted_content'],
+    input: [
+      { role: 'user', content: [{ type: 'input_text', text: 'hi' }, { type: 'input_image', image_url: 'https://img/1.png' }] },
+      { type: 'function_call', call_id: 'call_9', name: 'f', arguments: '{"a":1}' },
+      { type: 'function_call_output', call_id: 'call_9', output: [{ type: 'output_text', text: 'ok' }] },
+      { type: 'reasoning', summary: [] },
+    ],
+    tools: [
+      { type: 'function', name: 'f', description: 'd', parameters: { type: 'object' }, strict: true },
+      { type: 'web_search' },
+    ],
+    tool_choice: { type: 'function', name: 'f' },
+  })
+  check('responses convert system', req.messages[0].role === 'system' && req.messages[0].content === 'be nice', req.messages[0])
+  check('responses convert user parts', req.messages[1].role === 'user' && req.messages[1].content[0].type === 'text' && req.messages[1].content[0].text === 'hi' && req.messages[1].content[1].type === 'image_url' && req.messages[1].content[1].image_url.url === 'https://img/1.png', req.messages[1])
+  check('responses convert function_call', req.messages[2].role === 'assistant' && req.messages[2].tool_calls[0].id === 'call_9' && req.messages[2].tool_calls[0].function.arguments === '{"a":1}', req.messages[2])
+  check('responses convert function_call_output', req.messages[3].role === 'tool' && req.messages[3].tool_call_id === 'call_9' && req.messages[3].content === 'ok', req.messages[3])
+  check('responses convert drops reasoning item', req.messages.length === 4, req.messages.length)
+  check('responses convert tools nested + non-function dropped', req.tools?.length === 1 && req.tools[0].function.name === 'f' && req.tools[0].function.strict === true, req.tools)
+  check('responses convert tool_choice', req.tool_choice?.type === 'function' && req.tool_choice?.function?.name === 'f', req.tool_choice)
+  check('responses convert scalars', req.max_tokens === 321 && req.top_p === 0.8 && req.temperature === 0.2 && req.parallel_tool_calls === false && req.reasoning_effort === 'high' && req.user === 'u_1' && req.prompt_cache_key === 'pk', req)
+  check('responses convert ignores stateless fields', req.store === undefined && req.previous_response_id === undefined && req.include === undefined, req)
+
+  const out = buildResponsesObject('m2', 'resp_x', 123, {
+    fullText: 'hello',
+    reasoningContent: 'think',
+    toolCalls: [{ id: 'call_1', type: 'function', function: { name: 'f', arguments: '{"a":1}' } }],
+    finishReason: 'tool_calls',
+    usage: { inputTokens: 7, outputTokens: 3, cachedInputTokens: 2 },
+    upstreamError: null,
+  })
+  check('responses object shape', out.id === 'resp_x' && out.object === 'response' && out.status === 'completed' && out.created_at === 123, out)
+  check('responses object reasoning first', out.output[0].type === 'reasoning' && out.output[0].summary[0].text === 'think', out.output)
+  check('responses object message', out.output[1].type === 'message' && out.output[1].content[0].type === 'output_text' && out.output[1].content[0].text === 'hello', out.output[1])
+  check('responses object function_call', out.output[2].type === 'function_call' && out.output[2].call_id === 'call_1' && out.output[2].arguments === '{"a":1}', out.output[2])
+  check('responses object usage', out.usage.input_tokens === 7 && out.usage.output_tokens === 3 && out.usage.total_tokens === 10 && out.usage.input_tokens_details.cached_tokens === 2, out.usage)
+
+  const incomplete = buildResponsesObject('m2', 'resp_y', 1, { fullText: 'x', reasoningContent: '', toolCalls: null, finishReason: 'length', usage: null, upstreamError: null })
+  check('responses object length => incomplete', incomplete.status === 'incomplete' && incomplete.incomplete_details?.reason === 'max_output_tokens', incomplete)
+
+  const tr = createResponsesSseTranslator('m3', 'resp_s', 5)
+  const start = tr.startEvents()
+  check('responses sse created+in_progress', start.length === 2 && start[0].startsWith('event: response.created') && start[1].startsWith('event: response.in_progress'), start)
+  const enc = new TextEncoder()
+  const deltas = tr.parseChunk(enc.encode(JSON.stringify({ type: 'text-delta', text: 'Hi' }) + '\n'))
+  check('responses sse text delta', deltas.some((e) => e.startsWith('event: response.output_item.added')) && deltas.some((e) => e.includes('"delta":"Hi"')), deltas)
+  const fin = tr.finishEvents()
+  check('responses sse completed terminal, no [DONE]', fin.at(-1)?.startsWith('event: response.completed') === true && !fin.join('').includes('[DONE]'), fin)
+  check('responses sse sawContent', tr.sawContent === true)
 }
 
 console.log(`\nUNIT RESULT: ${passed} passed, ${failed} failed`)

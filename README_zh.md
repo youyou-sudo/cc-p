@@ -2,7 +2,7 @@
 
 > [English](README.md)
 
-把 Command Code API 暴露为 **OpenAI Chat Completions** 与 **Anthropic Messages** 兼容接口的反向代理。
+把 Command Code API 暴露为 **OpenAI Chat Completions**、**OpenAI Responses** 与 **Anthropic Messages** 兼容接口的反向代理。
 
 通过观察官方 CLI 流量，忠实复刻上游协议——设备指纹、生命周期事件、会话头、版本号与链路追踪。
 
@@ -10,7 +10,7 @@
 
 ## 功能
 
-- **双协议**：`POST /v1/chat/completions`（OpenAI）+ `POST /v1/messages`（Anthropic）
+- **三协议**：`POST /v1/chat/completions`（OpenAI）+ `POST /v1/responses`（OpenAI Responses）+ `POST /v1/messages`（Anthropic）
 - **流式 / 非流式**、工具调用、多模态图片、`reasoning_effort` / `thinking`
 - **动态模型**：`GET /v1/models` 从 Provider API 获取（5 分钟缓存），失败回退内置列表
 - **CLI 仿真**：按 Key 的设备指纹（8h + 2h 抖动）、`cli_session_exists` 生命周期事件、按 Key 会话（12h + 1h 抖动）、`x-command-code-version` 取自 npm（每天刷新）、`traceparent`、`x-project-slug`
@@ -79,6 +79,15 @@ msg = client.messages.create(
 )
 ```
 
+```python
+# OpenAI SDK（Responses API）
+resp = client.responses.create(
+    model="deepseek/deepseek-v4-flash",
+    input="hi",
+    stream=True,
+)
+```
+
 任何 OpenAI 兼容客户端（Claude Code、Cline、Roo、NextChat 等）只要把 `base_url`
 指向 `/v1` 并使用 `user_*` Key 即可。
 
@@ -90,6 +99,7 @@ msg = client.messages.create(
 | `GET` | `/health` | `{"ok":true}` |
 | `GET` | `/v1/models` | OpenAI 风格模型列表 |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
+| `POST` | `/v1/responses` | OpenAI Responses |
 | `POST` | `/v1/messages` | Anthropic Messages |
 
 ### `POST /v1/chat/completions`
@@ -115,6 +125,30 @@ Anthropic 结构，自动转换：
 
 流式输出 `message_start / content_block_* / message_delta / message_stop`；
 `thinking` 块会带一个合成 `signature`，满足严格 SDK 的校验。
+
+### `POST /v1/responses`
+
+OpenAI Responses 结构，自动转换：
+
+| Responses | 处理 |
+|-----------|------|
+| `instructions` | → OpenAI `system` 消息 |
+| `input`（字符串 / items） | → `messages`；`input_text` / `input_image` / `output_text` 分片透传 |
+| `input[].type: function_call` | → assistant `tool_calls` |
+| `input[].type: function_call_output` | → `role: "tool"` 消息 |
+| `tools[].{name,parameters,strict}`（扁平） | → 嵌套 `{type:"function",function:{…}}` |
+| `tool_choice: auto / none / required / {function}` | → `auto / none / required / {function}` |
+| `reasoning.effort` | → `reasoning_effort` |
+| `max_output_tokens` | → `max_tokens` |
+| `metadata.user_id` | → `user` |
+| `store` / `previous_response_id` / `include` / `truncation` / `text` | 忽略（无状态代理，记 debug 日志） |
+
+流式输出 `response.created / response.in_progress / response.output_item.added /
+response.output_text.delta / response.function_call_arguments.delta / … / response.completed`
+（无 `[DONE]`，SDK 以 `response.completed` 终止）。推理内容以
+`{type:"reasoning",summary:[…]}` item + `response.reasoning_summary_text.delta` 事件下发。
+`finishReason: length` 映射为 `status: "incomplete"` + `incomplete_details.reason: "max_output_tokens"`。
+内置工具（web_search/file_search 等）在 CC 侧无对应实现，丢弃并记 warn。
 
 ### `GET /v1/models`
 
@@ -296,6 +330,7 @@ rate_limit_error`——看到该包装先拆开看内层 `retry_after` 再决策
 │   ├── index.ts           # 路由、CORS、错误映射、启动、healthcheck CLI
 │   ├── config.ts          # config.json + 环境变量解析、包体上限
 │   ├── openai.ts          # POST /v1/chat/completions（流式 + 非流式）
+│   ├── responses.ts       # POST /v1/responses + Responses↔OpenAI 转换
 │   ├── anthropic.ts       # POST /v1/messages + Anthropic↔OpenAI 转换
 │   ├── cc.ts              # CC 请求构建 + 转发（/alpha/generate）
 │   ├── sse.ts             # SSE 管道 + CC NDJSON → OpenAI chunk

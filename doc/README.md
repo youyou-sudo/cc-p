@@ -4,7 +4,7 @@
 
 ## 1. 项目简介
 
-**Command Code Proxy**（`commandcode-proxy-elysia`）是一个基于 **Bun + Elysia** 的 API 代理服务，将 **OpenAI** 与 **Anthropic** 两种协议的请求转换为 Command Code（CC）上游的 `/alpha/generate` NDJSON 流式协议，并把上游事件流实时翻译回各自的 SSE / JSON 格式。
+**Command Code Proxy**（`commandcode-proxy-elysia`）是一个基于 **Bun + Elysia** 的 API 代理服务，将 **OpenAI Chat Completions**、**OpenAI Responses** 与 **Anthropic Messages** 三种协议的请求转换为 Command Code（CC）上游的 `/alpha/generate` NDJSON 流式协议，并把上游事件流实时翻译回各自的 SSE / JSON 格式。
 
 - 运行时：Bun（`bun run src/index.ts`），可编译为单文件二进制（Docker distroless）
 - 唯一运行时依赖：`elysia ^1.4.30`（其余全部为标准库 / Bun 全局 API）
@@ -18,6 +18,7 @@
 | GET | `/health` | `healthController` | 健康探针（JSON `{ok:true}`） | `src/modules/health/index.ts` |
 | GET | `/v1/models` | `modelsController` → `ModelsService.list` | OpenAI Models API | `src/modules/models/catalog.ts`（`handleModels`） |
 | POST | `/v1/chat/completions` | `chatController` → `ChatService.handleBody` | OpenAI Chat Completions（SSE / JSON） | `src/modules/chat/handler.ts`（`handleChatCompletionsBody`） |
+| POST | `/v1/responses` | `responsesController` → `ResponsesService.handleBody` | OpenAI Responses（SSE / JSON） | `src/modules/responses/handler.ts`（`handleResponsesBody`） |
 | POST | `/v1/messages` | `messagesController` → `MessagesService.handleBody` | Anthropic Messages（SSE / JSON） | `src/modules/messages/handler.ts`（`handleMessagesBody`） |
 | OPTIONS | 任意 | `corsPlugin.onRequest`（204） | CORS 预检 | `src/plugins/cors.ts` |
 
@@ -29,7 +30,7 @@
 ┌──────────────────────────────────────────────────────────────────────┐
 │  入口层      src/index.ts        启动 + healthcheck CLI + unhandledRejection │
 │             src/app.ts          Elysia 组装：use cors/errors/body/auth 插件    │
-│                                 + 4 个 controller                          │
+│                                 + 5 个 controller                          │
 ├──────────────────────────────────────────────────────────────────────┤
 │  插件层      src/plugins/cors.ts     onRequest 打 CORS 头 / OPTIONS 204     │
 │             src/plugins/errors.ts   onError：404/413/PARSE/VALIDATION→双协议 │
@@ -37,6 +38,7 @@
 │             src/plugins/auth.ts     getApiKey decorate / requireAuth macro  │
 ├──────────────────────────────────────────────────────────────────────┤
 │  协议层      src/modules/chat/      OpenAI /v1/chat/completions              │
+│             src/modules/responses/  OpenAI /v1/responses                     │
 │             src/modules/messages/   Anthropic /v1/messages                   │
 │             src/modules/models/     /v1/models                               │
 │             src/modules/health/     / 与 /health                             │
@@ -58,7 +60,7 @@
 
 ## 4. 请求流转（核心数据流）
 
-以 `/v1/messages` 与 `/v1/chat/completions` 为例，两条路径共用同一套前缀与上游编排，仅协议转换 / 翻译层不同：
+以 `/v1/messages`、`/v1/responses` 与 `/v1/chat/completions` 为例，三条路径共用同一套前缀与上游编排，仅协议转换 / 翻译层不同：
 
 ```
 createApp                     (src/app.ts)
@@ -66,15 +68,16 @@ createApp                     (src/app.ts)
   → bodyLimitPlugin.onParse    (src/plugins/body.ts，readJsonBody 单次限流解析)
       └ 超限 → onTransform 抛普通 Error(status=413) 哨兵
   → errorsPlugin.onError       (src/plugins/errors.ts，401/404/413/PARSE/VALIDATION 双协议体)
-  → messagesController / chatController
+  → messagesController / responsesController / chatController
                               (src/modules/*/index.ts)
       └ onTransform: createAuthPreCheck(isAnthropic)  ← auth 前置，无 key 时短路 validation
-  → body schema 校验           (body: 'messages.body' / 'chat.body')
+  → body schema 校验           (body: 'messages.body' / 'responses.body' / 'chat.body')
       └ 失败 → validation 400
-  → MessagesService.handleBody / ChatService.handleBody
+  → MessagesService.handleBody / ResponsesService.handleBody / ChatService.handleBody
                               (src/modules/*/service.ts → handler.ts)
   → getApiKey                  (src/shared/auth.ts，Bearer / x-api-key / CC_API_KEY 兜底，401)
   → convertAnthropicToOpenAI   (仅 messages：src/modules/messages/translator.ts)
+  → convertResponsesToOpenAI   (仅 responses：src/modules/responses/translator.ts)
   → buildCcRequest             (src/infra/cc.ts，OpenAI → CC 请求体)
   → createUpstreamFlow         (src/infra/proxy-handler.ts，客户端断连 → 级联 abort)
   → callUpstream               (src/infra/proxy-handler.ts)
@@ -85,22 +88,28 @@ createApp                     (src/app.ts)
   │    chat：createSseTranslator   (src/modules/chat/translator.ts)
   │          + SsePipeline(true)   (src/infra/sse.ts, autoStart)
   │          + startSseHeartbeat(pingEvent=SSE_KEEPALIVE_COMMENT)
+  │    responses：createResponsesSseTranslator (src/modules/responses/translator.ts)
+  │          + SsePipeline(false)（缓冲 response.created，首个
+  │            response.output_item.added 才 flush 头）
+  │          + startSseHeartbeat(pingEvent=SSE_KEEPALIVE_COMMENT)
   │    messages：createAnthropicSseTranslator (src/modules/messages/translator.ts)
   │          + SsePipeline(false) + emitAnthropic（缓冲 message_start，
   │            首个 content_block_* 才 flush 头）
   │    → CcStreamParser (src/infra/cc-events.ts) 逐行解析 NDJSON
   │    → new Response(pipeline.stream, SSE_HEADERS)
   └─ stream=false：
-       CcStreamParser 聚合 → createChatAggregator / createMessagesAggregator
-       → buildChatCompletion / buildAnthropicResponse
+       CcStreamParser 聚合 → createChatAggregator / createResponsesAggregator /
+       createMessagesAggregator
+       → buildChatCompletion / buildResponsesObject / buildAnthropicResponse
        → sendJSON / sendAnthropicError (src/shared/http.ts) → JSON
 ```
 
 **流式与非流式的差异**
 
 - chat 流式：`SsePipeline(true)`（`autoStart=true`）+ 工厂函数翻译器 `createSseTranslator`，心跳用 SSE 注释帧 `SSE_KEEPALIVE_COMMENT`（OpenAI SDK 只认 `data:` 行）。
+- responses 流式：`SsePipeline(false)` + 显式 `start()`（首个 `response.output_item.added`），`response.created` 保持缓冲，保证空回包走 JSON 429 而非 SSE 200；终帧为 `response.completed`（无 `[DONE]`），`finishReason: length` 转 `response.incomplete`；心跳同为 SSE 注释帧。
 - messages 流式：`SsePipeline(false)` + `emitAnthropic` 缓冲，闭包工厂函数 `createAnthropicSseTranslator`（返回 `{startEvents,parseChunk,flush,finishEvents}`，非 AsyncGenerator）；`message_start` 保持缓冲，仅首个 `content_block_*` 才 `start()` flush 头，保证空回包走 JSON 429 而非 SSE 200；心跳默认 Anthropic 原生 `ping` 事件。
-- 两者非流式均走聚合器 + `SsePipeline` 之外的 JSON 响应构建；零输出统一归 `429 retry_after:10`。
+- 三者非流式均走聚合器 + `SsePipeline` 之外的 JSON 响应构建；零输出统一归 `429 retry_after:10`。
 
 ## 5. 模块清单与文档索引
 
@@ -152,6 +161,7 @@ createApp                     (src/app.ts)
 | 42 | [42-test-heartbeat.md](modules/42-test-heartbeat.md) | `test/heartbeat.ts` | 89 | 测试 |
 | 43 | [43-test-idle-timeout-env.md](modules/43-test-idle-timeout-env.md) | `test/idle-timeout-env.ts` | 111 | 测试 |
 | 44 | [44-test-timeouts.md](modules/44-test-timeouts.md) | `test/timeouts.ts` | 114 | 测试 |
+| 45 | [45-responses.md](modules/45-responses.md) | `src/modules/responses/`（11 文件） | 1725 | 协议层 |
 
 ### 总报告
 
