@@ -40,7 +40,7 @@
 | `input` 字符串 | → `user` 消息 |
 | `input[].{role,content}` 分片 `input_text` / `output_text` / `text` | → `text` |
 | `input_image` / `image_url` / `image` | → `image_url`（data URL 兼容） |
-| `input[].type: function_call` | → assistant `tool_calls`（`id=call_id`） |
+| `input[].type: function_call` | → assistant `tool_calls`（`id=call_id`）；连续多个（并行调用）合并进同一条 assistant 消息，保证 tool 结果紧邻 |
 | `input[].type: function_call_output` | → `role:'tool'`（`tool_call_id=call_id`，output 字符串化） |
 | `input[].type: reasoning` / `item_reference` / mcp_* | 忽略 + debug 日志（无 CC 对应） |
 | `input_file` / `refusal` | 文本占位符，不静默丢 |

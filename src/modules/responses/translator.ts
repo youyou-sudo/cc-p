@@ -243,8 +243,15 @@ export function convertResponsesToOpenAI(responsesReq: any): any {
   if (typeof input === 'string') {
     if (input) messages.push({ role: 'user', content: input })
   } else if (Array.isArray(input)) {
+    // Parallel tool calls arrive as consecutive `function_call` items. Upstream
+    // requires one assistant tool_calls message immediately followed by tool
+    // results, so merge consecutive calls into a single assistant message
+    // (symmetric with messages/translator.ts grouping an assistant turn's
+    // tool_use blocks). Non-call items reset the container.
+    let toolCallContainer: any = null
     for (const item of input) {
       if (typeof item === 'string') {
+        toolCallContainer = null
         if (item) messages.push({ role: 'user', content: item })
         continue
       }
@@ -255,24 +262,32 @@ export function convertResponsesToOpenAI(responsesReq: any): any {
       const type = item.type
       if (type === 'function_call') {
         const callId = item.call_id || item.id || `call_${uuid().slice(0, 8)}`
-        messages.push({
-          role: 'assistant',
-          content: null,
-          tool_calls: [{
-            id: callId,
-            type: 'function',
-            function: { name: item.name || '', arguments: toolArgsToString(item.arguments) },
-          }],
-        })
+        const toolCall = {
+          id: callId,
+          type: 'function',
+          function: { name: item.name || '', arguments: toolArgsToString(item.arguments) },
+        }
+        if (toolCallContainer) {
+          toolCallContainer.tool_calls.push(toolCall)
+        } else {
+          toolCallContainer = { role: 'assistant', content: null, tool_calls: [toolCall] }
+          messages.push(toolCallContainer)
+        }
       } else if (type === 'function_call_output') {
+        toolCallContainer = null
+        const callId = item.call_id || item.id || ''
+        if (!callId) log('warn', 'responses function_call_output missing call_id', {})
         messages.push({
           role: 'tool',
-          tool_call_id: item.call_id || item.id || '',
+          tool_call_id: callId,
           content: outputToText(item.output),
         })
       } else if (type === 'reasoning' || type === 'item_reference' || type === 'computer_call_output' || type === 'mcp_call' || type === 'mcp_approval_response') {
+        // Ignored items (e.g. reasoning between parallel calls) must not break
+        // the tool-call grouping, so the container is intentionally kept.
         log('debug', 'responses input item ignored (no CC equivalent)', { itemType: type })
       } else if (item.role) {
+        toolCallContainer = null
         messages.push({ role: item.role, content: convertContentParts(item.content) })
       } else {
         log('warn', 'responses input item unknown dropped', { itemType: type || '' })

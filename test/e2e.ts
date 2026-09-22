@@ -584,6 +584,29 @@ console.log('--- responses non-stream ---')
   check('responses cache_control injected', b.params.messages[0].content.at(-1).cache_control?.type === 'ephemeral', b.params.messages[0].content)
 }
 
+console.log('--- responses parallel tool calls ---')
+{
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({
+      model: 'mock/model',
+      input: [
+        { role: 'user', content: [{ type: 'input_text', text: 'both?' }] },
+        { type: 'function_call', call_id: 'call_a', name: 'get_weather', arguments: '{"city":"SF"}' },
+        { type: 'function_call', call_id: 'call_b', name: 'get_time', arguments: '{"tz":"UTC"}' },
+        { type: 'function_call_output', call_id: 'call_a', output: 'sunny' },
+        { type: 'function_call_output', call_id: 'call_b', output: '12:00' },
+      ],
+    }),
+  })
+  check('responses parallel 200', r.status === 200, r.status)
+  const b = (await statsFetch()).lastGenerateBody
+  check('responses parallel one assistant tool-call msg', b.params.messages[1].role === 'assistant' && b.params.messages[1].content.length === 2 && b.params.messages[1].content[0].type === 'tool-call' && b.params.messages[1].content[1].type === 'tool-call', b.params.messages[1])
+  check('responses parallel tool ids preserved', b.params.messages[1].content[0].toolCallId === 'call_a' && b.params.messages[1].content[1].toolCallId === 'call_b', b.params.messages[1])
+  check('responses parallel tool results adjacent', b.params.messages[2].role === 'tool' && b.params.messages[2].content[0].toolCallId === 'call_a' && b.params.messages[3].role === 'tool' && b.params.messages[3].content[0].toolCallId === 'call_b', b.params.messages)
+}
+
 console.log('--- responses reasoning ---')
 {
   const r = await fetch(BASE + '/v1/responses', {

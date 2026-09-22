@@ -210,6 +210,34 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('responses convert scalars', req.max_tokens === 321 && req.top_p === 0.8 && req.temperature === 0.2 && req.parallel_tool_calls === false && req.reasoning_effort === 'high' && req.user === 'u_1' && req.prompt_cache_key === 'pk', req)
   check('responses convert ignores stateless fields', req.store === undefined && req.previous_response_id === undefined && req.include === undefined, req)
 
+  // Parallel tool calls: consecutive function_call items must collapse into one
+  // assistant message so every tool_call_id is immediately followed by its tool
+  // result (upstream rejects "insufficient tool messages following tool_calls").
+  const par = convertResponsesToOpenAI({
+    input: [
+      { role: 'user', content: 'go' },
+      { type: 'function_call', call_id: 'call_a', name: 'fa', arguments: '{"a":1}' },
+      { type: 'function_call', call_id: 'call_b', name: 'fb', arguments: '{"b":2}' },
+      { type: 'reasoning', summary: [] },
+      { type: 'function_call_output', call_id: 'call_a', output: 'ra' },
+      { type: 'function_call_output', call_id: 'call_b', output: 'rb' },
+    ],
+  })
+  check('responses parallel calls grouped into one assistant', par.messages.length === 4 && par.messages[1].role === 'assistant' && par.messages[1].tool_calls?.length === 2, par.messages)
+  check('responses parallel calls order preserved', par.messages[1].tool_calls[0].id === 'call_a' && par.messages[1].tool_calls[1].id === 'call_b', par.messages[1])
+  check('responses parallel outputs immediately follow', par.messages[2].role === 'tool' && par.messages[2].tool_call_id === 'call_a' && par.messages[3].role === 'tool' && par.messages[3].tool_call_id === 'call_b', par.messages)
+
+  // Sequential calls (output between calls) must stay as separate assistant turns.
+  const seq = convertResponsesToOpenAI({
+    input: [
+      { type: 'function_call', call_id: 'call_x', name: 'fx', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'call_x', output: 'rx' },
+      { type: 'function_call', call_id: 'call_y', name: 'fy', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'call_y', output: 'ry' },
+    ],
+  })
+  check('responses sequential calls not merged', seq.messages.length === 4 && seq.messages[0].tool_calls.length === 1 && seq.messages[2].tool_calls.length === 1, seq.messages)
+
   const out = buildResponsesObject('m2', 'resp_x', 123, {
     fullText: 'hello',
     reasoningContent: 'think',
