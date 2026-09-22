@@ -2,7 +2,7 @@ import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
 import { mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
 import { log } from '../../shared/logger'
-import { bytesToBase64, sha256bytes, uuid } from '../../shared/util'
+import { uuid } from '../../shared/util'
 
 // ---- local helpers (file-local, avoid cycles) ----
 function toNum(v: any): number {
@@ -53,13 +53,10 @@ function estimateTokensForText(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4))
 }
 
-// fakeThinkingSignature kept: Anthropic requires a signature for thinking
-// blocks; upstream gives none, so we synthesize a deterministic placeholder.
-export function fakeThinkingSignature(thinkingText: string): string {
-  const seed = sha256bytes(thinkingText || 'dsh-proxy-thinking').slice(0, 64)
-  const raw = new Uint8Array([0x12, seed.length, ...seed])
-  return bytesToBase64(raw)
-}
+// Anthropic thinking 分片的 signature：官方 CLI 在 gateway 路线上就发空串
+// （1.62.1 bundle 内 legacy 路径写死 signature:""），上游不校验其内容。
+// 本地此前伪造 base64 密文属于凭空造数据，改为与官方一致的占位空串。
+export const EMPTY_THINKING_SIGNATURE = ''
 
 /** Extract a data-URL or plain URL from an Anthropic image/document source. */
 function anthropicSourceToUrl(source: any): string {
@@ -283,8 +280,12 @@ export function convertAnthropicToOpenAI(anthropicReq: any): any {
     } else if (t.type === 'adaptive') {
       openaiReq.reasoning_effort = t.effort ?? 'medium'
     } else if (t.budget_tokens !== undefined) {
-      // 10k/5k cutoffs kept; <5k (incl 2k bucket) → low (previously duplicated else branch collapsed).
-      if (t.budget_tokens >= 10000) openaiReq.reasoning_effort = 'high'
+      // 官方档位全集 low<medium<high<xhigh<max（bundle 内 41 处 xhigh）；
+      // 本地原先把 >=10k 一律压到 high，丢失 xhigh/max。切点按数量级放大，
+      // 保持与官方 5 档语义一致（budget 越大档位越高）。
+      if (t.budget_tokens >= 50000) openaiReq.reasoning_effort = 'max'
+      else if (t.budget_tokens >= 25000) openaiReq.reasoning_effort = 'xhigh'
+      else if (t.budget_tokens >= 10000) openaiReq.reasoning_effort = 'high'
       else if (t.budget_tokens >= 5000) openaiReq.reasoning_effort = 'medium'
       else openaiReq.reasoning_effort = 'low'
     }
@@ -335,7 +336,7 @@ export function createAnthropicSseTranslator(
       const type = currentBlockType
       let out = ''
       if (type === 'thinking') {
-        out += `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: idx, delta: { type: 'signature_delta', signature: fakeThinkingSignature(currentThinkingText) } })}\n\n`
+        out += `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: idx, delta: { type: 'signature_delta', signature: EMPTY_THINKING_SIGNATURE } })}\n\n`
         currentThinkingText = ''
       }
       blockStarted = false

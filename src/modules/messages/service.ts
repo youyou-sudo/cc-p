@@ -9,7 +9,7 @@ export {
   buildAnthropicResponse,
   convertAnthropicToOpenAI,
   createAnthropicSseTranslator,
-  fakeThinkingSignature,
+  EMPTY_THINKING_SIGNATURE,
   handleMessagesBody,
 } from './protocol'
 export type { AnthropicStreamContext } from './protocol'

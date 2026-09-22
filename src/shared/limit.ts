@@ -10,6 +10,7 @@ export type UpstreamLimitKind =
   | 'context_overflow'
   | 'payment_required'
   | 'authed_session_refused'
+  | 'model_not_in_plan'
   | 'unknown'
 
 export interface LimitMeta {
@@ -21,7 +22,11 @@ export interface LimitMeta {
 const USAGE_5H_PATTERN = /5-hour|5 hour|five hour/i
 const USAGE_WEEKLY_PATTERN = /week/i
 const PAYMENT_MESSAGE_PATTERN =
-  /insufficient\s+credits?|out\s+of\s+credits?|no\s+credits?|payment\s+required|billing|past\s+due|balance\s+(exhausted|insufficient)|insufficient\s+balance/i
+  /insufficient\s+credits?|out\s+of\s+credits?|no\s+credits?|payment\s+required|billing|past\s+due|balance\s+(exhausted|insufficient)|insufficient\s+balance|premium[_ ]+credits?[_ ]+exhausted/i
+// 官方 CLI 的终局标记之一（`premium_credits_exhausted` / `model_not_in_plan` /
+// `insufficient credits` 命中即判不可重试）。model_not_in_plan 是订阅/授权类，
+// 重试永远不会成功，必须与真实 429 区分开。
+const MODEL_NOT_IN_PLAN_PATTERN = /model[_ ]?not[_ ]?in[_ ]?(the[_ ]?)?plan/i
 // Local overflow whitelist. Duplicated from errors.ts (CONTEXT_WINDOW_EXCEEDED_PATTERN)
 // on purpose to avoid an errors<->limit import cycle; keep the two in sync.
 const CONTEXT_OVERFLOW_PATTERN =
@@ -36,6 +41,8 @@ export function classifyUpstreamLimit(status: number, message: string): Upstream
   // Usage windows first: they arrive as 429 but must NOT be retried.
   if (status === 429 && USAGE_5H_PATTERN.test(msg)) return 'usage_window_5h'
   if (status === 429 && USAGE_WEEKLY_PATTERN.test(msg)) return 'usage_window_weekly'
+  // Plan/entitlement wall: terminal regardless of the status the server used.
+  if (MODEL_NOT_IN_PLAN_PATTERN.test(msg)) return 'model_not_in_plan'
   // Payment wording wins even when upstream mislabels the status (e.g. 429
   // with "insufficient credits"): retrying burns money, never retry.
   if (PAYMENT_MESSAGE_PATTERN.test(msg)) return 'payment_required'

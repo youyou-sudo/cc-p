@@ -1,5 +1,5 @@
 import { log } from '../shared/logger'
-import { sha256hex, uuid } from '../shared/util'
+import { generateSessionId, sha256hex, uuidFromSeed } from '../shared/util'
 import { keyStateStore } from './fingerprint'
 import { pruneAllGatesEmpty } from '../shared/concurrency'
 // NOTE: runtime.ts is imported lazily inside cleanup (dynamic import) to keep
@@ -56,7 +56,8 @@ export function ensureSession(apiKey: string): string {
   }
 
   const jitter = Math.floor(Math.random() * SESSION_JITTER_MS)
-  const sessionId = uuid()
+  // 官方 CLI 形状 `sess_<16 hex>`（bundle generateSessionId），不是裸 UUID。
+  const sessionId = generateSessionId()
   sessionStore.set(apiKey, { sessionId, expiresAt: now + SESSION_DURATION_MS + jitter })
   log('info', 'Session created', { sessionHash: shortId(sessionId), storeSize: sessionStore.size })
   return sessionId
@@ -102,6 +103,24 @@ export function getSessionId(
     return ensureSession(apiKey.slice(0, MAX_API_KEY_LENGTH))
   }
   return ensureSession(apiKey)
+}
+
+export interface SessionContext {
+  /** 上游 `x-session-id` 头。 */
+  sessionId: string
+  /** 上游 body 的 `threadId`：官方要求合法 UUID（非 UUID 会被 SDK 层丢弃），
+   *  因此由 sessionId 确定性派生，保证同一会话恒得同一 thread。 */
+  threadId: string
+}
+
+/** sessionId + 派生 threadId 一次解析，供上行请求同时使用（见 cc.forwardToCC）。 */
+export function getSessionContext(
+  incomingHeaders: Record<string, string | undefined>,
+  apiKey: string,
+  promptCacheKey?: string,
+): SessionContext {
+  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey)
+  return { sessionId, threadId: uuidFromSeed(sessionId) }
 }
 
 async function runCleanupOnce(): Promise<void> {

@@ -7,6 +7,7 @@
 // duplicated event switches and gives a single place to add new event types.
 
 import { log } from '../shared/logger'
+import { normalizeCcUsage } from '../shared/cc-types'
 import type { CcErrorEvent, CcEventType } from '../shared/cc-types'
 
 // Every event type the upstream can emit (union of CcStreamEvent types). A
@@ -16,7 +17,7 @@ export const CC_EVENT_TYPES: ReadonlySet<CcEventType> = new Set<CcEventType>([
   'start', 'start-step',
   'reasoning-start', 'reasoning-end', 'reasoning-delta',
   'text-start', 'text-end', 'text-delta',
-  'tool-call',
+  'tool-call', 'tool-result', 'abort',
   'finish-step', 'finish',
   'tool-input-start', 'tool-input-delta', 'tool-input-end', 'tool-error',
   'provider-metadata',
@@ -74,6 +75,11 @@ export class CcStreamParser {
     }
     if (!event.type) return
     this.lastCcEvent = event.type
+
+    // Normalize upstream usage field names once, at the wire boundary, so every
+    // downstream translator keeps reading one internal shape (see normalizeCcUsage).
+    if (event.usage) event.usage = normalizeCcUsage(event.usage) ?? event.usage
+    if (event.totalUsage) event.totalUsage = normalizeCcUsage(event.totalUsage) ?? event.totalUsage
 
     if (event.type === 'error') {
       this.errorEvent = event as CcErrorEvent

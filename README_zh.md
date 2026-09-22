@@ -13,7 +13,7 @@
 - **三协议**：`POST /v1/chat/completions`（OpenAI）+ `POST /v1/responses`（OpenAI Responses）+ `POST /v1/messages`（Anthropic）
 - **流式 / 非流式**、工具调用、多模态图片、`reasoning_effort` / `thinking`
 - **动态模型**：`GET /v1/models` 从 Provider API 获取（5 分钟缓存），失败回退内置列表
-- **CLI 仿真**：按 Key 的设备指纹（8h + 2h 抖动）、`cli_session_exists` 生命周期事件、按 Key 会话（12h + 1h 抖动）、`x-command-code-version` 取自 npm（每天刷新）、`traceparent`、`x-project-slug`
+- **CLI 仿真**：按 Key 的设备指纹（8h + 2h 抖动，官方 `thumbmark` 公式）、生命周期事件（`cli_installed` / `cli_session_exists` / `cli_first_message`）、按 Key 会话 `sess_<16hex>`（12h + 1h 抖动）及派生的 `threadId`、`User-Agent: cli`、`x-command-code-version` 取自 npm（每天刷新）、`traceparent`、`x-project-slug`
 - **容错**：零输出 → 可重试 `429`，空闲超时（流式 30s / 非流式 90s，可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变；思考期 `start`/`start-step`/`reasoning-start`/`reasoning-delta` 走 120s 宽限 `CC_THINKING_IDLE_MS`）→ `429`，断连立刻中止上游
 - **认证灵活**：按请求的 `Bearer user_*` / `x-api-key`，自托管可选 `CC_API_KEY` 兜底
 - **开箱可运维**：`GET /health`、`server healthcheck` CLI、Docker HEALTHCHECK、隐私日志（不记 Key、包体与堆栈）
@@ -119,12 +119,12 @@ Anthropic 结构，自动转换：
 | `user` 块中的 `tool_result` | → `role: "tool"` 消息 |
 | `tools[].input_schema` | → `parameters` |
 | `tool_choice: auto / any / tool / none` | → `auto / required / {function} / none` |
-| `thinking.budget_tokens` | → `reasoning_effort`（≥10000 high，≥5000 medium，≥2000 low） |
+| `thinking.budget_tokens` | → `reasoning_effort`（≥50000 max，≥25000 xhigh，≥10000 high，≥5000 medium，否则 low） |
 | `thinking.type: adaptive` | → `reasoning_effort: effort` |
 | CC `finishReason` | → `end_turn / max_tokens / tool_use` |
 
 流式输出 `message_start / content_block_* / message_delta / message_stop`；
-`thinking` 块会带一个合成 `signature`，满足严格 SDK 的校验。
+`thinking` 块带官方同款空 `signature`（字段必须存在，内容上游不校验）。
 
 ### `POST /v1/responses`
 
@@ -179,6 +179,7 @@ Bun 启动时自动加载 `.env`。空值 = 沿用 `config.json`；真实 shell 
 | `CC_STREAM_IDLE_MS` | ——（仅环境变量） | `30000` |
 | `CC_NONSTREAM_IDLE_MS` | ——（仅环境变量） | `90000` |
 | `CC_THINKING_IDLE_MS` | ——（仅环境变量） | `120000`（思考期宽限：`start`/`start-step`/`reasoning-start`/`reasoning-delta`；深度推理/高 `reasoning_effort` 建议 `180000`；调大代价是真 hang 时失败感知更慢） |
+| `CC_FORWARD_SAMPLING_PARAMS` | ——（仅环境变量） | `false`（忠实复刻 CLI 线格式：`top_p` / `stop` / `user` / `seed` / `tool_choice` / `parallel_tool_calls` 仍接受但不外发，因为官方 CLI 从不发送；设 `true` 恢复透传） |
 
 > **默认值说明：** 源码运行（`bun start`）、Docker 镜像、Release 二进制共用同一套
 > 内置默认值——`3050` / `0.0.0.0`，与入库的 `config.json` 一致。`PORT` / `HOST`
@@ -312,13 +313,15 @@ rate_limit_error`——看到该包装先拆开看内层 `retry_after` 再决策
 
 按 API Key，在首次调用上游前（之后约每 8h）执行：
 
-1. `POST /alpha/fingerprint/record` ——随机但合理的可信指纹（SHA-256 哈希的机器/MAC/用户/主机名、CPU 池、内存、时区、`win32/x64`），与 Key 绑定。
-2. `POST /alpha/lifecycle-events`（`cli_session_exists`）——与指纹并行发送。
+1. `POST /alpha/fingerprint/record` ——随机但合理的可信指纹（官方 `thumbmark` 公式：`sha256("command-code:device-fingerprint:v1" + "\0machine\0" + 机器信号)`，组件哈希同盐派生），与 Key 绑定。
+2. `POST /alpha/lifecycle-events` ——`cli_installed` / `cli_session_exists` / `cli_first_message`（官方 4 种中反代适用的 3 种），与指纹并行发送。
 
-每次 `POST /alpha/generate` 携带 `Authorization`、`x-cli-environment: production`、
+每次 `POST /alpha/generate` 携带 `User-Agent: cli`、`Authorization`、`x-cli-environment: production`、
 `x-command-code-version`（npm `command-code@latest`，每天刷新）、`x-session-id`
-（按 Key 12h 会话，可经 `x-session-id` / `prompt_cache_key` 复用）、`x-project-slug`、
-`traceparent`（W3C），以及可选的 `x-cmd-zdr: 1`。
+（`sess_<16hex>`，按 Key 12h 会话，可经 `x-session-id` / `prompt_cache_key` 复用）、`x-project-slug`、
+`traceparent`（W3C），以及可选的 `x-cmd-zdr: 1`。请求体顶层与 CLI 一致：
+`config` / `memory` / `taste` / `skills: null` / `permissionMode` / `threadId` / `params`，
+其中 `params` 只带 `model` / `messages` / `tools` / `system` / `max_tokens` / `stream` / `temperature?` / `reasoning_effort?`。
 
 ## 项目结构
 

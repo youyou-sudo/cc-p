@@ -2,7 +2,7 @@ import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
 import { mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
 import { uuid } from '../../shared/util'
-import { fakeThinkingSignature } from './translator'
+import { EMPTY_THINKING_SIGNATURE } from './translator'
 
 // ---- local helpers (file-local, avoid cycles) ----
 function toNum(v: any): number {
@@ -65,9 +65,9 @@ export function rawUsageFromCcUsageAnthropic(u: any): { input_tokens: number; ou
 
 export function buildAnthropicResponse(model: string, fullText: string, toolCalls: any[] | null, finishReason: string, usage: any, thinkingText: string): any {
   const content: any[] = []
-  // fakeThinkingSignature kept: Anthropic requires a signature for thinking
-  // blocks; upstream gives none, so we synthesize a deterministic placeholder.
-  if (thinkingText) content.push({ type: 'thinking', thinking: thinkingText, signature: fakeThinkingSignature(thinkingText) })
+  // signature 用官方同款空串占位（见 translator.EMPTY_THINKING_SIGNATURE）；
+  // Anthropic 要求字段存在，但不校验内容，官方 CLI 也是空串。
+  if (thinkingText) content.push({ type: 'thinking', thinking: thinkingText, signature: EMPTY_THINKING_SIGNATURE })
   if (fullText) content.push({ type: 'text', text: fullText })
   if (toolCalls) {
     for (const tc of toolCalls) {

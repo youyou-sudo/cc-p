@@ -10,6 +10,9 @@ export const modelEntry = t.Object(
     created: t.Optional(t.Number()),
     owned_by: t.Optional(t.String()),
     context_window: t.Optional(t.Number()),
+    max_output_tokens: t.Optional(t.Number()),
+    // 该模型允许的 reasoning_effort 档位（low|medium|high|xhigh|max 的子集）。
+    reasoning_efforts: t.Optional(t.Array(t.String())),
     // vision 声明（多别名兼容各客户端解析器，原有字段不动，additionalProperties 仍 true）。
     modalities: t.Optional(t.Array(t.String())),
     input_modalities: t.Optional(t.Array(t.String())),

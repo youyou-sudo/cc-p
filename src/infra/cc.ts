@@ -1,5 +1,5 @@
-import { CFG } from '../shared/config'
-import { getSessionId } from './session'
+import { CFG, FORWARD_SAMPLING_PARAMS } from '../shared/config'
+import { getSessionContext } from './session'
 import { CC_VERSION } from '../shared/version'
 import { fakeProjectSlug, generateTraceparent, getDateStr, getEnvironment, tryParseJSONStrict, isJSONParseFailure, randHex } from '../shared/util'
 import { log } from '../shared/logger'
@@ -239,12 +239,27 @@ export function buildCcRequest(openaiReq: any): any {
     }
     if (msg.role === 'assistant') {
       const parts: any[] = []
+      // 思考历史必须回灌：官方与生态（cpa-plugin/cmdcode2api/dsh/nodejs）都把
+      // assistant 的 thinking 作为 {type:'reasoning',text} 带上；本地此前对
+      // reasoning/thinking 分片一律 warn+丢弃，多轮 tool-loop 会丢推理上下文。
+      const reasoningText = typeof msg.reasoning_content === 'string' ? msg.reasoning_content.trim() : ''
+      if (reasoningText) parts.push({ type: 'reasoning', text: reasoningText })
       if (msg.content && typeof msg.content === 'string') {
         parts.push({ type: 'text', text: msg.content })
       } else if (msg.content && Array.isArray(msg.content)) {
         for (const part of msg.content) {
           if (part.type === 'text') parts.push(stripNonEphemeralCacheControl(part))
-          else if (part.type === 'image_url' || part.type === 'image') {
+          else if (part.type === 'reasoning') {
+            const text = typeof part.text === 'string' ? part.text : ''
+            if (text) parts.push({ type: 'reasoning', text })
+          } else if (part.type === 'thinking') {
+            const text = typeof part.thinking === 'string' ? part.thinking : ''
+            if (text) parts.push({ type: 'reasoning', text })
+          } else if (part.type === 'redacted_thinking') {
+            // 上游 gateway 路线本身不校验 signature/密文（官方发空 signature），
+            // 只保留文本语义：无明文则跳过，绝不伪造密文。
+            log('debug', 'cc assistant redacted_thinking skipped (no plaintext)', {})
+          } else if (part.type === 'image_url' || part.type === 'image') {
             const url = extractImageUrl(part)
             if (!url) {
               log('warn', 'cc assistant image omitted: empty url', {})
@@ -357,7 +372,8 @@ export function buildCcRequest(openaiReq: any): any {
     },
     memory: null,
     taste: null,
-    skills: '',
+    // 官方恒为 null（1.62.1 bundle 实测）；此前发空串属于形状不一致。
+    skills: null,
     permissionMode: 'standard',
     params: {
       model: model || 'deepseek/deepseek-v4-flash',
@@ -403,38 +419,56 @@ export function buildCcRequest(openaiReq: any): any {
       return out
     })
   }
-  if (tool_choice !== undefined) {
-    if (typeof tool_choice === 'string') {
-      const map: Record<string, string> = { 'auto': 'auto', 'none': 'none', 'required': 'any' }
-      ;(body.params as any).tool_choice = { type: map[tool_choice] || 'auto' }
-    } else if (tool_choice && tool_choice.type === 'function') {
-      const out: any = { type: 'tool', name: tool_choice.function?.name }
-      // 显式透传并行/白名单开关，未知键也不丢（避免静默降级）。
-      if (tool_choice.allowed_tools !== undefined) out.allowed_tools = tool_choice.allowed_tools
-      if (tool_choice.disable_parallel_tool_use !== undefined) out.disable_parallel_tool_use = tool_choice.disable_parallel_tool_use
-      for (const k of Object.keys(tool_choice)) {
-        if (!(k in out) && k !== 'type' && k !== 'function') out[k] = tool_choice[k]
+  // 采样/工具控制参数默认不外发：官方 /alpha/generate 只带 model/messages/tools/
+  // system/max_tokens/stream/temperature?/reasoning_effort?，多带 top_p/stop/user/
+  // seed/tool_choice/parallel_tool_calls 会让请求体与真实 CLI 不一致（可被风控识别）。
+  // 客户端仍可传这些字段（schema 不变、非法值照旧 400），只是不再转发；
+  // CC_FORWARD_SAMPLING_PARAMS=true 可恢复旧行为（见 shared/config.ts）。
+  if (FORWARD_SAMPLING_PARAMS) {
+    if (tool_choice !== undefined) {
+      if (typeof tool_choice === 'string') {
+        const map: Record<string, string> = { 'auto': 'auto', 'none': 'none', 'required': 'any' }
+        ;(body.params as any).tool_choice = { type: map[tool_choice] || 'auto' }
+      } else if (tool_choice && tool_choice.type === 'function') {
+        const out: any = { type: 'tool', name: tool_choice.function?.name }
+        // 显式透传并行/白名单开关，未知键也不丢（避免静默降级）。
+        if (tool_choice.allowed_tools !== undefined) out.allowed_tools = tool_choice.allowed_tools
+        if (tool_choice.disable_parallel_tool_use !== undefined) out.disable_parallel_tool_use = tool_choice.disable_parallel_tool_use
+        for (const k of Object.keys(tool_choice)) {
+          if (!(k in out) && k !== 'type' && k !== 'function') out[k] = tool_choice[k]
+        }
+        ;(body.params as any).tool_choice = out
+      } else {
+        // 未知对象（含 allowed_tools / disable_parallel_tool_use）整体透传不丢。
+        ;(body.params as any).tool_choice = tool_choice
       }
-      ;(body.params as any).tool_choice = out
-    } else {
-      // 未知对象（含 allowed_tools / disable_parallel_tool_use）整体透传不丢。
-      ;(body.params as any).tool_choice = tool_choice
     }
-  }
-  if (parallel_tool_calls !== undefined) {
-    ;(body.params as any).parallel_tool_calls = parallel_tool_calls
-  }
-  if (top_p !== undefined) {
-    ;(body.params as any).top_p = top_p
-  }
-  if (normalizedStop !== undefined) {
-    ;(body.params as any).stop = normalizedStop
-  }
-  if (user !== undefined) {
-    ;(body.params as any).user = user
-  }
-  if (seed !== undefined) {
-    ;(body.params as any).seed = seed
+    if (parallel_tool_calls !== undefined) {
+      ;(body.params as any).parallel_tool_calls = parallel_tool_calls
+    }
+    if (top_p !== undefined) {
+      ;(body.params as any).top_p = top_p
+    }
+    if (normalizedStop !== undefined) {
+      ;(body.params as any).stop = normalizedStop
+    }
+    if (user !== undefined) {
+      ;(body.params as any).user = user
+    }
+    if (seed !== undefined) {
+      ;(body.params as any).seed = seed
+    }
+  } else {
+    log('debug', 'cc sampling/tool-control params not forwarded (faithful CLI wire)', {
+      dropped: [
+        tool_choice !== undefined ? 'tool_choice' : '',
+        parallel_tool_calls !== undefined ? 'parallel_tool_calls' : '',
+        top_p !== undefined ? 'top_p' : '',
+        normalizedStop !== undefined ? 'stop' : '',
+        user !== undefined ? 'user' : '',
+        seed !== undefined ? 'seed' : '',
+      ].filter(Boolean),
+    })
   }
   void max_tokens
 
@@ -455,19 +489,27 @@ export async function forwardToCC(
     const lower = k.toLowerCase()
     if (normalizedForSession[lower] === undefined) normalizedForSession[lower] = incomingHeaders[k]
   }
-  const sessionId = getSessionId(normalizedForSession, apiKey, promptCacheKey)
+  const { sessionId, threadId } = getSessionContext(normalizedForSession, apiKey, promptCacheKey)
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    // 官方 CLI 固定发 User-Agent: cli（bundle buildCommandAuthHeaders）；缺失会被
+    // Cloudflare 以 403 Error 1010 拦截，本地此前完全没有这个头。
+    'User-Agent': 'cli',
     'Authorization': `Bearer ${apiKey}`,
     'x-cli-environment': 'production',
     'x-command-code-version': CC_VERSION,
     'x-session-id': sessionId,
-    'x-co-flag': 'false',
+    // x-co-flag 已从官方 1.62.1 移除（bundle 内 0 命中，仅旧版本存在）；继续发送
+    // 反而是可识别的旧版指纹，故删除。
     'x-taste-learning': 'false',
     'x-project-slug': fakeProjectSlug(sessionId),
     'traceparent': generateTraceparent(),
   }
+
+  // 官方 body 顶层带 threadId（合法 UUID）；非 UUID 官方会省略，本地用派生的
+  // 稳定 UUID 恒定发送（同一 session 恒同一 thread）。
+  body.threadId = threadId
 
   // generate 侧统一 ZDR：CFG.zdr || 请求头 x-cmd-zdr==='1'（大小写不敏感）。
   if (CFG.zdr || getHeader(incomingHeaders, 'x-cmd-zdr') === '1') {

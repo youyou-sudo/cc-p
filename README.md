@@ -13,7 +13,7 @@ Stack: **Bun + Elysia + TypeScript**. Single-file binary via `bun build --compil
 - **Triple protocol**: `POST /v1/chat/completions` (OpenAI) + `POST /v1/responses` (OpenAI Responses) + `POST /v1/messages` (Anthropic)
 - **Streaming & non-streaming**, tool calling, multimodal images, `reasoning_effort` / `thinking`
 - **Dynamic models**: `GET /v1/models` from Provider API (5 min cache) with builtin fallback
-- **CLI emulation**: per-key device fingerprint (8h + 2h jitter), lifecycle `cli_session_exists`, per-key session (12h + 1h jitter), `x-command-code-version` from npm (24h refresh), `traceparent`, `x-project-slug`
+- **CLI emulation**: per-key device fingerprint (8h + 2h jitter, official `thumbmark` formula), lifecycle events (`cli_installed` / `cli_session_exists` / `cli_first_message`), per-key session `sess_<16hex>` (12h + 1h jitter) with derived `threadId`, `User-Agent: cli`, `x-command-code-version` from npm (24h refresh), `traceparent`, `x-project-slug`
 - **Resilience**: zero-output → `429` retryable, idle timeout (30s stream / 90s non-stream, overridable via `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS`, defaults unchanged; thinking phase `start`/`start-step`/`reasoning-start`/`reasoning-delta` gets a 120s window via `CC_THINKING_IDLE_MS`) → `429`, disconnect aborts upstream
 - **Auth flexibility**: per-request `Bearer user_*` / `x-api-key`, optional `CC_API_KEY` fallback for self-host
 - **Ops ready**: `GET /health`, `server healthcheck` CLI, Docker HEALTHCHECK, privacy-aware logs (no keys, bodies, or stacks)
@@ -122,7 +122,7 @@ Anthropic schema with automatic conversion:
 | `thinking.type: adaptive` | → `reasoning_effort: effort` |
 | CC `finishReason` | → `end_turn / max_tokens / tool_use` |
 
-Streaming emits `message_start / content_block_* / message_delta / message_stop`; `thinking` blocks get a synthetic `signature` so strict SDKs validate.
+Streaming emits `message_start / content_block_* / message_delta / message_stop`; `thinking` blocks carry the same empty `signature` the official CLI emits (the field must be present, its content is not validated upstream).
 
 ### `POST /v1/responses`
 
@@ -169,6 +169,7 @@ Precedence (low → high): **builtin defaults → `config.json` → `.env` / env
 | `CC_STREAM_IDLE_MS` | — (env only) | `30000` |
 | `CC_NONSTREAM_IDLE_MS` | — (env only) | `90000` |
 | `CC_THINKING_IDLE_MS` | — (env only) | `120000` (thinking-phase grace: `start`/`start-step`/`reasoning-start`/`reasoning-delta`; use `180000` for deep reasoning / high `reasoning_effort`; cost of raising is slower failure detection on true hangs) |
+| `CC_FORWARD_SAMPLING_PARAMS` | — (env only) | `false` (faithful CLI wire: `top_p` / `stop` / `user` / `seed` / `tool_choice` / `parallel_tool_calls` are accepted but **not** forwarded upstream, because the official CLI never sends them; set `true` to restore passthrough) |
 
 > **Note on defaults:** source runs (`bun start`), Docker images, and Release
 > binaries all share one set of builtin defaults — `3050` / `0.0.0.0` — matching
@@ -319,7 +320,7 @@ Per API key, before the first upstream call (and every ~8h after):
 1. `POST /alpha/fingerprint/record` — random but plausible fingerprint (SHA-256 hashed machine/MAC/user/hostname IDs, CPU pool, memory, timezone, `win32/x64`), bound to the key.
 2. `POST /alpha/lifecycle-events` (`cli_session_exists`) — sent in parallel with the fingerprint.
 
-Each `POST /alpha/generate` then carries `Authorization`, `x-cli-environment: production`, `x-command-code-version` (npm `command-code@latest`, refreshed daily), `x-session-id` (12h per-key session, reusable via `x-session-id` / `prompt_cache_key` headers), `x-project-slug`, `traceparent` (W3C), and optional `x-cmd-zdr: 1`.
+Each `POST /alpha/generate` then carries `User-Agent: cli`, `Authorization`, `x-cli-environment: production`, `x-command-code-version` (npm `command-code@latest`, refreshed daily), `x-session-id` (`sess_<16hex>`, 12h per-key session, reusable via `x-session-id` / `prompt_cache_key` headers), `x-project-slug`, `traceparent` (W3C), and optional `x-cmd-zdr: 1`. The request body mirrors the CLI's top-level shape: `config` / `memory` / `taste` / `skills: null` / `permissionMode` / `threadId` / `params`, where `params` carries only `model` / `messages` / `tools` / `system` / `max_tokens` / `stream` / `temperature?` / `reasoning_effort?`.
 
 ## Project Structure
 

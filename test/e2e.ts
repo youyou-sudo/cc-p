@@ -90,6 +90,25 @@ Bun.serve({
             { type: 'text-delta', text: 'params-ok' },
             { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0 } },
           ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        case 'mock/realshape':
+          // 真实上游 usage 形状：cache 计数在 inputTokenDetails 里（含 1h 写入）；
+          // 并夹带 tool-result / abort 事件，验证不再被判为 unknown。
+          return new Response(ndjson([
+            { type: 'start' },
+            { type: 'text-delta', text: 'real' },
+            { type: 'tool-result', toolCallId: 'srv_1', toolName: 'web_search', providerExecuted: true, output: { type: 'text', value: 'x' } },
+            { type: 'abort' },
+            { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 200, outputTokens: 30, inputTokenDetails: { cacheReadTokens: 120, cacheWriteTokens: 40, cacheWriteTokens1h: 10 } } },
+          ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        case 'mock/structured-error':
+          // 官方 1.62.1 流式错误形状（statusCode/isRetryable）+ 终局标记。
+          return new Response(ndjson([
+            { type: 'error', error: { message: 'premium credits exhausted', statusCode: 402, isRetryable: false } },
+          ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        case 'mock/model-not-in-plan':
+          return new Response(ndjson([
+            { type: 'error', error: { message: 'Model not in plan: claude-opus-5', statusCode: 403, isRetryable: false } },
+          ]), { headers: { 'content-type': 'application/x-ndjson' } })
         default:
           return new Response(ndjson([
             { type: 'start' },
@@ -274,7 +293,7 @@ console.log('--- models ---')
   check('models from provider API', r.status === 200 && body.object === 'list' && body.data.length === 3 && body.data[0].id === 'mock-model-a', body)
   check('models passthrough context_window', body.data[0]?.context_window === 128000, body.data?.[0])
   check('models alias context_length → context_window', body.data[1]?.context_window === 64000, body.data?.[1])
-  check('models static fallback window', body.data[2]?.id === 'claude-sonnet-4-6' && body.data[2]?.context_window === 200000, body.data?.[2])
+  check('models static fallback window', body.data[2]?.id === 'claude-sonnet-4-6' && body.data[2]?.context_window === 1048576, body.data?.[2])
   check('models vision default modalities', body.data.every((m: any) => Array.isArray(m.modalities) && m.modalities.includes('image')) && body.data[0]?.supports_vision === true && body.data[0]?.vision === true, body.data?.[0])
 }
 
@@ -305,14 +324,18 @@ console.log('--- openai non-stream ---')
   check('upstream generate called once', s.generate === before + 1, s.generate)
   const h = s.lastGenerateHeaders
   check('bearer forwarded', h['authorization'] === `Bearer ${KEY}`)
-  check('session header present', !!h['x-session-id'] && h['x-session-id'].length >= 8)
+  check('official User-Agent: cli', h['user-agent'] === 'cli', h['user-agent'])
+  check('prompt_cache_key overrides session id', h['x-session-id'] === 'cache-key-001', h['x-session-id'])
   check('project slug format', /^-?[a-z0-9-]+$/.test(h['x-project-slug'] || ''), h['x-project-slug'])
   check('traceparent format', /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/.test(h['traceparent'] || ''), h['traceparent'])
   check('cli version header', !!h['x-command-code-version'])
-  check('co/taste flags', h['x-co-flag'] === 'false' && h['x-taste-learning'] === 'false')
+  check('x-co-flag removed (absent from official 1.62.1)', h['x-co-flag'] === undefined, h['x-co-flag'])
+  check('taste flag present', h['x-taste-learning'] === 'false')
 
   const b = s.lastGenerateBody
   check('params.stream always true', b.params.stream === true)
+  check('body threadId is a v4 UUID', /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(b.threadId || ''), b.threadId)
+  check('skills is null (official shape)', b.skills === null, b.skills)
   check('system extracted', b.params.system === 'be nice', b.params.system)
   check('tools mapped to input_schema', b.params.tools?.[0]?.name === 'get_weather' && !!b.params.tools?.[0]?.input_schema, b.params.tools)
   check('user msg wrapped', b.params.messages[0].role === 'user' && b.params.messages[0].content[0].type === 'text' && b.params.messages[0].content[0].text === 'hi')
@@ -377,11 +400,12 @@ console.log('--- param passthrough ---')
   check('params passthrough 200', r.status === 200 && body.choices?.[0]?.message?.content === 'params-ok', body)
   const s = await statsFetch()
   check('generate incremented', s.generate === before + 1)
+  check('generated session id is sess_ + 16 hex', /^sess_[0-9a-f]{16}$/.test(s.lastGenerateHeaders['x-session-id'] || ''), s.lastGenerateHeaders['x-session-id'])
   const b = s.lastGenerateBody
-  check('top_p passed through', b.params.top_p === 0.9, b.params)
-  check('stop passed through as array', Array.isArray(b.params.stop) && b.params.stop[0] === 'END' && b.params.stop[1] === '\n\n', b.params.stop)
-  check('user passed through', b.params.user === 'u_abc', b.params.user)
-  check('seed passed through', b.params.seed === 42, b.params.seed)
+  check('top_p withheld from CLI wire', b.params.top_p === undefined, b.params)
+  check('stop withheld from CLI wire', b.params.stop === undefined, b.params.stop)
+  check('user withheld from CLI wire', b.params.user === undefined, b.params.user)
+  check('seed withheld from CLI wire', b.params.seed === undefined, b.params.seed)
   check('empty system placeholder injected', b.params.system === ' ', b.params.system)
 }
 {
@@ -401,9 +425,56 @@ console.log('--- param passthrough ---')
   const s = await statsFetch()
   check('anthropic generate incremented', s.generate === before + 1)
   const b = s.lastGenerateBody
-  check('anthropic top_p → CC top_p', b.params.top_p === 0.5, b.params)
-  check('anthropic stop_sequences → CC stop', Array.isArray(b.params.stop) && b.params.stop[0] === 'STOP', b.params.stop)
-  check('anthropic metadata.user_id → CC user', b.params.user === 'u_xyz', b.params.user)
+  check('anthropic top_p withheld from CLI wire', b.params.top_p === undefined, b.params)
+  check('anthropic stop_sequences withheld from CLI wire', b.params.stop === undefined, b.params.stop)
+  check('anthropic metadata.user_id withheld from CLI wire', b.params.user === undefined, b.params.user)
+}
+
+console.log('--- upstream wire shape: usage / tool-result / abort / structured error ---')
+{
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/realshape', messages: [{ role: 'user', content: 'q' }] }),
+  })
+  const body = await r.json()
+  check('real-shape usage: inputTokenDetails.cacheReadTokens → cached_tokens', body.usage?.prompt_tokens_details?.cached_tokens === 120, body.usage)
+  check('real-shape usage: completion mapped', body.usage?.completion_tokens === 30, body.usage)
+  check('tool-result/abort tolerated (200 + content)', r.status === 200 && body.choices?.[0]?.message?.content === 'real', body)
+}
+{
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/structured-error', messages: [{ role: 'user', content: 'q' }] }),
+  })
+  const body = await r.json()
+  check('premium credits exhausted → 402 payment_required', r.status === 402 && body.error?.type === 'payment_required', body)
+  check('premium credits not retryable (no retry_after)', body.retry_after === undefined, body)
+}
+{
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/model-not-in-plan', messages: [{ role: 'user', content: 'q' }] }),
+  })
+  const body = await r.json()
+  check('model not in plan → 403 model_not_in_plan', r.status === 403 && body.error?.type === 'model_not_in_plan', body)
+}
+{
+  // 思考历史回灌：OpenAI assistant.reasoning_content → CC {type:'reasoning'}
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({
+      model: 'mock/params',
+      messages: [
+        { role: 'user', content: 'q1' },
+        { role: 'assistant', content: 'a1', reasoning_content: 'because reasons' },
+        { role: 'user', content: 'q2' },
+      ],
+    }),
+  })
+  await r.json()
+  const s = await statsFetch()
+  const assistantMsg = s.lastGenerateBody.params.messages.find((m: any) => m.role === 'assistant')
+  check('thinking history replayed as {type:reasoning}', assistantMsg?.content?.[0]?.type === 'reasoning' && assistantMsg.content[0].text === 'because reasons', assistantMsg)
 }
 
 console.log('--- zero output / upstream errors ---')
@@ -489,9 +560,9 @@ console.log('--- anthropic non-stream ---')
     body: JSON.stringify({ model: 'mock/reason', max_tokens: 100, messages: [{ role: 'user', content: 'q' }], thinking: { type: 'enabled', budget_tokens: 12000 } }),
   })
   const body = await r.json()
-  check('anthropic thinking block', body.content?.[0]?.type === 'thinking' && body.content?.[0]?.thinking === 'thinking hard' && typeof body.content?.[0]?.signature === 'string' && body.content?.[0]?.signature.startsWith('E'), body.content)
+  check('anthropic thinking block (empty official signature)', body.content?.[0]?.type === 'thinking' && body.content?.[0]?.thinking === 'thinking hard' && body.content?.[0]?.signature === '', body.content)
   const s = await statsFetch()
-  check('thinking → reasoning_effort high', s.lastGenerateBody.params.reasoning_effort === 'high', s.lastGenerateBody.params)
+  check('thinking budget 12000 → reasoning_effort high', s.lastGenerateBody.params.reasoning_effort === 'high', s.lastGenerateBody.params)
 }
 
 console.log('--- anthropic stream ---')
@@ -642,10 +713,10 @@ console.log('--- responses params passthrough ---')
   check('responses generate incremented (params)', s.generate === before + 1)
   const b = s.lastGenerateBody
   check('responses max_output_tokens → max_tokens', b.params.max_tokens === 123, b.params)
-  check('responses top_p passthrough', b.params.top_p === 0.7, b.params)
+  check('responses top_p withheld from CLI wire', b.params.top_p === undefined, b.params)
   check('responses reasoning.effort → reasoning_effort', b.params.reasoning_effort === 'high', b.params)
-  check('responses metadata.user_id → user', b.params.user === 'u_resp', b.params.user)
-  check('responses tool_choice function → CC tool', b.params.tool_choice?.type === 'tool' && b.params.tool_choice?.name === 'get_weather', b.params.tool_choice)
+  check('responses metadata.user_id withheld from CLI wire', b.params.user === undefined, b.params.user)
+  check('responses tool_choice withheld from CLI wire', b.params.tool_choice === undefined, b.params.tool_choice)
   check('responses stateless fields ignored', b.params.store === undefined && b.params.previous_response_id === undefined && b.params.include === undefined, b.params)
 }
 

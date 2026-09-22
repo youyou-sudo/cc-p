@@ -13,6 +13,8 @@ import { classifyUpstreamLimit, limitMeta } from '../src/shared/limit'
 import { parseRetryAfter, backoffDelay } from '../src/shared/retry'
 import { ConcurrencyGate, ConcurrencyAborted, ConcurrencyRoomFull, ConcurrencyTimeout } from '../src/shared/concurrency'
 import { mapCcError, mapCcEventError, toRetryAfterSeconds } from '../src/shared/errors'
+import { normalizeCcUsage } from '../src/shared/cc-types'
+import { generateSessionId, uuidFromSeed } from '../src/shared/util'
 
 let passed = 0
 let failed = 0
@@ -49,6 +51,38 @@ function check(name: string, cond: boolean, extra?: unknown): void {
 
   const rlHeader = limitMeta(429, 'rate limit', 5)
   check('rate_limit honors Retry-After header', rlHeader.retryAfterMs === 5000)
+}
+
+// official 1.62.1 wire shape: terminal markers / structured error / usage fields
+{
+  check('model_not_in_plan terminal', classifyUpstreamLimit(403, 'Model not in plan: claude-opus-5') === 'model_not_in_plan')
+  check('model_not_in_plan marker snake_case', classifyUpstreamLimit(400, 'model_not_in_plan') === 'model_not_in_plan')
+  check('model_not_in_plan not retryable', limitMeta(403, 'Model not in plan: x', null).retryable === false)
+  check('premium credits exhausted → payment', classifyUpstreamLimit(400, 'Premium credits exhausted') === 'payment_required')
+  check('premium_credits_exhausted marker → payment', classifyUpstreamLimit(400, 'premium_credits_exhausted') === 'payment_required')
+  check('insufficient credits → payment', classifyUpstreamLimit(400, 'You have insufficient credits') === 'payment_required')
+
+  const evPlan = mapCcEventError({ type: 'error', error: { message: 'Model not in plan: claude-opus-5', statusCode: 403, isRetryable: false } })
+  check('event model_not_in_plan → 403', evPlan.status === 403 && evPlan.body.error.type === 'model_not_in_plan')
+  const evPay = mapCcEventError({ type: 'error', error: { message: 'premium_credits_exhausted', statusCode: 402, isRetryable: false } })
+  check('event premium credits → 402 no retry_after', evPay.status === 402 && evPay.body.error.type === 'payment_required' && evPay.body.retry_after === undefined, evPay)
+  // structured statusCode wins over the legacy <NNN> prefix; isRetryable=false blocks the 429 retry path
+  const evNoRetry = mapCcEventError({ type: 'error', error: { message: 'slow down', statusCode: 429, isRetryable: false } })
+  check('event isRetryable=false suppresses retryable 429', evNoRetry.status === 429 && evNoRetry.body.retry_after === undefined, evNoRetry)
+  const evRetry = mapCcEventError({ type: 'error', error: { message: 'slow down', statusCode: 429 }, retry_after: 7 })
+  check('event retryable 429 keeps retry_after', evRetry.status === 429 && evRetry.body.retry_after === 7, evRetry)
+
+  const u = normalizeCcUsage({ inputTokens: 200, outputTokens: 30, inputTokenDetails: { cacheReadTokens: 120, cacheWriteTokens: 40, cacheWriteTokens1h: 10 } })
+  check('normalizeCcUsage reads cacheReadTokens', u?.cachedInputTokens === 120 && u?.inputTokens === 200 && u?.outputTokens === 30, u)
+  check('normalizeCcUsage carries cacheWrite + 1h', u?.inputTokenDetails?.cacheWriteTokens === 40 && u?.inputTokenDetails?.cacheWriteTokens1h === 10, u)
+  const uLegacy = normalizeCcUsage({ inputTokens: 5, cachedInputTokens: 3 })
+  check('normalizeCcUsage tolerates legacy flat shape', uLegacy?.cachedInputTokens === 3, uLegacy)
+  check('normalizeCcUsage undefined for garbage', normalizeCcUsage(null) === undefined)
+
+  const sid = generateSessionId()
+  check('generateSessionId sess_ + 16 hex', sid.length === 21 && sid.startsWith('sess_') && /^[0-9a-f]+$/.test(sid.slice(5)))
+  const tid = uuidFromSeed('sess_0123456789abcdef')
+  check('uuidFromSeed deterministic v4 shape', tid.length === 36 && tid === uuidFromSeed('sess_0123456789abcdef') && tid[14] === '4' && '89ab'.includes(tid[19]), tid)
 }
 
 // retry / backoff

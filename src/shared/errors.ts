@@ -140,6 +140,14 @@ export function mapCcError(ccStatus: number, ccBody?: string, retryAfterMs?: num
       body: { error: { message, type: 'payment_required' } },
     }
   }
+  if (kind === 'model_not_in_plan') {
+    // Entitlement wall: 403 (not 429) and no retry_after so SDKs stop instead
+    // of hammering a model the plan will never serve.
+    return {
+      status: 403,
+      body: { error: { message, type: 'model_not_in_plan' } },
+    }
+  }
   if (kind === 'authed_session_refused') {
     // Keep 401 vs 403 distinct: bad key vs forbidden/session-refused.
     if (ccStatus === 403) {
@@ -176,7 +184,14 @@ export function mapCcEventError(event: any): MappedError {
   // Trim BEFORE <NNN> match: upstream may pad with spaces/newlines.
   const trimmed = rawMessage.trim()
   const statusMatch = trimmed.match(/^<(\d{3})>/)
-  const ccStatus = statusMatch ? Number(statusMatch[1]) : 502
+  // Official 1.62.1 stream errors carry `{message, statusCode, isRetryable}`.
+  // Prefer the structured statusCode over the legacy "<NNN>" message prefix.
+  const structuredStatus = Number(event?.error?.statusCode)
+  const hasStructuredStatus = Number.isInteger(structuredStatus) && structuredStatus >= 400 && structuredStatus < 600
+  const ccStatus = statusMatch ? Number(statusMatch[1]) : (hasStructuredStatus ? structuredStatus : 502)
+  // A server-declared isRetryable=false is authoritative: never convert it into
+  // a retryable 429 even when the wording looks like a rate limit.
+  const upstreamNonRetryable = event?.error?.isRetryable === false
   const msgForClassify = trimmed.replace(/^<\d{3}>\s*/, '') || trimmed
 
   // Prefer the structured CcErrorEvent.retry_after (seconds) over fabrication.
@@ -204,6 +219,12 @@ export function mapCcEventError(event: any): MappedError {
       body: { error: { message, type: 'payment_required' } },
     }
   }
+  if (kind === 'model_not_in_plan') {
+    return {
+      status: 403,
+      body: { error: { message, type: 'model_not_in_plan' } },
+    }
+  }
   if (kind === 'authed_session_refused') {
     if (ccStatus === 403) {
       return { status: 403, body: { error: { message, type: 'permission_denied' } } }
@@ -213,7 +234,7 @@ export function mapCcEventError(event: any): MappedError {
 
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' }
 
-  if (kind === 'rate_limit') {
+  if (kind === 'rate_limit' && !upstreamNonRetryable) {
     const body: any = { error: { message, type: 'rate_limit_error' } }
     if (eventRetrySecs != null) body.retry_after = eventRetrySecs
     return { status: 429, body }

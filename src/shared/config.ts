@@ -348,3 +348,14 @@ export const THINKING_IDLE_TIMEOUT_MS = (() => {
   const v = envNumber('CC_THINKING_IDLE_MS')
   return v !== undefined && v > 0 ? v : 120_000
 })()
+
+// 采样/工具控制参数的透传开关。为什么默认关闭：官方 CLI 的 /alpha/generate 请求体
+// 只带 model/messages/tools/system/max_tokens/stream/temperature?/reasoning_effort?
+// （1.62.1 bundle 实测），从不发 top_p/stop/user/seed/tool_choice/parallel_tool_calls。
+// 多带这些字段会让请求体与真实 CLI 不一致，是可被风控识别的指纹特征（生态里的
+// yelixir/command-code-reverse/cmdcode2api 都为此主动删掉了这些字段）。
+// 默认 false = 忠实复刻（接受客户端字段但不外发）；设 true 恢复透传。模块加载快照，
+// 运行时改 env 需重启。
+export const FORWARD_SAMPLING_PARAMS = (() => {
+  return envBool('CC_FORWARD_SAMPLING_PARAMS') === true
+})()
