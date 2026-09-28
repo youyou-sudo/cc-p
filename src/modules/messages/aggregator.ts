@@ -1,6 +1,6 @@
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
-import { mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
+import { isTruncatedStream, mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage, truncatedStreamError } from '../../shared/errors'
 import { createToolCallIdGuard } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { uuid } from '../../shared/util'
@@ -113,6 +113,8 @@ export interface MessagesAggregate {
   finishReason: string
   usage: any
   upstreamError: { status: number; body: any } | null
+  /** 有内容、无错误、却未收到 finish → 上游截断；调用方须走错误帧而非成功。 */
+  truncated: boolean
 }
 
 export function createMessagesAggregator(opts?: { onEventError?: (event: any, mapped: { status: number; body: any }) => void }): {
@@ -127,6 +129,8 @@ export function createMessagesAggregator(opts?: { onEventError?: (event: any, ma
   let finishReason = 'stop'
   let usage: any = null
   let upstreamError: { status: number; body: any } | null = null
+  // sawFinish: CC 正常结束必发 finish（或 finish-step）；缺失 + 有内容 + 无错误 = 截断。
+  let sawFinish = false
   // tool-input-* incremental accumulation for large params.
   let pendingToolInput: { id: string; name: string; json: string } | null = null
 
@@ -200,10 +204,12 @@ export function createMessagesAggregator(opts?: { onEventError?: (event: any, ma
       pendingToolInput = null
     },
     'finish-step': (event: any) => {
+      sawFinish = true
       if (event.finishReason) finishReason = mergeFinishReason(finishReason, safeMapFinishReason(event.finishReason))
       if (event.usage) usage = mergeUsage(usage, event.usage)
     },
     'finish': (event: any) => {
+      sawFinish = true
       if (event.finishReason) finishReason = mergeFinishReason(finishReason, safeMapFinishReason(event.finishReason))
       const incoming = event.totalUsage ?? event.usage
       if (incoming) usage = mergeUsage(usage, incoming)
@@ -248,7 +254,10 @@ export function createMessagesAggregator(opts?: { onEventError?: (event: any, ma
           usage = { ...(usage || {}), outputTokens: est }
         }
       }
-      return { fullText, thinkingText, toolCalls, finishReason, usage, upstreamError }
+      // 截断归一：无 finish + 有内容 + 无错误 → 复用 upstreamError 通道。
+      const truncated = isTruncatedStream(sawFinish, hasContent, !!upstreamError)
+      if (truncated) upstreamError = truncatedStreamError()
+      return { fullText, thinkingText, toolCalls, finishReason, usage, upstreamError, truncated }
     },
   }
 }

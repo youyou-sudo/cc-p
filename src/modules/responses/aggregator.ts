@@ -2,7 +2,7 @@
 // 纯函数、无 I/O；聚合 hooks 与 chat/messages 同形（usage 只覆盖不重置、
 // 多步 finish 优先级、tool-input-* 增量缓冲），仅出口对象换成 Responses 形。
 
-import { mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
+import { isTruncatedStream, mapCcEventError, mapFinishReason, normalizeUsage, truncatedStreamError } from '../../shared/errors'
 import { createToolCallIdGuard } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
@@ -65,6 +65,8 @@ export interface ResponsesAggregate {
   finishReason: string
   usage: any
   upstreamError: { status: number; body: any } | null
+  /** 有内容、无错误、却未收到 finish → 上游截断；调用方须报错而非 completed。 */
+  truncated: boolean
 }
 
 export function createResponsesAggregator(opts?: { onEventError?: (event: any, mapped: { status: number; body: any }) => void }): {
@@ -79,6 +81,8 @@ export function createResponsesAggregator(opts?: { onEventError?: (event: any, m
   let usage: any = null
   let toolCalls: any[] | null = null
   let upstreamError: { status: number; body: any } | null = null
+  // sawFinish: CC 正常结束必发 finish（或 finish-step）；缺失 + 有内容 + 无错误 = 截断。
+  let sawFinish = false
   // tool-input-* incremental accumulation for large params (flushed on end or result()).
   let pendingToolInput: { id: string; name: string; json: string } | null = null
 
@@ -150,10 +154,12 @@ export function createResponsesAggregator(opts?: { onEventError?: (event: any, m
       pendingToolInput = null
     },
     'finish-step': (event: any) => {
+      sawFinish = true
       if (event.finishReason) finishReason = mergeFinishReason(finishReason, safeMapFinishReason(event.finishReason))
       if (event.usage) usage = mergeUsage(usage, event.usage)
     },
     'finish': (event: any) => {
+      sawFinish = true
       if (event.finishReason) finishReason = mergeFinishReason(finishReason, safeMapFinishReason(event.finishReason))
       const incoming = event.totalUsage ?? event.usage
       if (incoming) usage = mergeUsage(usage, incoming)
@@ -188,7 +194,11 @@ export function createResponsesAggregator(opts?: { onEventError?: (event: any, m
           usage = { ...(usage || {}), outputTokens: est }
         }
       }
-      return { fullText, reasoningContent, toolCalls, finishReason, usage, upstreamError }
+      // 截断归一：无 finish + 有内容 + 无错误 → 复用 upstreamError 通道，
+      // 让上层既有的错误尾处理自动生效（502 + rawUsage），不必新增分支。
+      const truncated = isTruncatedStream(sawFinish, hasContent, !!upstreamError)
+      if (truncated) upstreamError = truncatedStreamError()
+      return { fullText, reasoningContent, toolCalls, finishReason, usage, upstreamError, truncated }
     },
   }
 }

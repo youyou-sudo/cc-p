@@ -14,6 +14,7 @@
 
 import { SSE_HEADERS, readWithTimeout } from '../../shared/http'
 import { log } from '../../shared/logger'
+import { TRUNCATED_STREAM_MESSAGE } from '../../shared/errors'
 import {
   idleTimeoutFor,
   isThinkingWait,
@@ -139,6 +140,22 @@ export async function handleChatStream(deps: ChatStreamDeps): Promise<Response> 
           if (pipeline.started) {
             const errBody = translator.upstreamError.body
             pipeline.writeNow(`data: ${JSON.stringify({ ...errBody, error: { ...errBody.error, rawUsage: translator.rawUsage } })}\n\n`)
+          }
+        } else if (translator.truncated) {
+          // 截断：有内容但上游从未发 finish（abort / 断流）。绝不能补 [DONE] 把
+          // 半截回答记成成功；已发头则写 in-stream error 帧并保留部分内容。
+          log('warn', 'Stream truncated before finish (chat)', {
+            path: '/v1/chat/completions',
+            model,
+            completionId,
+            streaming: true,
+            lastCcEvent: lastCcEvent || '(none)',
+            bytesReceived,
+            inputTokens: translator.inputTokens,
+            outputTokens: translator.outputTokens,
+          })
+          if (pipeline.started) {
+            pipeline.writeNow(`data: ${JSON.stringify({ error: { message: TRUNCATED_STREAM_MESSAGE, type: 'upstream_error', rawUsage: translator.rawUsage } })}\n\n`)
           }
         } else if (!(sawText || sawReasoning || sawTool || translator.outputTokens > 0)) {
           state.zeroOutput = true

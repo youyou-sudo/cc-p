@@ -86,6 +86,34 @@ export function tryParseJSONStrict(str: string): any | JSONParseFailure {
   }
 }
 
+/** 日志 / 占位符用 URL 缩写：data: URL 只保留 `data:<mime>;base64` 前缀，
+ *  绝不把整段 base64 打进日志或上游文本。与 infra/cc.ts 的 local shortUrl 同形。 */
+export function shortUrl(url: string, max = 120): string {
+  if (typeof url !== 'string' || !url) return ''
+  if (url.length <= max) return url
+  if (url.startsWith('data:')) {
+    const comma = url.indexOf(',')
+    const head = comma >= 0 ? url.slice(0, comma) : url.slice(0, max)
+    return `${head};…[${url.length} chars omitted]`
+  }
+  return url.slice(0, max) + '…'
+}
+
+// 工具结果里嵌入的巨型内联 data: URL（截图 base64 可达数 MB）必须以占位符
+// 落地，否则每轮历史回灌都会把它当文本重发，直接顶爆上下文并触发对话压缩。
+// 阈值取 4096 base64 字符（≈3KB 二进制）：大截图命中，代码里的微型 data URL 保留。
+const LARGE_DATA_URL_PATTERN = /data:([a-z0-9.+-]+\/[a-z0-9.+-]+)?;base64,[A-Za-z0-9+/=]{4096,}/gi
+
+/** 把文本中过大的内联 data: URL 替换为占位符（保留 mime 与原始长度）。
+ *  只作用于文本通道：真正的图片分片（type:'image'）不走这里，视觉输入不受影响。 */
+export function redactLargeDataUrls(text: string): string {
+  if (!text || !text.includes(';base64,')) return text
+  return text.replace(LARGE_DATA_URL_PATTERN, (m, mime) => {
+    const kind = mime ? `data:${mime};base64` : 'data:;base64'
+    return `${kind},[${m.length} chars omitted]`
+  })
+}
+
 export function generateTraceparent(): string {
   return `00-${randHex(16)}-${randHex(8)}-01`
 }

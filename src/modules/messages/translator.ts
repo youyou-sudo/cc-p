@@ -1,9 +1,9 @@
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
-import { mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
+import { isTruncatedStream, mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage, TRUNCATED_STREAM_MESSAGE } from '../../shared/errors'
 import { createToolCallIdGuard } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
-import { uuid } from '../../shared/util'
+import { shortUrl, redactLargeDataUrls, uuid } from '../../shared/util'
 
 // ---- local helpers (file-local, avoid cycles) ----
 function toNum(v: any): number {
@@ -73,24 +73,32 @@ function anthropicSourceToUrl(source: any): string {
 
 /** tool_result content → text, preserving image placeholders instead of dropping. */
 function toolResultContentToText(content: any): string {
-  if (typeof content === 'string') return content
+  if (typeof content === 'string') return redactLargeDataUrls(content)
   if (Array.isArray(content)) {
-    return content.map((c: any) => {
+    return redactLargeDataUrls(content.map((c: any) => {
       if (c == null) return ''
       if (typeof c === 'string') return c
       if (c.type === 'text') return c.text || ''
       if (c.type === 'image') {
         const url = anthropicSourceToUrl(c.source)
-        log('warn', 'tool_result image demoted to placeholder', { url: url ? (url.length <= 120 ? url : url.slice(0, 120) + '...') : '(empty)' })
-        return url ? `[image: ${url.length <= 120 ? url : url.slice(0, 120) + '...'}]` : '[image omitted]'
+        log('warn', 'tool_result image demoted to placeholder', { url: url ? shortUrl(url) : '(empty)' })
+        return url ? `[image: ${shortUrl(url)}]` : '[image omitted]'
+      }
+      // 工具结果里的文件/附件分片：绝不 stringify 成文本。内联 base64 截图
+      // （可达数 MB）随历史每轮重发会直接顶爆上下文，必须降级为占位符。
+      if (c.type === 'file' || c.type === 'document' || c.type === 'input_file') {
+        const name = c.filename || c.name || ''
+        const uri = typeof c.uri === 'string' ? c.uri : (typeof c.url === 'string' ? c.url : anthropicSourceToUrl(c.source))
+        const size = uri && uri.startsWith('data:') ? `, ${uri.length} chars inline` : ''
+        return `[file: ${name || 'attachment'}${size}]`
       }
       if (c.text) return c.text
       return ''
-    }).join('')
+    }).join(''))
   }
   if (content == null) return ''
-  if (typeof content === 'object' && (content as any).text) return (content as any).text
-  return String(content || '')
+  if (typeof content === 'object' && (content as any).text) return redactLargeDataUrls((content as any).text)
+  return redactLargeDataUrls(String(content || ''))
 }
 
 export function convertAnthropicToOpenAI(anthropicReq: any): any {
@@ -320,6 +328,8 @@ export function createAnthropicSseTranslator(
   let cacheWriteTokens = 0
   let stopReason: string | null = null
   let hasError = false
+  // sawFinish: CC 正常结束必发 finish（或 finish-step）；缺失 + 有内容 + 无错误 = 截断。
+  let sawFinish = false
   let currentThinkingText = ''
   // Zero-output caliber: text / thinking / tool any-present counts as non-zero.
   let hasText = false
@@ -497,6 +507,21 @@ export function createAnthropicSseTranslator(
     'finish-step': handleFinishStep,
     'finish': handleFinishStep,
 
+    // 上游 abort：生成被中途取消，不是 finish。handler 的 sawFinish 判定会把
+    // 「有内容但无 finish」识别为截断，绝不回报正常 end_turn 成功帧。
+    'abort': () => {
+      log('warn', 'CC stream aborted by upstream', {
+        path: '/v1/messages',
+        model,
+        messageId,
+        lastCcEvent: parser.lastCcEvent || '(none)',
+        bytesReceived: ctx.bytesReceived,
+        hasText,
+        hasThinking,
+        hasToolCall,
+      })
+    },
+
     'error': (event: any) => {
       hasError = true
       const upstreamError = mapCcEventError(event)
@@ -520,6 +545,7 @@ export function createAnthropicSseTranslator(
   function handleFinishStep(event: any): void {
     // Suppress post-error finish (error wins).
     if (hasError) return
+    sawFinish = true
     if (event.finishReason) {
       const mapped = safeMapAnthropicStopReason(safeMapFinishReason(event.finishReason))
       stopReason = mergeAnthropicStopReason(stopReason, mapped)
@@ -546,6 +572,11 @@ export function createAnthropicSseTranslator(
       return [messageStartFrame]
     },
 
+    /** 有内容、无错误、却未收到 finish → 截断；handler 据此写错误尾而非成功帧。 */
+    get truncated(): boolean {
+      return isTruncatedStream(sawFinish, hasText || hasThinking || hasToolCall, hasError)
+    },
+
     parseChunk(bytes: Uint8Array): string[] {
       ctx.bytesReceived += bytes.byteLength
       const out = parser.push(bytes, hooks)
@@ -563,6 +594,28 @@ export function createAnthropicSseTranslator(
     },
 
     finishEvents(): string[] {
+      // 截断优先于一切成功终帧：有内容、无上游错误、却从未收到 finish。
+      // 保留已产出的部分块，然后发错误帧——绝不发 end_turn 的 message_delta，
+      // 否则客户端会把半截回答当成完整回答（这正是「说到一半就停」被误报成功的原因）。
+      const preFlushHasContent = hasText || hasThinking || hasToolCall
+      if (!hasError && isTruncatedStream(sawFinish, preFlushHasContent, false)) {
+        const out: string[] = []
+        out.push(...flushPendingToolInput())
+        const close = closeBlock()
+        if (close) out.push(close)
+        log('warn', 'Stream truncated before finish (anthropic)', {
+          path: '/v1/messages',
+          model,
+          messageId,
+          lastCcEvent: parser.lastCcEvent || '(none)',
+          bytesReceived: ctx.bytesReceived,
+          inputTokens,
+          outputTokens,
+        })
+        out.push(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: TRUNCATED_STREAM_MESSAGE }, retry_after: 10 })}\n\n`)
+        out.push(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`)
+        return out
+      }
       // Incremental-only tool calls flush here when finish arrives without a final tool-call.
       if (!hasError) {
         const pending = flushPendingToolInput()
@@ -606,9 +659,9 @@ export function createAnthropicSseTranslator(
 
       // Content-aware zero guard: text / thinking / tool any-present counts
       // as non-zero; backfill a length estimate when upstream reports 0/missing.
-      const hasContent = hasText || hasThinking || hasToolCall
+      const zeroGuardHasContent = hasText || hasThinking || hasToolCall
       let outTokens = outputTokens
-      if (outTokens === 0 && hasContent) {
+      if (outTokens === 0 && zeroGuardHasContent) {
         const est = Math.ceil((textChars + thinkingChars + toolInputChars) / 4)
         if (est > 0) {
           outTokens = est

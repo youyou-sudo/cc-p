@@ -13,6 +13,13 @@ import type { CcErrorEvent, CcEventType } from '../shared/cc-types'
 // Every event type the upstream can emit (union of CcStreamEvent types). A
 // parser only warns about a type when it is NOT in this set, so adding a new
 // upstream event type is a one-line change here instead of four switches.
+//
+// `abort` is a terminal signal (upstream ran a code-side abort / the turn was
+// cancelled mid-generation). It stays listed as a known type, but translators
+// additionally register an explicit handler for observability. The real guard
+// against reporting a truncated turn as success is NOT this handler: it is the
+// `sawFinish` check in each translator/aggregator (no finish event + content +
+// no error ⇒ truncated), which fires regardless of whether `abort` is handled.
 export const CC_EVENT_TYPES: ReadonlySet<CcEventType> = new Set<CcEventType>([
   'start', 'start-step',
   'reasoning-start', 'reasoning-end', 'reasoning-delta',

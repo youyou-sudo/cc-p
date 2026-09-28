@@ -14,12 +14,12 @@
 // （output_item.added）才由 stream-handler 显式 start()，保证空回包仍能回落
 // 429 JSON（与 messages 侧 message_start 缓冲语义一致）。
 
-import { mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
+import { isTruncatedStream, mapCcEventError, mapFinishReason, normalizeUsage, TRUNCATED_STREAM_MESSAGE } from '../../shared/errors'
 import { createToolCallIdGuard } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
-import { uuid } from '../../shared/util'
+import { shortUrl, uuid, redactLargeDataUrls } from '../../shared/util'
 
 // ---- local helpers (file-local, avoid cycles) ----
 function toNum(v: any): number {
@@ -98,23 +98,32 @@ function extractImageUrl(part: any): string {
 /** function_call_output.output → text (string / content parts / arbitrary object). */
 function outputToText(output: any): string {
   if (output == null) return ''
-  if (typeof output === 'string') return output
+  if (typeof output === 'string') return redactLargeDataUrls(output)
   if (Array.isArray(output)) {
-    return output.map((c: any) => {
+    return redactLargeDataUrls(output.map((c: any) => {
       if (c == null) return ''
       if (typeof c === 'string') return c
       if (typeof c.text === 'string') return c.text
       if (c.type === 'input_image' || c.type === 'image_url' || c.type === 'image') {
         const url = extractImageUrl(c)
-        return url ? `[image: ${url}]` : '[image omitted]'
+        return url ? `[image: ${shortUrl(url)}]` : '[image omitted]'
       }
+      // 工具结果里的文件分片（截图/附件）：绝不能 stringify 成文本，否则
+      // 内联 base64（可达数 MB）会随历史每轮重发，直接顶爆上下文触发压缩。
+      if (c.type === 'file' || c.type === 'input_file') {
+        const name = c.filename || c.name || ''
+        const uri = typeof c.uri === 'string' ? c.uri : (typeof c.url === 'string' ? c.url : '')
+        const size = uri.startsWith('data:') ? `, ${uri.length} chars inline` : ''
+        return `[file: ${name || 'attachment'}${size}]`
+      }
+      if (typeof c.text === 'string') return c.text
       return stringifyUnknownContent(c)
-    }).join('\n')
+    }).join('\n'))
   }
   if (typeof output === 'object') {
-    if (typeof output.text === 'string') return output.text
+    if (typeof output.text === 'string') return redactLargeDataUrls(output.text)
     if (output.output != null) return outputToText(output.output)
-    return stringifyUnknownContent(output)
+    return redactLargeDataUrls(stringifyUnknownContent(output))
   }
   return String(output)
 }
@@ -386,6 +395,8 @@ export function createResponsesSseTranslator(model: string, responseId: string, 
   let finishReason: string | null = null
   let usage: any = null
   let hasError = false
+  // sawFinish: CC 正常结束必发 finish（或 finish-step）；缺失 + 有内容 + 无错误 = 截断。
+  let sawFinish = false
   let upstreamError: { status: number; body: any } | null = null
   let pendingToolInput: { id: string; name: string; json: string } | null = null
   let sawText = false
@@ -597,14 +608,31 @@ export function createResponsesSseTranslator(model: string, responseId: string, 
     },
     'finish-step': (e: any) => {
       if (hasError) return
+      sawFinish = true
       if (e.finishReason) finishReason = mergeFinishReason(finishReason, safeMapFinishReason(e.finishReason))
       if (e.usage) usage = mergeUsage(usage, e.usage)
     },
     'finish': (e: any) => {
       if (hasError) return
+      sawFinish = true
       if (e.finishReason) finishReason = mergeFinishReason(finishReason, safeMapFinishReason(e.finishReason))
       const incoming = e.totalUsage ?? e.usage
       if (incoming) usage = mergeUsage(usage, incoming)
+    },
+    // 上游 abort：生成被中途取消，不是 finish。保持 sawFinish=false，收尾时
+    // finishEvents() 会判为截断并改写响应状态，绝不发 completed 成功帧。
+    'abort': (e: any) => {
+      log('warn', 'CC stream aborted by upstream', {
+        path: '/v1/responses',
+        model,
+        responseId,
+        lastCcEvent: parser.lastCcEvent || '(none)',
+        bytesReceived,
+        sawText,
+        sawReasoning,
+        sawToolCall,
+      })
+      return []
     },
     'error': (e: any) => {
       hasError = true
@@ -637,6 +665,10 @@ export function createResponsesSseTranslator(model: string, responseId: string, 
     },
     get sawContent() {
       return sawText || sawReasoning || sawToolCall
+    },
+    /** 有内容、无上游错误、却未收到 finish → 截断；收尾须报错而非 completed。 */
+    get truncated() {
+      return isTruncatedStream(sawFinish, sawText || sawReasoning || sawToolCall, hasError)
     },
     get bytesReceived() {
       return bytesReceived
@@ -683,7 +715,12 @@ export function createResponsesSseTranslator(model: string, responseId: string, 
       if (outputTokens === 0 && (sawText || sawReasoning || sawToolCall)) {
         outputTokens = Math.ceil((textChars + reasoningChars + toolChars) / 4) || 1
       }
-      const status = finishReason === 'length' ? 'incomplete' : 'completed'
+      // 截断 = 有内容、无上游错误、却从未收到 finish。按 Responses 规范发
+      // response.incomplete（而不是伪造 completed），让 SDK/客户端明确知道
+      // 这一轮没有正常结束，而不是把半截回答当作完整成功。
+      const truncated = isTruncatedStream(sawFinish, sawText || sawReasoning || sawToolCall, false)
+      const status = truncated ? 'incomplete' : (finishReason === 'length' ? 'incomplete' : 'completed')
+      const incompleteReason = truncated ? 'upstream_interrupted' : 'max_output_tokens'
       const response = {
         ...responseSkeleton(model, responseId, createdAt, status),
         output: items,
@@ -694,7 +731,7 @@ export function createResponsesSseTranslator(model: string, responseId: string, 
           output_tokens_details: { reasoning_tokens: 0 },
           total_tokens: inputTokens + outputTokens,
         },
-        ...(status === 'incomplete' ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
+        ...(status === 'incomplete' ? { incomplete_details: { reason: incompleteReason } } : {}),
       }
       out.push(event(status === 'incomplete' ? 'response.incomplete' : 'response.completed', { response }))
       return out

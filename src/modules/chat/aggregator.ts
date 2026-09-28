@@ -1,6 +1,6 @@
 // Non-streaming aggregation + response building. Pure, no I/O.
 
-import { mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
+import { isTruncatedStream, mapCcEventError, mapFinishReason, normalizeUsage, truncatedStreamError } from '../../shared/errors'
 import { createToolCallIdGuard } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
@@ -88,6 +88,8 @@ export interface ChatAggregate {
   finishReason: string
   usage: any
   upstreamError: { status: number; body: any } | null
+  /** 有内容、无错误、却未收到 finish → 上游截断；调用方须走 502 而非 200。 */
+  truncated: boolean
 }
 
 export function createChatAggregator(opts?: { onEventError?: (event: any, mapped: { status: number; body: any }) => void }): {
@@ -102,6 +104,8 @@ export function createChatAggregator(opts?: { onEventError?: (event: any, mapped
   let usage: any = null
   let toolCalls: any[] | null = null
   let upstreamError: { status: number; body: any } | null = null
+  // sawFinish: CC 正常结束必发 finish（或 finish-step）；缺失 + 有内容 + 无错误 = 截断。
+  let sawFinish = false
   // tool-input-* incremental accumulation for large params (flushed on end or result()).
   let pendingToolInput: { id: string; name: string; json: string } | null = null
 
@@ -178,10 +182,12 @@ export function createChatAggregator(opts?: { onEventError?: (event: any, mapped
       pendingToolInput = null
     },
     'finish-step': (event: any) => {
+      sawFinish = true
       if (event.finishReason) finishReason = mergeFinishReason(finishReason, safeMapFinishReason(event.finishReason))
       if (event.usage) usage = mergeUsage(usage, event.usage)
     },
     'finish': (event: any) => {
+      sawFinish = true
       if (event.finishReason) finishReason = mergeFinishReason(finishReason, safeMapFinishReason(event.finishReason))
       const incoming = event.totalUsage ?? event.usage
       if (incoming) usage = mergeUsage(usage, incoming)
@@ -215,7 +221,11 @@ export function createChatAggregator(opts?: { onEventError?: (event: any, mapped
           usage = { ...(usage || {}), outputTokens: est }
         }
       }
-      return { fullText, reasoningContent, toolCalls, finishReason, usage, upstreamError }
+      // 截断归一：无 finish + 有内容 + 无错误 → 复用 upstreamError 通道，
+      // 让上层既有的错误尾处理（502 + rawUsage）自动生效，不必新增分支。
+      const truncated = isTruncatedStream(sawFinish, hasContent, !!upstreamError)
+      if (truncated) upstreamError = truncatedStreamError()
+      return { fullText, reasoningContent, toolCalls, finishReason, usage, upstreamError, truncated }
     },
   }
 }

@@ -37,6 +37,22 @@ export function isContextWindowExceeded(message: string): boolean {
 
 export const CONTEXT_WINDOW_ERROR = { status: 400, type: 'context_window_exceeded' }
 
+/** 上游流在产出内容后没有发 finish 事件就结束（连接中断 / 上游 abort / 网关掐流）。
+ *  绝不能回报成功：客户端会把半截回答当成完整回答（且缺失 usage，触发本地
+ *  的字符估算兜底，进一步掩盖截断）。三协议 translator/aggregator 共用同一措辞。 */
+export const TRUNCATED_STREAM_MESSAGE = 'Upstream stream ended before completion (truncated)'
+
+export function truncatedStreamError(): MappedError {
+  return { status: 502, body: { error: { message: TRUNCATED_STREAM_MESSAGE, type: 'upstream_error' } } }
+}
+
+/** 判定截断：看到了内容、没有上游错误、却一次 finish/finish-step 都没收到。
+ *  正常结束的 CC 流一定会发 finish（或至少 finish-step）并带 usage；二者皆无
+ *  即视为被截断。空流（无内容）不在此列，仍走既有的零输出 429 分支。 */
+export function isTruncatedStream(sawFinish: boolean, hasContent: boolean, hasError: boolean): boolean {
+  return !sawFinish && hasContent && !hasError
+}
+
 /** 503 fallback when upstream omits Retry-After: short backoff hint so the
  *  client backs off instead of hammering. Only 503 gets a default; every
  *  other non-rate_limit kind omits retry_after entirely (no fabrication). */

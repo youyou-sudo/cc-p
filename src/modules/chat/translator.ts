@@ -1,7 +1,7 @@
 // OpenAI SSE translator: CC NDJSON → `chat.completion.chunk` frames.
 // Pure streaming translation, no I/O.
 
-import { mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
+import { isTruncatedStream, mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
 import { createToolCallIdGuard } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
@@ -70,6 +70,9 @@ export function createSseTranslator(model: string, completionId: string, created
   let hasText = false
   let hasReasoning = false
   let hasToolCall = false
+  // sawFinish: 是否收到过 finish/finish-step。CC 正常结束必发 finish；
+  // 缺失 + 有内容 + 无错误 = 上游截断（abort / 断流），必须走错误帧而非成功。
+  let sawFinish = false
   let textChars = 0
   let reasoningChars = 0
   // tool-input-* incremental accumulation for large params.
@@ -180,6 +183,7 @@ export function createSseTranslator(model: string, completionId: string, created
     },
     'finish-step': (event: any) => {
       if (hasError) return
+      sawFinish = true
       if (event.finishReason) finishReason = mergeFinishReason(finishReason, safeMapFinishReason(event.finishReason))
       if (event.usage) {
         // Accumulate, never reset: only overwrite fields the step reports,
@@ -203,6 +207,7 @@ export function createSseTranslator(model: string, completionId: string, created
     'finish': (event: any) => {
       // Suppress any finish chunk after an upstream error (error wins).
       if (hasError) return
+      sawFinish = true
       const flushed = flushPendingToolInput()
       const fr = finishReason || safeMapFinishReason(event.finishReason || 'stop')
       const u = event.totalUsage || event.usage || usage || {}
@@ -260,6 +265,21 @@ export function createSseTranslator(model: string, completionId: string, created
         mappedType: state.upstreamError.body?.error?.type,
       })
     },
+    // 上游 abort：生成被中途取消。本身不是一个错误帧（错误由客户端断流等
+    // 路径自行处理），但必须让收尾逻辑知道「这不是 finish」——否则会被当成
+    // 正常 stop 成功返回半截内容。sawFinish 保持 false 即可被截断判定捕获。
+    'abort': () => {
+      log('warn', 'CC stream aborted by upstream', {
+        path: '/v1/chat/completions',
+        model,
+        completionId,
+        lastCcEvent: parser.lastCcEvent || '(none)',
+        bytesReceived,
+        hasText,
+        hasReasoning,
+        hasToolCall,
+      })
+    },
   }
 
   return {
@@ -268,6 +288,10 @@ export function createSseTranslator(model: string, completionId: string, created
     },
     get upstreamError() {
       return state.upstreamError
+    },
+    /** 无上游错误、有内容、却一次 finish 都没收到 → 截断（不得回报成功）。 */
+    get truncated() {
+      return isTruncatedStream(sawFinish, hasText || hasReasoning || hasToolCall, hasError)
     },
     get inputTokens() {
       return inputTokens.value

@@ -93,12 +93,26 @@ export async function handleMessagesStream(deps: MessagesStreamDeps): Promise<Re
         const flushed = translator.flush()
         markOutput(flushed)
         pipeline.emitAnthropic(flushed)
+        // 截断判定必须在 finishEvents() 之前取（终帧发出后 sawFinish 语义已定，
+        // 但保持先读后发更直观）。截断时 translator 已自行发 error 帧，这里不能
+        // 记成功，否则超时/限流统计会被半截回答污染。
+        const truncated = translator.truncated
         const finished = translator.finishEvents()
         markOutput(finished)
         pipeline.emitAnthropic(finished)
-        recordTimeoutSuccess(apiKey, sessionId)
+        if (!truncated) recordTimeoutSuccess(apiKey, sessionId)
         if (ctx.upstreamError) {
           state.upstreamError = ctx.upstreamError
+        } else if (truncated) {
+          log('warn', 'Stream truncated before finish (messages)', {
+            path: '/v1/messages',
+            model,
+            messageId: messageIdHolder.current,
+            lastCcEvent: ctx.lastCcEvent || '(none)',
+            bytesReceived: ctx.bytesReceived,
+            inputTokens: ctx.inputTokens,
+            outputTokens: ctx.outputTokens,
+          })
         } else if (!(sawText || sawReasoning || sawTool || ctx.outputTokens > 0)) {
           state.zeroOutput = true
           try { abortController.abort() } catch {}
