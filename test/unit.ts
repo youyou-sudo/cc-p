@@ -91,6 +91,21 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('tool-call guard: empty id always passes', guard('') === false && guard('') === false)
 }
 
+// inline data-URL redaction (the screenshot-causes-compaction fix)
+{
+  const { redactLargeDataUrls, shortUrl } = await import('../src/shared/util')
+  const big = 'data:image/png;base64,' + 'A'.repeat(5000)
+  const small = 'data:image/png;base64,' + 'A'.repeat(64)
+  const redacted = redactLargeDataUrls(`before ${big} after`)
+  check('redacts oversized inline data URL', !redacted.includes(big) && redacted.includes('chars omitted'), redacted.slice(0, 80))
+  check('redaction preserves surrounding text', redacted.startsWith('before ') && redacted.endsWith(' after'), redacted.slice(0, 60))
+  check('redaction keeps mime marker', redacted.includes('data:image/png;base64'), redacted.slice(0, 60))
+  check('keeps small inline data URL intact', redactLargeDataUrls(`x ${small} y`).includes(small))
+  check('no-op on plain text', redactLargeDataUrls('just text') === 'just text')
+  check('shortUrl summarizes data URL', shortUrl(big).includes('omitted') && shortUrl(big).length < 200, shortUrl(big).length)
+  check('shortUrl keeps short url', shortUrl('https://x/y.png') === 'https://x/y.png')
+}
+
 // retry / backoff
 {
   check('parseRetryAfter seconds', parseRetryAfter('15') === 15)
@@ -278,6 +293,19 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   })
   check('responses sequential calls not merged', seq.messages.length === 4 && seq.messages[0].tool_calls.length === 1 && seq.messages[2].tool_calls.length === 1, seq.messages)
 
+  // Screenshot-in-tool-result: a giant inline data: URL must be demoted to a
+  // placeholder, never serialized verbatim (that is what blew up the context).
+  const bigImage = 'data:image/png;base64,' + 'A'.repeat(5000)
+  const imgOut = convertResponsesToOpenAI({
+    input: [
+      { type: 'function_call', call_id: 'call_img', name: 'read', arguments: '{"path":"x.png"}' },
+      { type: 'function_call_output', call_id: 'call_img', output: [{ type: 'input_text', text: 'shot' }, { type: 'file', uri: bigImage, mime: 'image/png', name: 'x.png' }] },
+    ],
+  })
+  const imgText = imgOut.messages[1].content
+  check('responses giant inline image demoted, not verbatim', typeof imgText === 'string' && !imgText.includes('A'.repeat(5000)) && imgText.includes('file:'), String(imgText).slice(0, 120))
+  check('responses tool text still carries the leading text', imgText.includes('shot'), imgText)
+
   const out = buildResponsesObject('m2', 'resp_x', 123, {
     fullText: 'hello',
     reasoningContent: 'think',
@@ -285,6 +313,7 @@ function check(name: string, cond: boolean, extra?: unknown): void {
     finishReason: 'tool_calls',
     usage: { inputTokens: 7, outputTokens: 3, cachedInputTokens: 2 },
     upstreamError: null,
+    truncated: false,
   })
   check('responses object shape', out.id === 'resp_x' && out.object === 'response' && out.status === 'completed' && out.created_at === 123, out)
   check('responses object reasoning first', out.output[0].type === 'reasoning' && out.output[0].summary[0].text === 'think', out.output)
@@ -292,18 +321,30 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('responses object function_call', out.output[2].type === 'function_call' && out.output[2].call_id === 'call_1' && out.output[2].arguments === '{"a":1}', out.output[2])
   check('responses object usage', out.usage.input_tokens === 7 && out.usage.output_tokens === 3 && out.usage.total_tokens === 10 && out.usage.input_tokens_details.cached_tokens === 2, out.usage)
 
-  const incomplete = buildResponsesObject('m2', 'resp_y', 1, { fullText: 'x', reasoningContent: '', toolCalls: null, finishReason: 'length', usage: null, upstreamError: null })
+  const incomplete = buildResponsesObject('m2', 'resp_y', 1, { fullText: 'x', reasoningContent: '', toolCalls: null, finishReason: 'length', usage: null, upstreamError: null, truncated: false })
   check('responses object length => incomplete', incomplete.status === 'incomplete' && incomplete.incomplete_details?.reason === 'max_output_tokens', incomplete)
 
+  // 截断：只喂 text-delta、不喂 finish —— 必须落 response.incomplete（而非
+  // 伪造 response.completed），且绝不能出现 [DONE]。
   const tr = createResponsesSseTranslator('m3', 'resp_s', 5)
   const start = tr.startEvents()
   check('responses sse created+in_progress', start.length === 2 && start[0].startsWith('event: response.created') && start[1].startsWith('event: response.in_progress'), start)
   const enc = new TextEncoder()
   const deltas = tr.parseChunk(enc.encode(JSON.stringify({ type: 'text-delta', text: 'Hi' }) + '\n'))
   check('responses sse text delta', deltas.some((e) => e.startsWith('event: response.output_item.added')) && deltas.some((e) => e.includes('"delta":"Hi"')), deltas)
+  check('responses sse truncation detected', tr.truncated === true)
   const fin = tr.finishEvents()
-  check('responses sse completed terminal, no [DONE]', fin.at(-1)?.startsWith('event: response.completed') === true && !fin.join('').includes('[DONE]'), fin)
+  check('responses sse truncated → response.incomplete, no [DONE]', fin.at(-1)?.startsWith('event: response.incomplete') === true && fin.join('').includes('upstream_interrupted') && !fin.join('').includes('[DONE]'), fin)
   check('responses sse sawContent', tr.sawContent === true)
+
+  // 正常结束：提供 finish 事件后必须落 response.completed（不得误判为截断）。
+  const trOk = createResponsesSseTranslator('m4', 'resp_ok', 6)
+  trOk.startEvents()
+  trOk.parseChunk(enc.encode(JSON.stringify({ type: 'text-delta', text: 'Hi' }) + '\n'))
+  trOk.parseChunk(enc.encode(JSON.stringify({ type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 3, outputTokens: 2, cachedInputTokens: 0 } }) + '\n'))
+  check('responses sse finish → not truncated', trOk.truncated === false)
+  const finOk = trOk.finishEvents()
+  check('responses sse completed after finish, no [DONE]', finOk.at(-1)?.startsWith('event: response.completed') === true && !finOk.join('').includes('[DONE]'), finOk)
 }
 
 console.log(`\nUNIT RESULT: ${passed} passed, ${failed} failed`)

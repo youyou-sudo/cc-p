@@ -101,6 +101,22 @@ Bun.serve({
             { type: 'abort' },
             { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 200, outputTokens: 30, inputTokenDetails: { cacheReadTokens: 120, cacheWriteTokens: 40, cacheWriteTokens1h: 10 } } },
           ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        case 'mock/truncated':
+          // 上游中途 abort：产出内容后既不发 finish 也不发 error 就断流。
+          // 客户端必须看到明确失败（SSE 内 error / 终端 502），绝不能是成功。
+          return new Response(ndjson([
+            { type: 'start' },
+            { type: 'text-delta', text: 'partial answer' },
+            { type: 'abort' },
+          ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        case 'mock/abort-no-finish':
+          // 与 truncated 同形，单独命名用于 anthropic/responses 命名可读性。
+          return new Response(ndjson([
+            { type: 'start' },
+            { type: 'reasoning-delta', text: 'thinking…' },
+            { type: 'text-delta', text: 'half' },
+            { type: 'abort' },
+          ]), { headers: { 'content-type': 'application/x-ndjson' } })
         case 'mock/dup-tool':
           // 上游对同一个 tool call 重复投递：权威的 tool-call 之后又跟一份
           // tool-input-* 携带同一 id（真实上游如此，cmdcode2api 也为此做了去重）。
@@ -396,6 +412,30 @@ console.log('--- openai stream ---')
   check('tool_calls chunk', chunks[2]?.choices?.[0]?.delta?.tool_calls?.[0]?.function?.name === 'get_weather' && chunks[2]?.choices?.[0]?.delta?.tool_calls?.[0]?.function?.arguments === '{"city":"SF"}', chunks[2])
   const finish = chunks.at(-1)
   check('finish chunk w/ usage', finish?.choices?.[0]?.finish_reason === 'tool_calls' && finish?.usage?.prompt_tokens === 100 && finish?.usage?.total_tokens === 120, finish)
+}
+
+console.log('--- openai stream truncation (upstream abort, no finish) ---')
+{
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/truncated', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+  })
+  const text = await r.text()
+  const lines = text.split('\n').filter((l) => l.startsWith('data: '))
+  check('truncated stream keeps partial text', text.includes('"content":"partial answer"'), text.slice(0, 300))
+  check('truncated stream never fakes [DONE]', !text.includes('[DONE]'), lines.at(-1))
+  const last = lines.at(-1)
+  check('truncated stream emits error frame', last?.includes('truncated') === true, last)
+}
+{
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/truncated', messages: [{ role: 'user', content: 'hi' }] }),
+  })
+  const body = await r.json()
+  check('truncated non-stream → 502 upstream_error', r.status === 502 && body.error?.type === 'upstream_error' && /truncated/i.test(body.error?.message || ''), { status: r.status, body })
 }
 
 console.log('--- openai reasoning ---')
@@ -737,6 +777,27 @@ console.log('--- anthropic zero output / upstream errors ---')
   check('anthropic stream error before output → JSON 429', r.status === 429 && ct.includes('json') && !ct.includes('event-stream') && body.type === 'error' && body.error.type === 'rate_limit_error' && body.retry_after === undefined, { ct, body })
 }
 
+console.log('--- anthropic stream truncation (upstream abort, no finish) ---')
+{
+  const r = await fetch(BASE + '/v1/messages', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
+    body: JSON.stringify({ model: 'mock/truncated', max_tokens: 100, stream: true, messages: [{ role: 'user', content: 'q' }] }),
+  })
+  check('anthropic truncated stream SSE 200', r.status === 200 && (r.headers.get('content-type') || '').includes('text/event-stream'), r.status)
+  const text = await r.text()
+  check('anthropic truncated keeps partial text', text.includes('partial answer'), text.slice(0, 300))
+  check('anthropic truncated emits error (never fake end_turn)', text.includes('event: error') && text.includes('truncated'), text.slice(-400))
+  check('anthropic truncated has no end_turn success', !text.includes('"stop_reason":"end_turn"'), text.slice(-400))
+}
+{
+  const r = await fetch(BASE + '/v1/messages', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
+    body: JSON.stringify({ model: 'mock/truncated', max_tokens: 100, messages: [{ role: 'user', content: 'q' }] }),
+  })
+  const body = await r.json()
+  check('anthropic truncated non-stream → 502 upstream_error', r.status === 502 && body.type === 'error' && body.error?.type === 'upstream_error' && /truncated/i.test(body.error?.message || ''), { status: r.status, body })
+}
+
 console.log('--- responses non-stream ---')
 {
   const before = (await statsFetch()).generate
@@ -910,6 +971,26 @@ console.log('--- responses zero output / upstream errors ---')
   const text = await r.text()
   check('responses midstream error keeps SSE 200', r.status === 200 && (r.headers.get('content-type') || '').includes('text/event-stream'), r.status)
   check('responses midstream error has partial + error event', text.includes('"delta":"partial"') && text.includes('event: error') && !text.includes('response.completed'), text.slice(-200))
+}
+
+{
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/truncated', stream: true, input: 'q' }),
+  })
+  check('responses truncated stream keeps SSE 200', r.status === 200 && (r.headers.get('content-type') || '').includes('text/event-stream'), r.status)
+  const text = await r.text()
+  check('responses truncated stream keeps partial delta', text.includes('"delta":"partial answer"'), text.slice(0, 300))
+  check('responses truncated stream → response.incomplete (never completed)', text.includes('event: response.incomplete') && !text.includes('event: response.completed'), text.slice(-400))
+  check('responses truncated stream marks upstream_interrupted', text.includes('upstream_interrupted'), text.slice(-400))
+}
+{
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/truncated', input: 'q' }),
+  })
+  const body = await r.json()
+  check('responses truncated non-stream → 502 upstream_error', r.status === 502 && body.error?.type === 'upstream_error' && /truncated/i.test(body.error?.message || ''), { status: r.status, body })
 }
 
 console.log('--- client disconnect ---')

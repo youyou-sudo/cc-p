@@ -117,6 +117,22 @@ export async function handleResponsesStream(deps: ResponsesStreamDeps): Promise<
           // 错误帧由 translator 的 error hook 产出；未 start 时留在 buffered，
           // close() 清空后走终端 JSON，绝不翻转成 SSE 200。
           state.upstreamError = translator.upstreamError
+        } else if (translator.truncated) {
+          // 截断：有内容但上游从未发 finish（abort / 断流）。translator 的
+          // finishEvents() 会发 response.incomplete（非 completed）；未 start 时
+          // 留在 buffered，close() 后走终端 502，绝不翻转成 SSE 200 成功。
+          log('warn', 'Stream truncated before finish (responses)', {
+            path: '/v1/responses',
+            model,
+            responseId,
+            streaming: true,
+            lastCcEvent: lastCcEvent || '(none)',
+            bytesReceived,
+            inputTokens: translator.inputTokens,
+            outputTokens: translator.outputTokens,
+          })
+          pipeline.start()
+          emit(translator.finishEvents())
         } else if (!(translator.sawContent || translator.outputTokens > 0)) {
           state.zeroOutput = true
           try { if (!abortController.signal.aborted) abortController.abort() } catch {}

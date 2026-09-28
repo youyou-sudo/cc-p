@@ -1,7 +1,7 @@
 import { CFG, FORWARD_SAMPLING_PARAMS } from '../shared/config'
 import { getSessionContext } from './session'
 import { CC_VERSION } from '../shared/version'
-import { fakeProjectSlug, generateTraceparent, getDateStr, getEnvironment, tryParseJSONStrict, isJSONParseFailure, randHex } from '../shared/util'
+import { fakeProjectSlug, generateTraceparent, getDateStr, getEnvironment, tryParseJSONStrict, isJSONParseFailure, randHex, redactLargeDataUrls } from '../shared/util'
 import { log } from '../shared/logger'
 
 /** buildCcRequest 参数非法时抛出的 400 错误，由上层统一转 invalid_request_error。 */
@@ -228,6 +228,26 @@ function repairDuplicateToolCallIds(ccMessages: any[]): number {
   return repaired
 }
 
+/** 递归清扫文本通道里过大的内联 data: URL（截图 base64）。真正的图片分片
+ *  （type:'image'）不在此列，视觉输入不受影响；只清理会被当成文本回灌的字段。
+ *  `touched` 计数被改写过的字符串，供调用方决定是否打日志（避免额外 stringify）。 */
+function redactLargeDataUrlsIn(value: any, touched: { n: number }): any {
+  if (typeof value === 'string') {
+    const out = redactLargeDataUrls(value)
+    if (out !== value) touched.n++
+    return out
+  }
+  if (Array.isArray(value)) return value.map((v) => redactLargeDataUrlsIn(v, touched))
+  if (value && typeof value === 'object') {
+    // 图片分片（type:'image'）的载荷是视觉输入，保持原样，绝不降级。
+    if (value.type === 'image') return value
+    const out: any = {}
+    for (const k of Object.keys(value)) out[k] = redactLargeDataUrlsIn(value[k], touched)
+    return out
+  }
+  return value
+}
+
 export function buildCcRequest(openaiReq: any): any {
   const { model, messages, max_tokens, temperature, tools, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key, top_p, stop, user, seed } = openaiReq
 
@@ -380,9 +400,9 @@ export function buildCcRequest(openaiReq: any): any {
       }
       let toolText: string
       if (typeof msg.content === 'string') {
-        toolText = msg.content
+        toolText = redactLargeDataUrls(msg.content)
       } else if (Array.isArray(msg.content)) {
-        toolText = msg.content.map((c: any) => {
+        toolText = redactLargeDataUrls(msg.content.map((c: any) => {
           if (c == null) return ''
           if (typeof c === 'string') return c
           if (c.type === 'text') return c.text || ''
@@ -391,11 +411,20 @@ export function buildCcRequest(openaiReq: any): any {
             log('warn', 'cc tool image demoted to placeholder', { url: url ? shortUrl(url) : '(empty)' })
             return url ? `[image: ${shortUrl(url)}]` : '[image omitted: empty url]'
           }
+          // 文件/附件分片：内联 base64 截图可达数 MB，stringify 进 tool 文本后
+          // 会随历史每轮重发、直接顶爆上下文。降级为占位符，绝不整段搬运。
+          if (c.type === 'file' || c.type === 'input_file' || c.type === 'document') {
+            const name = c.filename || c.name || ''
+            const uri = typeof c.uri === 'string' ? c.uri : (typeof c.url === 'string' ? c.url : '')
+            const size = uri.startsWith('data:') ? `, ${uri.length} chars inline` : ''
+            log('warn', 'cc tool file demoted to placeholder', { name, inline: uri.startsWith('data:') })
+            return `[file: ${name || 'attachment'}${size}]`
+          }
           if (typeof c.text === 'string') return c.text
           try { return JSON.stringify(c) } catch { return String(c) }
-        }).join('\n')
+        }).join('\n'))
       } else {
-        toolText = JSON.stringify(msg.content)
+        toolText = redactLargeDataUrls(JSON.stringify(msg.content))
       }
       return {
         role: 'tool',
@@ -413,6 +442,16 @@ export function buildCcRequest(openaiReq: any): any {
 
   // 收敛历史里的重复 tool_call_id（上游对此零容忍，见 repairDuplicateToolCallIds）。
   repairDuplicateToolCallIds(ccMessages)
+
+  // 最后一道安全网：任何消息形状里残留的巨型内联 data: URL（截图 base64）
+  // 都以占位符落地，绝不随历史每轮重发顶爆上下文。type:'image' 分片原样保留。
+  const touched = { n: 0 }
+  for (let i = 0; i < ccMessages.length; i++) {
+    ccMessages[i] = redactLargeDataUrlsIn(ccMessages[i], touched)
+  }
+  if (touched.n > 0) {
+    log('warn', 'cc redacted oversized inline data URLs in history', { strings: touched.n })
+  }
 
   const hasMessageCacheMarker = ccMessages.some((msg: any) =>
     Array.isArray(msg.content) && msg.content.some((part: any) => part?.cache_control))
