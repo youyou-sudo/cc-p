@@ -2,7 +2,7 @@
 // Pure streaming translation, no I/O.
 
 import { isTruncatedStream, mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
-import { createToolCallIdGuard } from '../../shared/cc-types'
+import { ccToolCallId, ccToolName, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
@@ -98,7 +98,13 @@ export function createSseTranslator(model: string, completionId: string, created
     }
     hasToolCall = true
     const finalId = id || `call_${Date.now()}_${toolCallIndex}`
-    const tcEntry = { index: toolCallIndex, id: finalId, type: 'function', function: { name: name || '', arguments: argsStr } }
+    // OpenAI 契约要求 function.name 非空；opencode 的 ToolStream.appendOrStart 对
+    // 空串 name 会直接抛 "OpenAI Chat tool call delta is missing id or name"，
+    // 整条流失败。上游确实没给名字时兜底占位名并记日志。
+    if (!name) {
+      log('warn', 'cc tool-call empty name fallback', { path: '/v1/chat/completions', toolCallId: finalId })
+    }
+    const tcEntry = { index: toolCallIndex, id: finalId, type: 'function', function: { name: name || UNKNOWN_TOOL_NAME, arguments: argsStr } }
     const delta = chunkIndex === 0
       ? { role: 'assistant', content: null, tool_calls: [tcEntry] }
       : { tool_calls: [tcEntry] }
@@ -141,14 +147,17 @@ export function createSseTranslator(model: string, completionId: string, created
     },
     'tool-call': (event: any) => {
       const args = typeof event.input === 'string' ? event.input : JSON.stringify(event.input ?? {})
-      // A final tool-call supersedes any pending incremental buffer.
+      // 最终 tool-call 可能只带 input：先把 tool-input-* 缓存里的 id/name 取回
+      // 再清空，否则会丢掉上游早先给出的工具名、发出空 name（见 emitToolCallChunk）。
+      const id = ccToolCallId(event) || pendingToolInput?.id || ''
+      const name = ccToolName(event) || pendingToolInput?.name || ''
       pendingToolInput = null
-      return emitToolCallChunk(event.toolCallId || '', event.toolName || '', args)
+      return emitToolCallChunk(id, name, args)
     },
     'tool-input-start': (event: any) => {
       pendingToolInput = {
-        id: event.toolCallId || event.id || event.toolUseId || '',
-        name: event.toolName || event.name || '',
+        id: ccToolCallId(event) || pendingToolInput?.id || '',
+        name: ccToolName(event) || pendingToolInput?.name || '',
         json: '',
       }
     },
@@ -156,15 +165,13 @@ export function createSseTranslator(model: string, completionId: string, created
       const d = event.delta ?? event.text ?? event.partial_json ?? event.partialJson
         ?? event.data ?? event.json ?? event.value ?? event.input ?? ''
       const s = typeof d === 'string' ? d : JSON.stringify(d)
+      const id = ccToolCallId(event)
+      const name = ccToolName(event)
       if (!pendingToolInput) {
-        pendingToolInput = {
-          id: event.toolCallId || event.id || '',
-          name: event.toolName || event.name || '',
-          json: '',
-        }
+        pendingToolInput = { id, name, json: '' }
       } else {
-        if (event.toolCallId || event.id) pendingToolInput.id = event.toolCallId || event.id
-        if (event.toolName || event.name) pendingToolInput.name = event.toolName || event.name
+        if (id) pendingToolInput.id = id
+        if (name) pendingToolInput.name = name
       }
       if (s) pendingToolInput.json += s
     },
@@ -173,8 +180,8 @@ export function createSseTranslator(model: string, completionId: string, created
       // End carries the complete input when present; otherwise emit the
       // buffered incremental payload. Either way pending is cleared so a
       // later finish/flush cannot double-emit the same call.
-      const id = event.toolCallId || event.id || pendingToolInput?.id || ''
-      const name = event.toolName || event.name || pendingToolInput?.name || ''
+      const id = ccToolCallId(event) || pendingToolInput?.id || ''
+      const name = ccToolName(event) || pendingToolInput?.name || ''
       const argsStr = fullInput != null
         ? (typeof fullInput === 'string' ? fullInput : JSON.stringify(fullInput ?? {}))
         : (pendingToolInput?.json || '')

@@ -404,5 +404,30 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('responses sse completed after finish, no [DONE]', finOk.at(-1)?.startsWith('event: response.completed') === true && !finOk.join('').includes('[DONE]'), finOk)
 }
 
+// billing: upstream credits payload → OpenAI credit_summary (pure)
+{
+  const { buildCreditSummary } = await import('../src/modules/billing/service')
+
+  const summary = buildCreditSummary({
+    windowLimits: {
+      fiveHour: { used: 2, cap: 14, exceeded: false, resetAt: Date.now() + 3_600_000 },
+      weekly: { used: 5, cap: 35, exceeded: false, resetAt: Date.now() + 86_400_000 },
+    },
+    credits: { monthlyCredits: 57.5, monthlyCreditsGranted: 70, purchasedCredits: 10 },
+  })
+  check('billing summary object', summary.object === 'credit_summary', summary)
+  check('billing summary totals include purchased', summary.total_granted === 70 && summary.total_used === 12.5 && summary.total_available === 67.5, summary)
+  check('billing summary grant entry', summary.grants.object === 'list' && summary.grants.data.length === 1 && summary.grants.data[0].object === 'credit_grant' && summary.grants.data[0].grant_amount === 70 && summary.grants.data[0].used_amount === 12.5 && summary.grants.data[0].expires_at === null, summary.grants)
+
+  const onlyRemaining = buildCreditSummary({ credits: { monthlyCredits: 30 } })
+  check('billing summary missing granted → untouched', onlyRemaining.total_granted === 30 && onlyRemaining.total_used === 0 && onlyRemaining.total_available === 30, onlyRemaining)
+
+  const overspent = buildCreditSummary({ credits: { monthlyCredits: 0, monthlyCreditsGranted: 70 } })
+  check('billing summary fully spent clamps used', overspent.total_used === 70 && overspent.total_available === 0, overspent)
+
+  const empty = buildCreditSummary(null)
+  check('billing summary garbage → zeros, never throws', empty.total_granted === 0 && empty.total_used === 0 && empty.total_available === 0 && empty.grants.data.length === 1, empty)
+}
+
 console.log(`\nUNIT RESULT: ${passed} passed, ${failed} failed`)
 if (failed > 0) process.exit(1)

@@ -10,6 +10,7 @@ const stats = {
   generate: 0,
   fingerprint: 0,
   lifecycle: 0,
+  billing: 0,
   lastGenerateHeaders: {} as Record<string, string>,
   lastGenerateBody: null as any,
 }
@@ -51,6 +52,16 @@ Bun.serve({
 
     if (url.pathname === '/alpha/fingerprint/record') { stats.fingerprint++; return Response.json({}) }
     if (url.pathname === '/alpha/lifecycle-events') { stats.lifecycle++; return Response.json({}) }
+    if (url.pathname === '/alpha/billing/credits') {
+      stats.billing++
+      return Response.json({
+        windowLimits: {
+          fiveHour: { used: 2, cap: 14, exceeded: false, resetAt: Date.now() + 3_600_000 },
+          weekly: { used: 5, cap: 35, exceeded: false, resetAt: Date.now() + 86_400_000 },
+        },
+        credits: { monthlyCredits: 57.5, monthlyCreditsGranted: 70, purchasedCredits: 10 },
+      })
+    }
     if (url.pathname === '/provider/v1/models') {
       return Response.json({ data: [{ id: 'mock-model-a', context_window: 128000, max_output_tokens: 4096 }, { id: 'mock-model-b', context_length: 64000 }, { id: 'claude-sonnet-4-6' }] })
     }
@@ -353,6 +364,27 @@ console.log('--- models ---')
   check('models alias context_length → context_window', body.data[1]?.context_window === 64000, body.data?.[1])
   check('models static fallback window', body.data[2]?.id === 'claude-sonnet-4-6' && body.data[2]?.context_window === 1048576, body.data?.[2])
   check('models vision default modalities', body.data.every((m: any) => Array.isArray(m.modalities) && m.modalities.includes('image')) && body.data[0]?.supports_vision === true && body.data[0]?.vision === true, body.data?.[0])
+}
+
+console.log('--- billing / credit summary ---')
+{
+  const before = (await statsFetch()).billing
+  const r = await fetch(BASE + '/v1/dashboard/billing/credit_grants', { headers: { authorization: `Bearer ${KEY}` } })
+  const body = await r.json()
+  check('billing 200 credit_summary', r.status === 200 && body.object === 'credit_summary', body)
+  check('billing totals granted/used/available', body.total_granted === 70 && body.total_used === 12.5 && body.total_available === 67.5, body)
+  check('billing grants list shape', body.grants?.object === 'list' && body.grants?.data?.[0]?.object === 'credit_grant' && body.grants.data[0].grant_amount === 70 && body.grants.data[0].used_amount === 12.5, body.grants)
+  check('billing CORS never null', r.headers.get('access-control-allow-origin') !== 'null')
+  check('billing Vary: Origin', (r.headers.get('vary') || '').includes('Origin'))
+  const s = await statsFetch()
+  check('billing upstream called with key', s.billing === before + 1, s.billing)
+}
+{
+  const before = (await statsFetch()).billing
+  const r = await fetch(BASE + '/v1/dashboard/billing/credit_grants')
+  const body = await r.json()
+  check('billing missing key 401 openai shape', r.status === 401 && body.error?.type === 'auth_error' && (body as any).type === undefined, body)
+  check('billing 401 does not reach upstream', (await statsFetch()).billing === before)
 }
 
 console.log('--- openai non-stream ---')

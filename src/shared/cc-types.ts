@@ -69,6 +69,27 @@ export function createToolCallIdGuard(): (id: string) => boolean {
   }
 }
 
+/** 上游工具名可能落在不同字段：权威 `tool-call` 用 `toolName`，部分事件/版本
+ *  用 `name`，个别包装在 `tool.name`。六个钩子各自手写会漏读，最终向下游发出
+ *  空 `function.name`/`tool_use.name` —— opencode 的 ToolStream 遇空 name 直接抛
+ *  "OpenAI Chat tool call delta is missing id or name"，整条流失败。
+ *  统一提取，永远是去掉首尾空白的字符串（可能为空，由发射端兜底）。 */
+export function ccToolName(event: any): string {
+  const v = event?.toolName ?? event?.name ?? event?.tool?.name
+  return typeof v === 'string' ? v.trim() : ''
+}
+
+/** 上游工具调用 id 可能落在 `toolCallId` / `toolUseId` / `id`（tool-input-start
+ *  用 `id`）。同样统一提取，避免流式路径漏读后下发空 id。 */
+export function ccToolCallId(event: any): string {
+  const v = event?.toolCallId ?? event?.id ?? event?.toolUseId
+  return typeof v === 'string' ? v.trim() : ''
+}
+
+/** 下游契约要求工具名非空；上游确实完全没给名字时的统一占位符
+ *  （与 request 侧 resolveCallName / cc.ts 的空名兜底同名，保持一轮自洽）。 */
+export const UNKNOWN_TOOL_NAME = 'unknown_tool'
+
 // ── NDJSON stream events ────────────────────────────────────────────────
 
 export interface CcStartEvent { type: 'start' }
