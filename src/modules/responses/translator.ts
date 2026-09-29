@@ -173,13 +173,60 @@ function convertContentParts(content: any): any {
   return parts
 }
 
-/** Responses tools (flat {type,name,parameters}) → chat nested function tools. */
-function convertTools(tools: any): any[] | undefined {
+/**
+ * Responses tools (flat {type,name,parameters}) → chat nested function tools.
+ *
+ * `namespace` tools (codex `collaboration` / `multi_agent_v1`) group several
+ * function tools under one name; CC has no namespace concept, so the whole
+ * group must be flattened to bare-name function tools — otherwise the model
+ * never sees its subtools and the client replays a call the proxy cannot name
+ * (which upstream then rejects with "`name` must be non-empty"). `namespaces`
+ * records bare-name → namespace so response translation can restore the
+ * `namespace` field codex routes on (see createResponsesSseTranslator /
+ * buildResponsesObject). Built-in tools with no CC equivalent are still dropped
+ * with a warn (never silently).
+ */
+function convertTools(tools: any, namespaces: Record<string, string>): any[] | undefined {
   if (!Array.isArray(tools) || tools.length === 0) return undefined
   const out: any[] = []
+  const seen = new Set<string>()
+  const pushFunction = (name: string, description: string, params: any, strict: any, namespace?: string): void => {
+    // 先到先赢：顶层同名 function 工具优先，避免两套 schema 漂移。
+    if (!name || seen.has(name)) return
+    seen.add(name)
+    if (namespace) namespaces[name] = namespace
+    const fn: any = { name, description: description || '' }
+    if (params !== undefined) fn.parameters = params
+    if (strict !== undefined) fn.strict = strict
+    out.push({ type: 'function', function: fn })
+  }
   for (const t of tools) {
     if (!t || typeof t !== 'object') continue
     const type = t.type || 'function'
+    if (type === 'namespace') {
+      const ns = t.name || ''
+      const subTools = Array.isArray(t.tools) ? t.tools : []
+      if (!ns || subTools.length === 0) {
+        log('warn', 'responses namespace tool empty dropped', { name: ns, subTools: subTools.length })
+        continue
+      }
+      for (const sub of subTools) {
+        const subType = sub?.type || 'function'
+        if (subType !== 'function') {
+          log('warn', 'responses namespace sub-tool dropped', { namespace: ns, toolType: subType, name: sub?.name || '' })
+          continue
+        }
+        const subName = sub.name || ''
+        if (!subName) {
+          log('warn', 'responses namespace sub-tool missing name dropped', { namespace: ns })
+          continue
+        }
+        // 描述前缀保留命名空间来源，模型仍能据此选择正确的子工具。
+        const desc = `[namespace: ${ns}] ${sub.description ?? ''}`.trim()
+        pushFunction(subName, desc, sub.parameters ?? sub.input_schema, sub.strict, ns)
+      }
+      continue
+    }
     if (type !== 'function') {
       // Built-in tools (web_search/file_search/mcp/...): CC has no equivalent.
       log('warn', 'responses non-function tool dropped', { toolType: type, name: t.name || '' })
@@ -190,29 +237,59 @@ function convertTools(tools: any): any[] | undefined {
       log('warn', 'responses tool missing name dropped', {})
       continue
     }
-    const fn: any = {
-      name,
-      description: t.description ?? t.function?.description ?? '',
-    }
-    const params = t.parameters ?? t.function?.parameters ?? t.input_schema
-    if (params !== undefined) fn.parameters = params
-    const strict = t.strict ?? t.function?.strict
-    if (strict !== undefined) fn.strict = strict
-    out.push({ type: 'function', function: fn })
+    pushFunction(name, t.description ?? t.function?.description ?? '', t.parameters ?? t.function?.parameters ?? t.input_schema, t.strict ?? t.function?.strict)
   }
   return out.length > 0 ? out : undefined
 }
 
-function convertToolChoice(tc: any): any {
+/** 把 Responses 的带命名空间调用名规范成扁平的裸子工具名。
+ *  codex 会把命名空间调用的 name 写成 `<ns>.<tool>`；上行 tools 已按裸名展平，
+ *  这里剥掉已知前缀，避免上游因引用不存在的工具名而 400。 */
+export function normalizeNamespacedName(name: string, namespaces: Record<string, string>): string {
+  if (!name) return name
+  if (namespaces[name]) return name
+  const dot = name.indexOf('.')
+  if (dot > 0) {
+    const bare = name.slice(dot + 1)
+    if (namespaces[bare]) return bare
+  }
+  return name
+}
+
+/** 回放 `function_call` 时的工具名解析。
+ *
+ *  codex 的命名空间调用回放时可能**不带 name**（只带 namespace / call_id），
+ *  直接 `item.name || ''` 会向上游发出空名，上游以
+ *  "`name` must be non-empty" 400 掉整个请求（生产日志实证）。
+ *  解析顺序：name / function.name / tool_name → 归一点分名 → namespace 唯一子工具
+ *  → 非空占位名。**永不返回空串**（上游契约要求非空）。 */
+function resolveCallName(item: any, namespaces: Record<string, string>): string {
+  const raw = String(item?.name ?? item?.function?.name ?? item?.tool_name ?? '').trim()
+  const normalized = normalizeNamespacedName(raw, namespaces)
+  if (normalized) return normalized
+  const ns = typeof item?.namespace === 'string' ? item.namespace : ''
+  if (ns) {
+    const subs = Object.keys(namespaces).filter((k) => namespaces[k] === ns)
+    if (subs.length === 1) return subs[0]!
+  }
+  return 'unknown_tool'
+}
+
+function convertToolChoice(tc: any, namespaces: Record<string, string>): any {
   if (tc === undefined || tc === null) return undefined
   if (typeof tc === 'string') return tc
   if (typeof tc !== 'object') return undefined
   if (tc.type === 'function') {
-    const name = tc.name ?? tc.function?.name
+    let name = tc.name ?? tc.function?.name
     if (!name) {
       log('warn', 'responses tool_choice function missing name dropped', {})
       return undefined
     }
+    // 命名空间选择：`{namespace, name:"ns.tool"}` 或点分裸名 → 裸子工具名。
+    if (typeof tc.namespace === 'string' && tc.namespace) {
+      name = name.replace(new RegExp(`^${tc.namespace.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.`), '')
+    }
+    name = normalizeNamespacedName(name, namespaces)
     const out: any = { type: 'function', function: { name } }
     if (tc.disable_parallel_tool_use !== undefined) out.disable_parallel_tool_use = tc.disable_parallel_tool_use
     return out
@@ -235,6 +312,12 @@ const IGNORED_FIELDS = [
 export function convertResponsesToOpenAI(responsesReq: any): any {
   const req = responsesReq || {}
   const messages: any[] = []
+
+  // tools/namespaces 先于 input 解析：function_call 回放需要 namespaces 做名字
+  // 归一与空名兜底（见 resolveCallName），否则会向上游发出空名而被 400。
+  const namespaces: Record<string, string> = {}
+  const tools = convertTools(req.tools, namespaces)
+  const toolChoice = convertToolChoice(req.tool_choice, namespaces)
 
   const instructions = req.instructions
   if (typeof instructions === 'string') {
@@ -272,10 +355,19 @@ export function convertResponsesToOpenAI(responsesReq: any): any {
       const type = item.type
       if (type === 'function_call') {
         const callId = item.call_id || item.id || `call_${uuid().slice(0, 8)}`
+        const name = resolveCallName(item, namespaces)
+        if (name === 'unknown_tool') {
+          // 非空兜底只为满足上游校验（"`name` must be non-empty"）；记下形态便于定位。
+          log('warn', 'responses function_call name fallback', {
+            callId,
+            namespace: item.namespace || '',
+            hadName: !!item.name,
+          })
+        }
         const toolCall = {
           id: callId,
           type: 'function',
-          function: { name: item.name || '', arguments: toolArgsToString(item.arguments) },
+          function: { name, arguments: toolArgsToString(item.arguments) },
         }
         if (toolCallContainer) {
           toolCallContainer.tool_calls.push(toolCall)
@@ -290,6 +382,9 @@ export function convertResponsesToOpenAI(responsesReq: any): any {
         messages.push({
           role: 'tool',
           tool_call_id: callId,
+          // 客户端可能只回放 output 而不带调用项（stateless 转发忽略
+          // previous_response_id），带上 name 可避免 cc.ts 落到 unknown_tool 兜底。
+          ...(item.name ? { name: String(item.name) } : {}),
           content: outputToText(item.output),
         })
       } else if (type === 'reasoning' || type === 'item_reference' || type === 'computer_call_output' || type === 'mcp_call' || type === 'mcp_approval_response') {
@@ -321,10 +416,14 @@ export function convertResponsesToOpenAI(responsesReq: any): any {
   if (req.user !== undefined) openaiReq.user = req.user
   if (req.metadata?.user_id !== undefined) openaiReq.user = req.metadata.user_id
 
-  const tools = convertTools(req.tools)
   if (tools) openaiReq.tools = tools
-  const toolChoice = convertToolChoice(req.tool_choice)
   if (toolChoice !== undefined) openaiReq.tool_choice = toolChoice
+  // namespace 子工具展平后，名字→命名空间的映射需透传到响应侧：上游把该调用
+  // 当扁平 function 返回，回放时必须还原 `namespace` 字段（codex-rs 按
+  // (namespace, name) 路由，点分 ns.name 会被判 unsupported call）。
+  // 内部透传字段（非标准 OpenAI，仅在 proxy 内部消费，绝不进上游请求体：
+  // buildCcRequest 只挑白名单字段，会自然忽略）。
+  if (Object.keys(namespaces).length > 0) openaiReq._toolNamespaces = namespaces
 
   if (req.reasoning && typeof req.reasoning === 'object') {
     if (req.reasoning.effort !== undefined) openaiReq.reasoning_effort = req.reasoning.effort
@@ -385,9 +484,17 @@ interface OpenItem {
   args: string
   name: string
   callId: string
+  /** 展平后的命名空间子工具：回放时附加 namespace 字段（codex-rs 路由键）。 */
+  namespace: string
 }
 
-export function createResponsesSseTranslator(model: string, responseId: string, createdAt: number) {
+export function createResponsesSseTranslator(
+  model: string,
+  responseId: string,
+  createdAt: number,
+  /** 裸子工具名 → 命名空间（来自请求转换 convertTools 的展平）。 */
+  toolNamespaces: Record<string, string> = {},
+) {
   let sequence = 0
   let outputIndex = 0
   const items: any[] = []
@@ -414,7 +521,7 @@ export function createResponsesSseTranslator(model: string, responseId: string, 
     const out: string[] = []
     if (current && current.kind !== 'message') out.push(...closeCurrent())
     if (current) return out
-    const item: OpenItem = { kind: 'message', id: `msg_${uuid().slice(0, 12)}`, outputIndex: outputIndex++, text: '', args: '', name: '', callId: '' }
+    const item: OpenItem = { kind: 'message', id: `msg_${uuid().slice(0, 12)}`, outputIndex: outputIndex++, text: '', args: '', name: '', callId: '', namespace: '' }
     current = item
     out.push(event('response.output_item.added', {
       output_index: item.outputIndex,
@@ -433,7 +540,7 @@ export function createResponsesSseTranslator(model: string, responseId: string, 
     const out: string[] = []
     if (current && current.kind !== 'reasoning') out.push(...closeCurrent())
     if (current) return out
-    const item: OpenItem = { kind: 'reasoning', id: `rs_${uuid().slice(0, 12)}`, outputIndex: outputIndex++, text: '', args: '', name: '', callId: '' }
+    const item: OpenItem = { kind: 'reasoning', id: `rs_${uuid().slice(0, 12)}`, outputIndex: outputIndex++, text: '', args: '', name: '', callId: '', namespace: '' }
     current = item
     out.push(event('response.output_item.added', {
       output_index: item.outputIndex,
@@ -482,10 +589,11 @@ export function createResponsesSseTranslator(model: string, responseId: string, 
       out.push(event('response.function_call_arguments.done', {
         item_id: c.id, output_index: c.outputIndex, arguments: c.args,
       }))
-      const item = {
+      const item: any = {
         id: c.id, type: 'function_call', status: 'completed',
         call_id: c.callId, name: c.name, arguments: c.args,
       }
+      if (c.namespace) item.namespace = c.namespace
       items.push(item)
       out.push(event('response.output_item.done', { output_index: c.outputIndex, item }))
     }
@@ -494,13 +602,17 @@ export function createResponsesSseTranslator(model: string, responseId: string, 
 
   const isDuplicateToolCallId = createToolCallIdGuard()
 
-  function emitFunctionCall(callId: string, name: string, args: string): string[] {
+  function emitFunctionCall(callId: string, rawName: string, args: string): string[] {
     // 同一 id 二次出现必须跳过（见 createToolCallIdGuard），否则客户端回传重复
     // call_id，上游 400。
     if (isDuplicateToolCallId(callId)) {
       log('debug', 'cc duplicate tool-call id suppressed (stream)', { toolCallId: callId })
       return []
     }
+    // 上游按扁平 function 返回；若该名字来自命名空间展平，回放时剥掉可能的
+    // `<ns>.` 前缀并还原 namespace 字段（codex-rs 按 (namespace, name) 路由）。
+    const name = normalizeNamespacedName(rawName || '', toolNamespaces)
+    const namespace = toolNamespaces[name] || ''
     const out: string[] = []
     if (current) out.push(...closeCurrent())
     const item: OpenItem = {
@@ -511,11 +623,14 @@ export function createResponsesSseTranslator(model: string, responseId: string, 
       args,
       name,
       callId,
+      namespace,
     }
     current = item
+    const addedItem: any = { id: item.id, type: 'function_call', status: 'in_progress', call_id: callId, name, arguments: '' }
+    if (namespace) addedItem.namespace = namespace
     out.push(event('response.output_item.added', {
       output_index: item.outputIndex,
-      item: { id: item.id, type: 'function_call', status: 'in_progress', call_id: callId, name, arguments: '' },
+      item: addedItem,
     }))
     if (args) {
       out.push(event('response.function_call_arguments.delta', {

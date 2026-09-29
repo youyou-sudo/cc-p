@@ -284,7 +284,9 @@ export function buildCcRequest(openaiReq: any): any {
     if (msg.role === 'assistant' && msg.tool_calls) {
       for (const tc of msg.tool_calls) {
         if (tc.id) {
-          toolNameMap[tc.id] = tc.function?.name || ''
+          // 与下面的 tool-call 占位名保持一致：空名会让上游 400，且结果的
+          // toolName 也应与调用一致（而非退化成 tool_call_id）。
+          toolNameMap[tc.id] = tc.function?.name || 'unknown_tool'
         }
       }
     }
@@ -373,18 +375,32 @@ export function buildCcRequest(openaiReq: any): any {
           if (typeof rawArgs === 'string') {
             const parsed = tryParseJSONStrict(rawArgs)
             if (isJSONParseFailure(parsed)) {
-              log('warn', 'cc tool arguments parse failed, passthrough raw', { raw: rawArgs.slice(0, 200), message: parsed.message })
-              input = rawArgs
+              // 上游 tool-call.input 只接受对象（cmdcode2api 实测：标量/尾随内容被拒），
+              // 透传裸字符串会被判 Param Incorrect 并 400 掉整轮。回退空对象保活，
+              // 原始片段留在日志里便于定位（原先 passthrough raw 就是 400 的来源之一）。
+              log('warn', 'cc tool arguments parse failed, using empty object', { raw: rawArgs.slice(0, 200), message: parsed.message })
+              input = {}
+            } else if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              log('warn', 'cc tool arguments not an object, using empty object', { type: Array.isArray(parsed) ? 'array' : typeof parsed })
+              input = {}
             } else {
               input = parsed
             }
+          } else if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
+            input = rawArgs
           } else {
-            input = (rawArgs || {})
+            input = {}
+          }
+          const toolName = tc.function?.name || tc.name || ''
+          if (!toolName) {
+            // 上游要求工具名非空（"`name` must be non-empty"）：空名会 400 掉整轮。
+            // 与 tool-result 侧一致，回退到非空占位名。
+            log('warn', 'cc tool_call empty name, using unknown_tool', { toolCallId })
           }
           parts.push({
             type: 'tool-call',
             toolCallId,
-            toolName: tc.function?.name || '',
+            toolName: toolName || 'unknown_tool',
             input,
           })
         }
@@ -396,7 +412,7 @@ export function buildCcRequest(openaiReq: any): any {
       const mappedName = toolNameMap[msg.tool_call_id]
       const toolName = msg.name || mappedName || msg.tool_call_id || 'unknown_tool'
       if (!hasExplicitName && !mappedName) {
-        log('warn', 'cc tool-result unknown_tool fallback', { tool_call_id: msg.tool_call_id || '' })
+        log('debug', 'cc tool-result unknown_tool fallback', { tool_call_id: msg.tool_call_id || '' })
       }
       let toolText: string
       if (typeof msg.content === 'string') {

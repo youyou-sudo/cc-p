@@ -66,6 +66,14 @@ export function limitMeta(
 ): LimitMeta {
   const kind = classifyUpstreamLimit(status, message)
   if (kind !== 'rate_limit') {
+    // 官方 CLI 的可重试集合是 408 / 429 / 5xx（isRetryableStatus），5xx 属
+    // 「瞬时上游故障」，HTTP 层同样应重试（此前只重试 429，生产里一次网关
+    // 502 就直接透传给客户端）。业务终局类（usage window / payment / auth /
+    // plan / overflow）已被 classify 归到各自 kind，不会落到 unknown。
+    const transientStatus = status === 408 || (status >= 500 && status <= 599)
+    if (kind === 'unknown' && transientStatus) {
+      return { kind, retryable: true, retryAfterMs: null }
+    }
     return { kind, retryable: false, retryAfterMs: null }
   }
   let retryAfterMs: number | null = null

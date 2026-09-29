@@ -14,6 +14,8 @@ const stats = {
   lastGenerateBody: null as any,
 }
 let gatewayRetryCount = 0
+let http502RetryCount = 0
+let http400Count = 0
 
 function ndjson(events: any[]): ReadableStream<Uint8Array> {
   return new ReadableStream({
@@ -143,6 +145,19 @@ Bun.serve({
             { type: 'text-delta', text: 'recovered' },
             { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 5, outputTokens: 3, cachedInputTokens: 0 } },
           ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        case 'mock/http-502-retry':
+          // HTTP 层 5xx：官方 CLI 可重试（isRetryableStatus），第一次 502、第二次成功。
+          http502RetryCount++
+          if (http502RetryCount === 1) return Response.json({ error: { message: 'Bad gateway' } }, { status: 502 })
+          return new Response(ndjson([
+            { type: 'start' },
+            { type: 'text-delta', text: 'http-retry-ok' },
+            { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 5, outputTokens: 3, cachedInputTokens: 0 } },
+          ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        case 'mock/http-400':
+          // 4xx 业务错误不得重试（证明 5xx 重试没有过度触发）。
+          http400Count++
+          return Response.json({ error: { message: 'bad request shape' } }, { status: 400 })
         case 'mock/structured-error':
           // 官方 1.62.1 流式错误形状（statusCode/isRetryable）+ 终局标记。
           return new Response(ndjson([
@@ -607,6 +622,52 @@ console.log('--- duplicate tool_call_id: response-side dedupe + request-side rep
   const resultIds = parts.filter((p: any) => p.type === 'tool-result').map((p: any) => p.toolCallId)
   check('history dup tool_call_id repaired to unique', callIds.length === 2 && new Set(callIds).size === 2, callIds)
   check('history tool results re-paired in order', resultIds.length === 2 && resultIds[0] === callIds[0] && resultIds[1] === callIds[1], { callIds, resultIds })
+}
+
+console.log('--- tool-call history hardening (empty name / bad args) ---')
+{
+  // 上游契约：tool-call 的 name 必须非空、input 必须是对象。生产日志里
+  // "`name` must be non-empty" / "Param Incorrect" 400 就来自这两处。
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({
+      model: 'mock/params',
+      messages: [
+        { role: 'user', content: 'go' },
+        { role: 'assistant', tool_calls: [{ id: 'call_bad_1', type: 'function', function: { name: '', arguments: '{"a":' } }] },
+        { role: 'tool', tool_call_id: 'call_bad_1', content: 'r' },
+      ],
+    }),
+  })
+  await r.json()
+  const s = await statsFetch()
+  const parts = s.lastGenerateBody.params.messages.flatMap((m: any) => (Array.isArray(m.content) ? m.content : []))
+  const call = parts.find((p: any) => p.type === 'tool-call')
+  check('empty tool-call name → non-empty placeholder', call?.toolName === 'unknown_tool', call)
+  check('unparseable tool arguments → object input', call != null && typeof call.input === 'object' && call.input !== null, call)
+}
+
+console.log('--- HTTP 5xx retry / 4xx no-retry ---')
+{
+  const before = (await statsFetch()).generate
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/http-502-retry', messages: [{ role: 'user', content: 'q' }] }),
+  })
+  const body = await r.json()
+  check('http 502 retried → 200', r.status === 200 && body.choices?.[0]?.message?.content === 'http-retry-ok', body)
+  const after = (await statsFetch()).generate
+  check('http 502 retry used 2 upstream attempts', after === before + 2, { before, after })
+}
+{
+  const before = (await statsFetch()).generate
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/http-400', messages: [{ role: 'user', content: 'q' }] }),
+  })
+  await r.json()
+  const after = (await statsFetch()).generate
+  check('http 400 not retried (1 attempt)', r.status === 400 && after === before + 1, { status: r.status, before, after })
 }
 
 console.log('--- pre-output upstream stream error: retry vs pass-through ---')

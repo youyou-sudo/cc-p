@@ -35,10 +35,13 @@ export interface ResponsesNonStreamDeps {
   estimatedInputTokens: number
   flow: UpstreamFlow
   releaseUpstream: () => void
+  /** 裸子工具名 → 命名空间（openaiReq._toolNamespaces）；非流式同样需要还原
+   *  `namespace` 字段，否则 codex-rs 会判 unsupported call。 */
+  toolNamespaces?: Record<string, string>
 }
 
 export async function handleResponsesNonStream(deps: ResponsesNonStreamDeps): Promise<Response> {
-  const { ccResponse, apiKey, sessionId, model, responseId, createdAt, estimatedInputTokens, flow, releaseUpstream } = deps
+  const { ccResponse, apiKey, sessionId, model, responseId, createdAt, estimatedInputTokens, flow, releaseUpstream, toolNamespaces } = deps
 
   const abortController = flow.controller
   const aborted = () => flow.aborted
@@ -179,5 +182,5 @@ export async function handleResponsesNonStream(deps: ResponsesNonStreamDeps): Pr
     outputTokens: rawUsage.output_tokens,
     cachedInputTokens: rawUsage.cached_tokens,
   })
-  return sendJSON(200, buildResponsesObject(model, responseId, createdAt, aggregate))
+  return sendJSON(200, buildResponsesObject(model, responseId, createdAt, aggregate, toolNamespaces || {}))
 }

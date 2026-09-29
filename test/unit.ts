@@ -51,6 +51,18 @@ function check(name: string, cond: boolean, extra?: unknown): void {
 
   const rlHeader = limitMeta(429, 'rate limit', 5)
   check('rate_limit honors Retry-After header', rlHeader.retryAfterMs === 5000)
+
+  // HTTP 层 5xx / 408 可重试（对齐官方 CLI 的 isRetryableStatus）；业务终局类
+  // 即使挂 5xx 状态也不重试（classify 已把它们归到各自 kind）。
+  check('500 retryable', limitMeta(500, 'boom', null).retryable === true)
+  check('502 retryable', limitMeta(502, 'bad gateway', null).retryable === true)
+  check('503 retryable', limitMeta(503, 'unavailable', null).retryable === true)
+  check('504 retryable', limitMeta(504, 'gateway timeout', null).retryable === true)
+  check('408 retryable', limitMeta(408, 'request timeout', null).retryable === true)
+  check('5xx payment wording stays non-retryable', limitMeta(503, 'insufficient credits', null).retryable === false)
+  check('401 not retryable', limitMeta(401, 'unauthorized', null).retryable === false)
+  check('403 not retryable', limitMeta(403, 'forbidden', null).retryable === false)
+  check('402 payment not retryable', limitMeta(402, 'no credits', null).retryable === false)
 }
 
 // official 1.62.1 wire shape: terminal markers / structured error / usage fields
@@ -306,6 +318,36 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('responses giant inline image demoted, not verbatim', typeof imgText === 'string' && !imgText.includes('A'.repeat(5000)) && imgText.includes('file:'), String(imgText).slice(0, 120))
   check('responses tool text still carries the leading text', imgText.includes('shot'), imgText)
 
+  // ── namespace 工具 + 空名 function_call 回放（生产日志驱动回归） ──────────
+  // codex 的 namespace 工具（collaboration / multi_agent_v1）CC 无对应概念，必须
+  // 展平成裸名 function；回放调用时空名会让上游 400 "`name` must be non-empty"。
+  const nsReq = convertResponsesToOpenAI({
+    model: 'm',
+    tools: [
+      { type: 'namespace', name: 'collaboration', tools: [
+        { type: 'function', name: 'spawn_agent', description: 'd', parameters: { type: 'object', properties: {} } },
+      ] },
+    ],
+  })
+  check('namespace tool flattened to bare name', nsReq.tools?.length === 1 && nsReq.tools[0].function.name === 'spawn_agent', nsReq.tools)
+  check('namespace map forwarded for response restore', nsReq._toolNamespaces?.spawn_agent === 'collaboration', nsReq._toolNamespaces)
+
+  const emptyName = convertResponsesToOpenAI({
+    input: [{ type: 'function_call', call_id: 'call_x', namespace: 'collaboration', arguments: '{}' }],
+  })
+  const emptyCall = emptyName.messages.find((m: any) => Array.isArray(m.tool_calls))
+  check('empty function_call name never blank (upstream rejects)', typeof emptyCall?.tool_calls[0]?.function?.name === 'string' && emptyCall.tool_calls[0].function.name !== '', emptyCall)
+
+  const dotted = convertResponsesToOpenAI({
+    tools: [{ type: 'namespace', name: 'ns1', tools: [{ type: 'function', name: 'do_it', parameters: { type: 'object' } }] }],
+    input: [{ type: 'function_call', call_id: 'call_y', name: 'ns1.do_it', arguments: '{}' }],
+  })
+  const dottedCall = dotted.messages.find((m: any) => Array.isArray(m.tool_calls))
+  check('dotted namespace call normalized to bare name', dottedCall?.tool_calls[0]?.function?.name === 'do_it', dottedCall)
+
+  const outReq = convertResponsesToOpenAI({ input: [{ type: 'function_call_output', call_id: 'call_z', name: 'do_it', output: 'ok' }] })
+  check('function_call_output carries name (avoids unknown_tool)', outReq.messages[0].role === 'tool' && outReq.messages[0].name === 'do_it', outReq.messages[0])
+
   const out = buildResponsesObject('m2', 'resp_x', 123, {
     fullText: 'hello',
     reasoningContent: 'think',
@@ -319,6 +361,21 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('responses object reasoning first', out.output[0].type === 'reasoning' && out.output[0].summary[0].text === 'think', out.output)
   check('responses object message', out.output[1].type === 'message' && out.output[1].content[0].type === 'output_text' && out.output[1].content[0].text === 'hello', out.output[1])
   check('responses object function_call', out.output[2].type === 'function_call' && out.output[2].call_id === 'call_1' && out.output[2].arguments === '{"a":1}', out.output[2])
+
+  // 非流式路径同样要还原 namespace：codex-rs 按 (namespace, name) 路由，
+  // 缺 namespace 会被判 unsupported call（此前只有流式实现、且未接线）。
+  const nsOut = buildResponsesObject('m2', 'resp_ns', 1, {
+    fullText: '', reasoningContent: '',
+    toolCalls: [{ id: 'call_ns', type: 'function', function: { name: 'spawn_agent', arguments: '{}' } }],
+    finishReason: 'tool_calls', usage: null, upstreamError: null, truncated: false,
+  }, { spawn_agent: 'collaboration' })
+  check('responses object restores namespace (non-stream)', nsOut.output[0].type === 'function_call' && nsOut.output[0].namespace === 'collaboration' && nsOut.output[0].name === 'spawn_agent', nsOut.output[0])
+  const nsDotted = buildResponsesObject('m2', 'resp_ns2', 1, {
+    fullText: '', reasoningContent: '',
+    toolCalls: [{ id: 'call_ns2', type: 'function', function: { name: 'collaboration.spawn_agent', arguments: '{}' } }],
+    finishReason: 'tool_calls', usage: null, upstreamError: null, truncated: false,
+  }, { spawn_agent: 'collaboration' })
+  check('responses object normalizes dotted name + namespace', nsDotted.output[0].name === 'spawn_agent' && nsDotted.output[0].namespace === 'collaboration', nsDotted.output[0])
   check('responses object usage', out.usage.input_tokens === 7 && out.usage.output_tokens === 3 && out.usage.total_tokens === 10 && out.usage.input_tokens_details.cached_tokens === 2, out.usage)
 
   const incomplete = buildResponsesObject('m2', 'resp_y', 1, { fullText: 'x', reasoningContent: '', toolCalls: null, finishReason: 'length', usage: null, upstreamError: null, truncated: false })

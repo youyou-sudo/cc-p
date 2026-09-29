@@ -89,6 +89,9 @@ export async function handleResponsesBody(responsesReq: any, headers: Record<str
       estimatedInputTokens,
       flow,
       releaseUpstream: () => releaseUpstream(),
+      // 命名空间子工具展平映射（convertResponsesToOpenAI 透传，非标准 OpenAI
+      // 字段，只在本地消费）：流式/非流式都要用它还原 function_call.namespace。
+      toolNamespaces: (openaiReq as any)._toolNamespaces || {},
     }
     if (stream) {
       return handleResponsesStream(deps)

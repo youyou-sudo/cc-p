@@ -8,6 +8,7 @@ import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
 import { uuid } from '../../shared/util'
+import { normalizeNamespacedName } from './translator'
 
 // ---- local helpers (file-local, avoid cycles) ----
 function toNum(v: any): number {
@@ -209,6 +210,9 @@ export function buildResponsesObject(
   responseId: string,
   createdAt: number,
   aggregate: ResponsesAggregate,
+  /** 裸子工具名 → 命名空间（来自请求转换 convertTools 的展平）。流式路径
+   *  等价实现见 translator.createResponsesSseTranslator。 */
+  toolNamespaces: Record<string, string> = {},
 ): any {
   const u = aggregate.usage || {}
   normalizeUsage(u)
@@ -238,13 +242,19 @@ export function buildResponsesObject(
     })
   }
   for (const tc of aggregate.toolCalls || []) {
+    // 与流式路径一致：上游按扁平 function 返回；若该名字来自命名空间展平，
+    // 回放时剥掉可能的 `<ns>.` 前缀并还原 namespace 字段（codex-rs 按
+    // (namespace, name) 路由，点分 ns.name 会被判 unsupported call）。
+    const nsName = normalizeNamespacedName(tc.function?.name || '', toolNamespaces)
+    const namespace = toolNamespaces[nsName] || ''
     output.push({
       id: `fc_${uuid().slice(0, 12)}`,
       type: 'function_call',
       status: 'completed',
       call_id: tc.id,
-      name: tc.function?.name || '',
+      name: nsName,
       arguments: toolArgsToString(tc.function?.arguments),
+      ...(namespace ? { namespace } : {}),
     })
   }
   return {
