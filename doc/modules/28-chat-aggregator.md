@@ -41,6 +41,7 @@
 
 - 非流式只认 `finish` 事件的 `totalUsage`（60）；缺失时 `buildChatCompletion` 用 `normalizeUsage` 兜底（87）。
 - tool-call 无 `toolCallId` 时以 `uuid().slice(0,8)` 生成（50）。
+- **空名红线**：`tool-call` / `tool-input-*` 钩子统一用 `ccToolCallId`/`ccToolName`（`cc-types`），`pushToolCall` 内对空名兜底 `UNKNOWN_TOOL_NAME`。上游把名字放在不同字段、或只在 `tool-input-start` 给名，漏读就会下发 `function.name:""`，客户端（如 opencode）直接判为无效工具调用。
 - `message` 字段按需合并（96-100）：`content`（空则 `null`）、`tool_calls`（存在才加）、`reasoning_content`（非空才加）。
 - usage 输出口径：`prompt_tokens` / `completion_tokens` / `total_tokens` + `prompt_tokens_details.cached_tokens`，均取自 `rawUsageFromCcUsage`（103-108）。
 - `onEventError` 仅供日志，不影响返回状态码分支。

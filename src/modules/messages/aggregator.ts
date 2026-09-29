@@ -1,7 +1,7 @@
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
 import { isTruncatedStream, mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage, truncatedStreamError } from '../../shared/errors'
-import { createToolCallIdGuard } from '../../shared/cc-types'
+import { ccToolCallId, ccToolName, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { uuid } from '../../shared/util'
 import { EMPTY_THINKING_SIGNATURE } from './translator'
@@ -146,7 +146,8 @@ export function createMessagesAggregator(opts?: { onEventError?: (event: any, ma
     toolCalls.push({
       id: id || ('call_' + uuid().slice(0, 8)),
       type: 'function',
-      function: { name: name || '', arguments: argsStr },
+      // name 非空是下游契约（见 cc-types.UNKNOWN_TOOL_NAME）。
+      function: { name: name || UNKNOWN_TOOL_NAME, arguments: argsStr },
     })
   }
 
@@ -163,16 +164,16 @@ export function createMessagesAggregator(opts?: { onEventError?: (event: any, ma
     'reasoning-delta': (event: any) => { thinkingText += textOrDelta(event) },
     'tool-call': (event: any) => {
       pushToolCall(
-        event.toolCallId || pendingToolInput?.id || '',
-        event.toolName || pendingToolInput?.name || '',
+        ccToolCallId(event) || pendingToolInput?.id || '',
+        ccToolName(event) || pendingToolInput?.name || '',
         toolArgsToString(event.input),
       )
       pendingToolInput = null
     },
     'tool-input-start': (event: any) => {
       pendingToolInput = {
-        id: event.toolCallId || event.id || event.toolUseId || pendingToolInput?.id || '',
-        name: event.toolName || event.name || pendingToolInput?.name || '',
+        id: ccToolCallId(event) || pendingToolInput?.id || '',
+        name: ccToolName(event) || pendingToolInput?.name || '',
         json: '',
       }
     },
@@ -180,15 +181,13 @@ export function createMessagesAggregator(opts?: { onEventError?: (event: any, ma
       const d = event.delta ?? event.text ?? event.partial_json ?? event.partialJson
         ?? event.data ?? event.json ?? event.value ?? event.input ?? ''
       const s = typeof d === 'string' ? d : JSON.stringify(d)
+      const id = ccToolCallId(event)
+      const name = ccToolName(event)
       if (!pendingToolInput) {
-        pendingToolInput = {
-          id: event.toolCallId || event.id || '',
-          name: event.toolName || event.name || '',
-          json: '',
-        }
+        pendingToolInput = { id, name, json: '' }
       } else {
-        if (event.toolCallId || event.id) pendingToolInput.id = event.toolCallId || event.id
-        if (event.toolName || event.name) pendingToolInput.name = event.toolName || event.name
+        if (id) pendingToolInput.id = id
+        if (name) pendingToolInput.name = name
       }
       if (s) pendingToolInput.json += s
     },
@@ -197,8 +196,8 @@ export function createMessagesAggregator(opts?: { onEventError?: (event: any, ma
       // End carries the complete input when present; otherwise emit the
       // buffered incremental payload. Either way pending is cleared so a
       // later result() flush cannot double-emit.
-      const id = event.toolCallId || event.id || pendingToolInput?.id || ''
-      const name = event.toolName || event.name || pendingToolInput?.name || ''
+      const id = ccToolCallId(event) || pendingToolInput?.id || ''
+      const name = ccToolName(event) || pendingToolInput?.name || ''
       const argsStr = fullInput != null ? toolArgsToString(fullInput) : (pendingToolInput?.json || '')
       if (argsStr || id || name) pushToolCall(id, name, argsStr)
       pendingToolInput = null

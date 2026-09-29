@@ -142,6 +142,26 @@ Bun.serve({
             { type: 'tool-input-end', toolCallId: 'call_dup_1', input: { city: 'SF' } },
             { type: 'finish', finishReason: 'tool-calls', totalUsage: { inputTokens: 5, outputTokens: 3, cachedInputTokens: 0 } },
           ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        case 'mock/tool-noname':
+          // 生产实证：tool-input-start 给了名字，但最终 tool-call 只带 input。
+          // 流式翻译必须先取回缓存里的 name，否则下发 function.name=""，
+          // opencode 的 ToolStream.appendOrStart 直接抛
+          // "OpenAI Chat tool call delta is missing id or name"。
+          return new Response(ndjson([
+            { type: 'start' },
+            { type: 'tool-input-start', toolCallId: 'call_nn_1', toolName: 'get_weather' },
+            { type: 'tool-input-delta', toolCallId: 'call_nn_1', delta: '{"city":"SF"}' },
+            { type: 'tool-call', input: { city: 'SF' } },
+            { type: 'finish', finishReason: 'tool-calls', totalUsage: { inputTokens: 5, outputTokens: 3, cachedInputTokens: 0 } },
+          ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        case 'mock/tool-fully-noname':
+          // 上游全程不给工具名（真实日志里 web_search 之类被 dropped 的形态）：
+          // 发射端必须兜底 unknown_tool，绝不发空 name。
+          return new Response(ndjson([
+            { type: 'start' },
+            { type: 'tool-call', toolCallId: 'call_un_1', input: { q: 'x' } },
+            { type: 'finish', finishReason: 'tool-calls', totalUsage: { inputTokens: 5, outputTokens: 3, cachedInputTokens: 0 } },
+          ]), { headers: { 'content-type': 'application/x-ndjson' } })
         case 'mock/gateway-retry':
           // 输出前网关故障：第一次整轮流里只有一个 error 事件（官方 CLI 会重试），
           // 第二次成功。验证 pre-output 重试。
@@ -1019,6 +1039,83 @@ console.log('--- responses stream ---')
   const completed = events.at(-1)
   check('responses stream completed usage', completed?.data?.response?.status === 'completed' && completed?.data?.response?.usage?.input_tokens === 100 && completed?.data?.response?.usage?.output_tokens === 20, completed?.data?.response?.usage)
   check('responses stream sequence numbers', events.every((e, i) => e.data?.sequence_number === i), events.map((e) => e.data?.sequence_number))
+}
+
+console.log('--- tool-call identity fallback (empty name must never reach client) ---')
+{
+  // 生产 bug：tool-input-start 给了名字，最终 tool-call 只带 input → 翻译层若
+  // 先清空缓存再读 name，就会下发 function.name=""，opencode 直接抛
+  // "OpenAI Chat tool call delta is missing id or name"。
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/tool-noname', stream: true, messages: [{ role: 'user', content: 'go' }] }),
+  })
+  const text = await r.text()
+  const deltas = text.split('\n').filter((l) => l.startsWith('data: ') && !l.includes('[DONE]'))
+    .map((l) => JSON.parse(l.slice(6)))
+  const tc = deltas.flatMap((c: any) => c.choices?.[0]?.delta?.tool_calls ?? [])[0]
+  check('chat stream recovers name from tool-input-start', tc?.function?.name === 'get_weather' && tc?.id === 'call_nn_1', tc)
+  check('chat stream recovers arguments', tc?.function?.arguments === '{"city":"SF"}', tc?.function?.arguments)
+}
+{
+  // 上游全程不给名字：必须兜底 unknown_tool，绝不发空 name。
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/tool-fully-noname', stream: true, messages: [{ role: 'user', content: 'go' }] }),
+  })
+  const text = await r.text()
+  const deltas = text.split('\n').filter((l) => l.startsWith('data: ') && !l.includes('[DONE]'))
+    .map((l) => JSON.parse(l.slice(6)))
+  const tc = deltas.flatMap((c: any) => c.choices?.[0]?.delta?.tool_calls ?? [])[0]
+  check('chat stream empty name → unknown_tool', tc?.function?.name === 'unknown_tool', tc)
+}
+{
+  // Anthropic 流：同样必须先取回缓存名，且非空。
+  const r = await fetch(BASE + '/v1/messages', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
+    body: JSON.stringify({ model: 'mock/tool-noname', max_tokens: 100, stream: true, messages: [{ role: 'user', content: 'go' }] }),
+  })
+  const text = await r.text()
+  const start = text.split('\n\n').filter(Boolean).map((block) => {
+    const lines = block.split('\n')
+    const dataLine = lines.find((l) => l.startsWith('data: '))?.slice(6)
+    return dataLine ? JSON.parse(dataLine) : null
+  }).find((d: any) => d?.content_block?.type === 'tool_use')
+  check('anthropic stream recovers tool_use name', start?.content_block?.name === 'get_weather' && start?.content_block?.id === 'call_nn_1', start)
+}
+{
+  // Responses 流：name 与 call_id 都必须非空（且 name 从缓存恢复）。
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/tool-noname', stream: true, input: 'go' }),
+  })
+  const text = await r.text()
+  const added = text.split('\n\n').filter(Boolean).map((block) => {
+    const lines = block.split('\n')
+    const eventName = lines.find((l) => l.startsWith('event: '))?.slice(7)
+    const dataLine = lines.find((l) => l.startsWith('data: '))?.slice(6)
+    return { eventName, data: dataLine ? JSON.parse(dataLine) : null }
+  }).find((e) => e.eventName === 'response.output_item.added' && e.data?.item?.type === 'function_call')
+  check('responses stream recovers function name + call_id', added?.data?.item?.name === 'get_weather' && added?.data?.item?.call_id === 'call_nn_1', added?.data?.item)
+}
+{
+  // Responses 非流式：空名同样不得下发。
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/tool-fully-noname', input: 'go' }),
+  })
+  const body = await r.json()
+  const fc = body.output?.find((o: any) => o.type === 'function_call')
+  check('responses non-stream empty name → unknown_tool, call_id non-empty', fc?.name === 'unknown_tool' && typeof fc?.call_id === 'string' && fc.call_id.length > 0, fc)
+}
+{
+  // chat 非流式：空名兜底同样生效。
+  const r = await fetch(BASE + '/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ model: 'mock/tool-fully-noname', messages: [{ role: 'user', content: 'go' }] }),
+  })
+  const body = await r.json()
+  check('chat non-stream empty name → unknown_tool', body.choices?.[0]?.message?.tool_calls?.[0]?.function?.name === 'unknown_tool', body.choices?.[0]?.message?.tool_calls)
 }
 
 console.log('--- responses zero output / upstream errors ---')

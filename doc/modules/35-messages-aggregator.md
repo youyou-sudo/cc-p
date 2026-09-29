@@ -45,5 +45,6 @@
 - `buildAnthropicResponse` 的 content 顺序（22-30）与流式 translation 一致：thinking → text → tool_use；thinking 块复用 `fakeThinkingSignature`（translator.ts:7）保证签名格式合法。
 - usage IIFE（39-48）会就地 `normalizeUsage`（outputTokens 缺失/0 时把 input/cached 归零），因此 45-46 的 cache 字段可能在零输出时被清零。
 - `createMessagesAggregator` 的 `error` 钩子（93-97）只记录 `upstreamError`，**不**中断后续解析；handler 在 `aggregator.result()` 后据此优先返回上游错误。
+- **空名红线**：`tool-call` / `tool-input-*` 钩子统一用 `ccToolCallId`/`ccToolName`，`pushToolCall` 内空名兜底 `UNKNOWN_TOOL_NAME`，避免下游 `tool_use.name` 为空。
 - `push`/`flush`（105-111）丢弃 `parser` 返回值，因为非流式只需状态聚合，无需逐帧输出。
 - `lastCcEvent`（101-103）供 handler 的空闲超时判定与日志诊断使用。

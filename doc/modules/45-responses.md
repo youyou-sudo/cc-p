@@ -63,6 +63,11 @@
   **不发 `[DONE]`**（Responses SDK 以 `response.completed` 终止）。
 - `error` 事件帧为 `{type:'error',code,message,param,sequence_number}`；所有事件带连续
   `sequence_number`（0 起递增）。
+- **工具身份非空**：`function_call` / `response.output_item.added(item.type==='function_call')`
+  的 `name` 与 `call_id` 必非空（流式 `emitFunctionCall` 与非流 `buildResponsesObject` 均兜底
+  `unknown_tool` / `call_<uuid>`）。上游 `tool-call` 可能只带 `input`（名字在更早的
+  `tool-input-start`），钩子须先取回 `pendingToolInput` 再清空；空名会让客户端 ToolStream 抛错
+  （opencode "missing id or name"）。
 
 ## 红线不变量
 

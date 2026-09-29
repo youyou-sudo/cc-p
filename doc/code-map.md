@@ -236,9 +236,9 @@ API Key 提取与鉴权错误文案，格式校验为 `user_` 前缀 + base64url
 
 ---
 
-## src/shared/cc-types.ts（39 行 · 基础设施层 · 纯类型）
+## src/shared/cc-types.ts（纯类型 + 线协议纯函数 · 基础设施层）
 
-Command Code 上游 NDJSON 线协议类型定义，无运行时代码。
+Command Code 上游 NDJSON 线协议类型定义，并附少量无依赖纯函数（usage 归一 / tool-call 身份提取）。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
@@ -262,6 +262,10 @@ Command Code 上游 NDJSON 线协议类型定义，无运行时代码。
 | 30 | `CcErrorEvent` | interface | E | `{type:'error'; error?{message,type}/message?/retry_after?}` |
 | 32-37 | `CcStreamEvent` | type（联合） | E | 全部 17 个事件的判别联合 |
 | 39 | `CcEventType` | type | E | `CcStreamEvent['type']` 事件名字面量联合 |
+| 54-70 | `createToolCallIdGuard` | 函数 | E | tool-call id 去重（空 id 放行），防重复 id 回传上游 400 |
+| 72-81 | `ccToolName` | 函数 | E | 统一取工具名 `toolName ?? name ?? tool.name`（trim） |
+| 83-87 | `ccToolCallId` | 函数 | E | 统一取调用 id `toolCallId ?? id ?? toolUseId`（trim） |
+| 89-91 | `UNKNOWN_TOOL_NAME` | 常量 | E | `'unknown_tool'` 非空占位名 |
 
 依赖：无
 

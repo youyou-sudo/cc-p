@@ -13,7 +13,7 @@ import { classifyUpstreamLimit, limitMeta } from '../src/shared/limit'
 import { parseRetryAfter, backoffDelay } from '../src/shared/retry'
 import { ConcurrencyGate, ConcurrencyAborted, ConcurrencyRoomFull, ConcurrencyTimeout } from '../src/shared/concurrency'
 import { mapCcError, mapCcEventError, toRetryAfterSeconds } from '../src/shared/errors'
-import { normalizeCcUsage, createToolCallIdGuard } from '../src/shared/cc-types'
+import { normalizeCcUsage, ccToolName, ccToolCallId, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../src/shared/cc-types'
 import { generateSessionId, uuidFromSeed } from '../src/shared/util'
 
 let passed = 0
@@ -101,6 +101,19 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('tool-call guard: repeat id suppressed', guard('call_a') === true)
   check('tool-call guard: other id passes', guard('call_b') === false)
   check('tool-call guard: empty id always passes', guard('') === false && guard('') === false)
+
+  // 工具身份提取：六个钩子统一读法，覆盖上游各字段拼写。
+  check('ccToolName reads toolName', ccToolName({ toolName: 'bash' }) === 'bash')
+  check('ccToolName reads name', ccToolName({ name: 'bash' }) === 'bash')
+  check('ccToolName reads nested tool.name', ccToolName({ tool: { name: 'bash' } }) === 'bash')
+  check('ccToolName prefers toolName', ccToolName({ toolName: 'a', name: 'b' }) === 'a')
+  check('ccToolName trims / empty-safe', ccToolName({ toolName: '  ' }) === '' && ccToolName(null) === '')
+  check('ccToolCallId reads toolCallId', ccToolCallId({ toolCallId: 'call_1' }) === 'call_1')
+  check('ccToolCallId reads id', ccToolCallId({ id: 'call_1' }) === 'call_1')
+  check('ccToolCallId reads toolUseId', ccToolCallId({ toolUseId: 'call_1' }) === 'call_1')
+  check('ccToolCallId prefers toolCallId', ccToolCallId({ toolCallId: 'a', id: 'b' }) === 'a')
+  check('ccToolCallId empty-safe', ccToolCallId({ id: '' }) === '' && ccToolCallId(undefined) === '')
+  check('UNKNOWN_TOOL_NAME non-empty', UNKNOWN_TOOL_NAME === 'unknown_tool')
 }
 
 // inline data-URL redaction (the screenshot-causes-compaction fix)

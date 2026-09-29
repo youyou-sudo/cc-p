@@ -47,7 +47,7 @@
 | 223-277 | └ `hooks` | 逻辑 | P | 按 CC 事件产 Anthropic SSE 帧 |
 | 224-230 |   └ reasoning-delta | 逻辑 | P | 开 thinking 块、累 `currentThinkingText`、产 `thinking_delta` |
 | 232-237 |   └ text-delta | 逻辑 | P | 开 text 块、`outputTokens += 1`、产 `text_delta` |
-| 239-254 |   └ tool-call | 逻辑 | P | 关当前块；一次性产 tool_use 的 start/input_json_delta/stop；`outputTokens += 20` |
+| 239-254 |   └ tool-call | 逻辑 | P | 关当前块；**先取回 `pendingToolInput` 的 id/name 再清空**（`ccToolCallId`/`ccToolName`），一次性产 tool_use 的 start/input_json_delta/stop；`outputTokens += 20` |
 | 256-257 |   └ finish-step/finish | 逻辑 | P | 均指向 `handleFinishStep` |
 | 259-276 |   └ error | 逻辑 | P | `hasError=true`；`ctx.upstreamError = mapCcEventError`；log warn；产 `event: error` 帧（带 retry_after） |
 | 279-293 | `handleFinishStep` | 函数 | P | 映射 stopReason；取 `totalUsage||usage` normalizeUsage 后记 tokens 四元组并回写 ctx |
@@ -65,6 +65,7 @@
 - thinking 映射（131-142）只产出 `reasoning_effort`，不产出 Anthropic 侧字段；`disabled`/`none` 显式忽略。
 - 块生命周期（174-199）：`startBlock` 在类型切换或未开块时先关旧块；thinking 块关闭必须补 `signature_delta`（180-181），否则客户端会拒收。
 - `tool-call`（239-254）不受 `blockStarted` 复用逻辑约束：它关当前块后自增一个独立索引，三帧一次成块，且 `outputTokens += 20` 为估算值。
+- **空名红线**：`tool-call` 在清空 `pendingToolInput` 之前先用 `ccToolCallId`/`ccToolName` 取回 id/name，`emitToolUseBlock` 对空名兜底 `UNKNOWN_TOOL_NAME` 并 log warn。Anthropic 契约要求 `tool_use.name` 非空；上游只在 `tool-input-start` 给名、`tool-call` 只带 `input` 时漏读会破坏客户端工具路由。
 - `finishEvents`（313-331）：`hasError` 时不补 message_delta/message_stop（错误帧已由 hooks.error 发出）；零输出单独产 error 帧而非正常收尾，交由 handler 决定走 terminal JSON 429。
 - `finishEvents` 的 usage 四元组（322-326）：`output_tokens`/`cache_read_input_tokens`/`cache_creation_input_tokens`/`input_tokens`，其中 cacheWrite 缺省补 0。
 - 注意：本文件的 `createAnthropicSseTranslator` 是返回 `{startEvents,parseChunk,flush,finishEvents}` 的工厂函数，**不是** `AsyncGenerator`；旧文档 15-anthropic.md 的 AsyncGenerator 描述已过时。
