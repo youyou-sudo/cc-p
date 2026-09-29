@@ -1,7 +1,7 @@
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
 import { isTruncatedStream, mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage, TRUNCATED_STREAM_MESSAGE } from '../../shared/errors'
-import { createToolCallIdGuard } from '../../shared/cc-types'
+import { ccToolCallId, ccToolName, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { shortUrl, redactLargeDataUrls, uuid } from '../../shared/util'
 
@@ -389,8 +389,12 @@ export function createAnthropicSseTranslator(
     const close = closeBlock()
     if (close) out.push(close)
     const finalId = id || `toolu_${uuid().slice(0, 12)}`
+    // Anthropic 契约要求 tool_use.name 非空；空名会被 SDK/客户端判为无效工具调用。
+    if (!name) {
+      log('warn', 'cc tool-call empty name fallback', { path: '/v1/messages', toolCallId: finalId })
+    }
     const tcIndex = nextBlockIndex++
-    out.push(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: tcIndex, content_block: { type: 'tool_use', id: finalId, name: name || '', input: {} } })}\n\n`)
+    out.push(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: tcIndex, content_block: { type: 'tool_use', id: finalId, name: name || UNKNOWN_TOOL_NAME, input: {} } })}\n\n`)
     out.push(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: tcIndex, delta: { type: 'input_json_delta', partial_json: inputJson } })}\n\n`)
     out.push(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: tcIndex })}\n\n`)
     hasToolCall = true
@@ -451,16 +455,19 @@ export function createAnthropicSseTranslator(
     'tool-call': (event: any) => {
       if (hasError) return
       const input = typeof event.input === 'string' ? event.input : JSON.stringify(event.input ?? {})
-      // A final tool-call supersedes any pending incremental buffer.
+      // 最终 tool-call 可能只带 input：先取回 tool-input-* 缓存里的 id/name 再清空，
+      // 否则会丢掉上游早先给出的工具名，发出空 name 的 tool_use 块。
+      const id = ccToolCallId(event) || pendingToolInput?.id || ''
+      const name = ccToolName(event) || pendingToolInput?.name || ''
       pendingToolInput = null
-      return emitToolUseBlock(event.toolCallId || '', event.toolName || '', input)
+      return emitToolUseBlock(id, name, input)
     },
 
     'tool-input-start': (event: any) => {
       if (hasError) return
       pendingToolInput = {
-        id: event.toolCallId || event.id || event.toolUseId || pendingToolInput?.id || '',
-        name: event.toolName || event.name || pendingToolInput?.name || '',
+        id: ccToolCallId(event) || pendingToolInput?.id || '',
+        name: ccToolName(event) || pendingToolInput?.name || '',
         json: '',
       }
     },
@@ -470,15 +477,13 @@ export function createAnthropicSseTranslator(
       const d = event.delta ?? event.text ?? event.partial_json ?? event.partialJson
         ?? event.data ?? event.json ?? event.value ?? event.input ?? ''
       const s = typeof d === 'string' ? d : JSON.stringify(d)
+      const id = ccToolCallId(event)
+      const name = ccToolName(event)
       if (!pendingToolInput) {
-        pendingToolInput = {
-          id: event.toolCallId || event.id || '',
-          name: event.toolName || event.name || '',
-          json: '',
-        }
+        pendingToolInput = { id, name, json: '' }
       } else {
-        if (event.toolCallId || event.id) pendingToolInput.id = event.toolCallId || event.id
-        if (event.toolName || event.name) pendingToolInput.name = event.toolName || event.name
+        if (id) pendingToolInput.id = id
+        if (name) pendingToolInput.name = name
       }
       if (s) {
         pendingToolInput.json += s
@@ -495,8 +500,8 @@ export function createAnthropicSseTranslator(
       // End carries the complete input when present; otherwise emit the
       // buffered incremental payload. Either way pending is cleared so a
       // later flush/finishEvents cannot double-emit the same block.
-      const id = event.toolCallId || event.id || pendingToolInput?.id || ''
-      const name = event.toolName || event.name || pendingToolInput?.name || ''
+      const id = ccToolCallId(event) || pendingToolInput?.id || ''
+      const name = ccToolName(event) || pendingToolInput?.name || ''
       const argsStr = fullInput != null
         ? (typeof fullInput === 'string' ? fullInput : JSON.stringify(fullInput ?? {}))
         : (pendingToolInput?.json || '')

@@ -13,6 +13,7 @@ Stack: **Bun + Elysia + TypeScript**. Single-file binary via `bun build --compil
 - **Triple protocol**: `POST /v1/chat/completions` (OpenAI) + `POST /v1/responses` (OpenAI Responses) + `POST /v1/messages` (Anthropic)
 - **Streaming & non-streaming**, tool calling, multimodal images, `reasoning_effort` / `thinking`
 - **Dynamic models**: `GET /v1/models` from Provider API (5 min cache) with builtin fallback
+- **Account balance**: `GET /v1/dashboard/billing/credit_grants` returns the monthly allowance as OpenAI `credit_summary`
 - **CLI emulation**: per-key device fingerprint (8h + 2h jitter, official `thumbmark` formula), lifecycle events (`cli_installed` / `cli_session_exists` / `cli_first_message`), per-key session `sess_<16hex>` (12h + 1h jitter) with derived `threadId`, `User-Agent: cli`, `x-command-code-version` from npm (24h refresh), `traceparent`, `x-project-slug`
 - **Resilience**: zero-output → `429` retryable, idle timeout (30s stream / 90s non-stream, overridable via `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS`, defaults unchanged; thinking phase `start`/`start-step`/`reasoning-start`/`reasoning-delta` gets a 120s window via `CC_THINKING_IDLE_MS`) → `429`, disconnect aborts upstream
 - **Auth flexibility**: per-request `Bearer user_*` / `x-api-key`, optional `CC_API_KEY` fallback for self-host
@@ -146,6 +147,10 @@ Streaming emits `response.created / response.in_progress / response.output_item.
 ### `GET /v1/models`
 
 Tries `GET {CC_API_BASE}/provider/v1/models` with your key (10s timeout); caches for `CC_MODEL_REFRESH_INTERVAL_MS`. Falls back to the builtin list in `src/modules/models/catalog.ts` on any failure. Set `CC_USE_PROVIDER_MODELS=false` to always use the builtin list.
+
+### `GET /v1/dashboard/billing/credit_grants`
+
+Tries `GET {CC_API_BASE}/alpha/billing/credits` with your key (10s timeout) and maps the CC monthly allowance to OpenAI `credit_summary`: `total_granted` (monthly granted), `total_used`, `total_available` (remaining plus purchased credits), with a single `grants.data[]` entry. No key → OpenAI-shaped `401`; upstream failure → `502 api_error` (never fabricates a balance).
 
 ## Configuration
 

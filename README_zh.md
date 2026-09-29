@@ -13,6 +13,7 @@
 - **三协议**：`POST /v1/chat/completions`（OpenAI）+ `POST /v1/responses`（OpenAI Responses）+ `POST /v1/messages`（Anthropic）
 - **流式 / 非流式**、工具调用、多模态图片、`reasoning_effort` / `thinking`
 - **动态模型**：`GET /v1/models` 从 Provider API 获取（5 分钟缓存），失败回退内置列表
+- **账户余额**：`GET /v1/dashboard/billing/credit_grants` 返回 OpenAI `credit_summary` 格式的月度额度
 - **CLI 仿真**：按 Key 的设备指纹（8h + 2h 抖动，官方 `thumbmark` 公式）、生命周期事件（`cli_installed` / `cli_session_exists` / `cli_first_message`）、按 Key 会话 `sess_<16hex>`（12h + 1h 抖动）及派生的 `threadId`、`User-Agent: cli`、`x-command-code-version` 取自 npm（每天刷新）、`traceparent`、`x-project-slug`
 - **容错**：零输出 → 可重试 `429`，空闲超时（流式 30s / 非流式 90s，可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变；思考期 `start`/`start-step`/`reasoning-start`/`reasoning-delta` 走 120s 宽限 `CC_THINKING_IDLE_MS`）→ `429`，断连立刻中止上游
 - **认证灵活**：按请求的 `Bearer user_*` / `x-api-key`，自托管可选 `CC_API_KEY` 兜底
@@ -98,6 +99,7 @@ resp = client.responses.create(
 | `GET` | `/` | `OK`（纯文本） |
 | `GET` | `/health` | `{"ok":true}` |
 | `GET` | `/v1/models` | OpenAI 风格模型列表 |
+| `GET` | `/v1/dashboard/billing/credit_grants` | 账户余额（OpenAI `credit_summary`） |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
 | `POST` | `/v1/responses` | OpenAI Responses |
 | `POST` | `/v1/messages` | Anthropic Messages |
@@ -155,6 +157,13 @@ response.output_text.delta / response.function_call_arguments.delta / … / resp
 用你的 Key 请求 `GET {CC_API_BASE}/provider/v1/models`（10s 超时），按
 `CC_MODEL_REFRESH_INTERVAL_MS` 缓存。任何失败都回退到 `src/modules/models/catalog.ts` 内置列表。
 `CC_USE_PROVIDER_MODELS=false` 则始终用内置列表。
+
+### `GET /v1/dashboard/billing/credit_grants`
+
+用你的 Key 请求 `GET {CC_API_BASE}/alpha/billing/credits`（10s 超时），把 CC 的月度额度
+映射成 OpenAI `credit_summary`：`total_granted` = 本月授予总额，`total_used` = 已用，
+`total_available` = 剩余 + 另购额度（`purchasedCredits`），并附单条 `grants.data[]`。
+无 Key → OpenAI 形 `401`；上游失败 → `502 api_error`（绝不伪造余额）。
 
 ## 配置
 

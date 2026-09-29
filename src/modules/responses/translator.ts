@@ -15,7 +15,7 @@
 // 429 JSON（与 messages 侧 message_start 缓冲语义一致）。
 
 import { isTruncatedStream, mapCcEventError, mapFinishReason, normalizeUsage, TRUNCATED_STREAM_MESSAGE } from '../../shared/errors'
-import { createToolCallIdGuard } from '../../shared/cc-types'
+import { ccToolCallId, ccToolName, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
@@ -613,6 +613,19 @@ export function createResponsesSseTranslator(
     // `<ns>.` 前缀并还原 namespace 字段（codex-rs 按 (namespace, name) 路由）。
     const name = normalizeNamespacedName(rawName || '', toolNamespaces)
     const namespace = toolNamespaces[name] || ''
+    // Responses SDK / codex 契约要求 function_call 的 name 与 call_id 非空；空 name
+    // 会让客户端 ToolStream 抛错（见 cc-types.ccToolName 注释），空 call_id 则无法
+    // 配对回放。上游确实缺失时统一兜底。
+    const finalCallId = callId || `call_${uuid().slice(0, 12)}`
+    const finalName = name || UNKNOWN_TOOL_NAME
+    if (!name || !callId) {
+      log('warn', 'cc tool-call identity fallback', {
+        path: '/v1/responses',
+        missingName: !name,
+        missingCallId: !callId,
+        callId: finalCallId,
+      })
+    }
     const out: string[] = []
     if (current) out.push(...closeCurrent())
     const item: OpenItem = {
@@ -621,12 +634,12 @@ export function createResponsesSseTranslator(
       outputIndex: outputIndex++,
       text: '',
       args,
-      name,
-      callId,
+      name: finalName,
+      callId: finalCallId,
       namespace,
     }
     current = item
-    const addedItem: any = { id: item.id, type: 'function_call', status: 'in_progress', call_id: callId, name, arguments: '' }
+    const addedItem: any = { id: item.id, type: 'function_call', status: 'in_progress', call_id: finalCallId, name: finalName, arguments: '' }
     if (namespace) addedItem.namespace = namespace
     out.push(event('response.output_item.added', {
       output_index: item.outputIndex,
@@ -681,17 +694,21 @@ export function createResponsesSseTranslator(
     },
     'tool-call': (e: any) => {
       if (hasError) return
+      // 最终 tool-call 可能只带 input：先取回 tool-input-* 缓存里的 id/name 再清空，
+      // 否则会丢掉上游早先给出的工具名、发出空 name（见 emitFunctionCall 兜底）。
+      const id = ccToolCallId(e) || pendingToolInput?.id || ''
+      const name = ccToolName(e) || pendingToolInput?.name || ''
       pendingToolInput = null
       const args = toolArgsToString(e.input)
       sawToolCall = true
       toolChars += args.length
-      return emitFunctionCall(e.toolCallId || '', e.toolName || '', args)
+      return emitFunctionCall(id, name, args)
     },
     'tool-input-start': (e: any) => {
       if (hasError) return
       pendingToolInput = {
-        id: e.toolCallId || e.id || e.toolUseId || '',
-        name: e.toolName || e.name || '',
+        id: ccToolCallId(e) || pendingToolInput?.id || '',
+        name: ccToolName(e) || pendingToolInput?.name || '',
         json: '',
       }
     },
@@ -700,19 +717,21 @@ export function createResponsesSseTranslator(
       const d = e.delta ?? e.text ?? e.partial_json ?? e.partialJson
         ?? e.data ?? e.json ?? e.value ?? e.input ?? ''
       const s = typeof d === 'string' ? d : JSON.stringify(d)
+      const id = ccToolCallId(e)
+      const name = ccToolName(e)
       if (!pendingToolInput) {
-        pendingToolInput = { id: e.toolCallId || e.id || '', name: e.toolName || e.name || '', json: '' }
+        pendingToolInput = { id, name, json: '' }
       } else {
-        if (e.toolCallId || e.id) pendingToolInput.id = e.toolCallId || e.id
-        if (e.toolName || e.name) pendingToolInput.name = e.toolName || e.name
+        if (id) pendingToolInput.id = id
+        if (name) pendingToolInput.name = name
       }
       if (s) pendingToolInput.json += s
     },
     'tool-input-end': (e: any) => {
       if (hasError) return
       const fullInput = e.input ?? e.json ?? null
-      const id = e.toolCallId || e.id || pendingToolInput?.id || ''
-      const name = e.toolName || e.name || pendingToolInput?.name || ''
+      const id = ccToolCallId(e) || pendingToolInput?.id || ''
+      const name = ccToolName(e) || pendingToolInput?.name || ''
       const args = fullInput != null ? toolArgsToString(fullInput) : (pendingToolInput?.json || '')
       pendingToolInput = null
       if (args || id || name) {

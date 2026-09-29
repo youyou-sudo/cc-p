@@ -17,6 +17,7 @@
 | GET | `/` | `healthController` | 健康探针（文本 `OK`） | `src/modules/health/index.ts` |
 | GET | `/health` | `healthController` | 健康探针（JSON `{ok:true}`） | `src/modules/health/index.ts` |
 | GET | `/v1/models` | `modelsController` → `ModelsService.list` | OpenAI Models API | `src/modules/models/catalog.ts`（`handleModels`） |
+| GET | `/v1/dashboard/billing/credit_grants` | `billingController` → `BillingService.creditSummary` | OpenAI Billing（`credit_summary`） | `src/modules/billing/service.ts`（`buildCreditSummary`） |
 | POST | `/v1/chat/completions` | `chatController` → `ChatService.handleBody` | OpenAI Chat Completions（SSE / JSON） | `src/modules/chat/handler.ts`（`handleChatCompletionsBody`） |
 | POST | `/v1/responses` | `responsesController` → `ResponsesService.handleBody` | OpenAI Responses（SSE / JSON） | `src/modules/responses/handler.ts`（`handleResponsesBody`） |
 | POST | `/v1/messages` | `messagesController` → `MessagesService.handleBody` | Anthropic Messages（SSE / JSON） | `src/modules/messages/handler.ts`（`handleMessagesBody`） |
@@ -30,7 +31,7 @@
 ┌──────────────────────────────────────────────────────────────────────┐
 │  入口层      src/index.ts        启动 + healthcheck CLI + unhandledRejection │
 │             src/app.ts          Elysia 组装：use cors/errors/body/auth 插件    │
-│                                 + 5 个 controller                          │
+│                                 + 6 个 controller                          │
 ├──────────────────────────────────────────────────────────────────────┤
 │  插件层      src/plugins/cors.ts     onRequest 打 CORS 头 / OPTIONS 204     │
 │             src/plugins/errors.ts   onError：404/413/PARSE/VALIDATION→双协议 │
