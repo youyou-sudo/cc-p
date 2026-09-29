@@ -15,7 +15,7 @@ Stack: **Bun + Elysia + TypeScript**. Single-file binary via `bun build --compil
 - **Dynamic models**: `GET /v1/models` from Provider API (5 min cache) with builtin fallback
 - **Account balance**: `GET /v1/dashboard/billing/credit_grants` returns the monthly allowance as OpenAI `credit_summary`
 - **CLI emulation**: per-key device fingerprint (8h + 2h jitter, official `thumbmark` formula), lifecycle events (`cli_installed` / `cli_session_exists` / `cli_first_message`), per-key session `sess_<16hex>` (12h + 1h jitter) with derived `threadId`, `User-Agent: cli`, `x-command-code-version` from npm (24h refresh), `traceparent`, `x-project-slug`
-- **Resilience**: zero-output → `429` retryable, idle timeout (30s stream / 90s non-stream, overridable via `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS`, defaults unchanged; thinking phase `start`/`start-step`/`reasoning-start`/`reasoning-delta` gets a 120s window via `CC_THINKING_IDLE_MS`) → `429`, disconnect aborts upstream
+- **Resilience**: zero-output → `429` retryable, idle timeout (30s stream / 90s non-stream, overridable via `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS`, defaults unchanged; thinking phase `start`/`start-step`/`reasoning-start`/`reasoning-delta` gets a 120s window via `CC_THINKING_IDLE_MS`) → `429`, disconnect aborts upstream. The Bun transport-layer idle cap is disabled (`idleTimeout: 0`, overriding Elysia's hardcoded 30s) so these budgets are the sole authority.
 - **Auth flexibility**: per-request `Bearer user_*` / `x-api-key`, optional `CC_API_KEY` fallback for self-host
 - **Ops ready**: `GET /health`, `server healthcheck` CLI, Docker HEALTHCHECK, privacy-aware logs (no keys, bodies, or stacks)
 
@@ -401,6 +401,7 @@ Mock upstream — no real API calls:
 ```bash
 bun run test            # e2e suite (protocol, streaming, errors)
 bun run test:timeouts   # idle timeout + client disconnect
+bun run test:idle-transport  # transport idle cap regression (~33s)
 bunx tsc --noEmit       # typecheck (also runs in CI)
 ```
 

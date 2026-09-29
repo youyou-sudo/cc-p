@@ -11,7 +11,8 @@
     "test": "bun run test/e2e.ts",
     "test:unit": "bun run test/unit.ts",
     "test:timeouts": "bun run test/timeouts.ts",
-    "test:heartbeat": "bun run test/heartbeat.ts"
+    "test:heartbeat": "bun run test/heartbeat.ts",
+    "test:idle-transport": "bun run test/idle-transport.ts"
   },
   "dependencies": {
     "elysia": "^1.4.30"

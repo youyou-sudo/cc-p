@@ -15,7 +15,7 @@
 - **动态模型**：`GET /v1/models` 从 Provider API 获取（5 分钟缓存），失败回退内置列表
 - **账户余额**：`GET /v1/dashboard/billing/credit_grants` 返回 OpenAI `credit_summary` 格式的月度额度
 - **CLI 仿真**：按 Key 的设备指纹（8h + 2h 抖动，官方 `thumbmark` 公式）、生命周期事件（`cli_installed` / `cli_session_exists` / `cli_first_message`）、按 Key 会话 `sess_<16hex>`（12h + 1h 抖动）及派生的 `threadId`、`User-Agent: cli`、`x-command-code-version` 取自 npm（每天刷新）、`traceparent`、`x-project-slug`
-- **容错**：零输出 → 可重试 `429`，空闲超时（流式 30s / 非流式 90s，可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变；思考期 `start`/`start-step`/`reasoning-start`/`reasoning-delta` 走 120s 宽限 `CC_THINKING_IDLE_MS`）→ `429`，断连立刻中止上游
+- **容错**：零输出 → 可重试 `429`，空闲超时（流式 30s / 非流式 90s，可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变；思考期 `start`/`start-step`/`reasoning-start`/`reasoning-delta` 走 120s 宽限 `CC_THINKING_IDLE_MS`）→ `429`，断连立刻中止上游。Bun 传输层空闲上限已关闭（`idleTimeout: 0`，覆盖 Elysia 写死的 30s），上述预算为唯一权威。
 - **认证灵活**：按请求的 `Bearer user_*` / `x-api-key`，自托管可选 `CC_API_KEY` 兜底
 - **开箱可运维**：`GET /health`、`server healthcheck` CLI、Docker HEALTHCHECK、隐私日志（不记 Key、包体与堆栈）
 
@@ -410,6 +410,7 @@ Mock 上游，无真实 API 调用：
 ```bash
 bun run test            # e2e（协议、流式、错误）
 bun run test:timeouts   # 空闲超时 + 客户端断连
+bun run test:idle-transport  # 传输层空闲上限回归（约 33s）
 bunx tsc --noEmit       # 类型检查（CI 同样会跑）
 ```
 

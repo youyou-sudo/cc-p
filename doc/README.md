@@ -1,6 +1,6 @@
 # Command Code Proxy 项目文档
 
-> 生成时间：2026-09-10 · 基于工作区全量扫描（`src/` 40 个源文件、`test/` 4 个测试，共约 4 518 行 TypeScript）
+> 生成时间：2026-09-10 · 基于工作区全量扫描（`src/` 40 个源文件、`test/` 5 个测试，共约 4 600 行 TypeScript）
 
 ## 1. 项目简介
 
@@ -163,6 +163,7 @@ createApp                     (src/app.ts)
 | 43 | [43-test-idle-timeout-env.md](modules/43-test-idle-timeout-env.md) | `test/idle-timeout-env.ts` | 111 | 测试 |
 | 44 | [44-test-timeouts.md](modules/44-test-timeouts.md) | `test/timeouts.ts` | 114 | 测试 |
 | 45 | [45-responses.md](modules/45-responses.md) | `src/modules/responses/`（11 文件） | 1725 | 协议层 |
+| 46 | [46-test-idle-transport.md](modules/46-test-idle-transport.md) | `test/idle-transport.ts` | 66 | 测试 |
 
 ### 总报告
 
@@ -190,6 +191,7 @@ createApp                     (src/app.ts)
 | 超限排水上限 `DRAIN_LIMIT` | 32 MB（防慢速攻击） | `src/shared/http.ts:58` |
 | SSE 心跳 interval | 5 s | `src/infra/sse.ts:8` |
 | SSE 心跳 idle | 15 s | `src/infra/sse.ts:9` |
+| 传输层空闲上限 | 0（关闭；覆盖 Elysia Bun adapter 写死的 30s，超时只归 runtime.ts） | `src/index.ts`（`LISTEN_OPTIONS`） |
 | 监听端口/地址 | 3050 / 0.0.0.0 | `src/shared/config.ts:89-90` |
 
 ## 7. 长会话 / 上下文管理（客户端止血习惯）
@@ -227,4 +229,5 @@ createApp                     (src/app.ts)
 | `bun run test` | e2e：`test/e2e.ts`，mock 上游(4100) + 被测服务(4200) |
 | `bun run test:timeouts` | 真实时间验证流式空闲超时 / 断连取消 / 服务存活（`test/timeouts.ts`） |
 | `bun run test:heartbeat` | SSE 心跳行为验证（`test/heartbeat.ts`） |
+| `bun run test:idle-transport` | 传输层空闲上限回归：慢 GET 越过旧 30s 上限（`test/idle-transport.ts`，约 33s） |
 | `bun run test/idle-timeout-env.ts` | 空闲超时环境变量验证（`package.json` 无该 script，直接运行） |

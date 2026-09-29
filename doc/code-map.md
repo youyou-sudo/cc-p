@@ -6,17 +6,18 @@
 
 ---
 
-## src/index.ts（79 行 · 入口层）
+## src/index.ts（134 行 · 入口层）
 
 服务启动入口：拉起后台任务、创建并监听 Elysia app、提供 `healthcheck` CLI 与 `unhandledRejection` 兜底。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
 | 1-6 | — | import | — | `./shared/config`(CFG) `./shared/logger`(log) `./modules/models/catalog`(MODELS) `./infra/session`(startSessionCleanup) `./shared/version`(startVersionRefresh) `./app`(createApp) |
-| 8-37 | `startServer` | 函数 | E | 启动 `startVersionRefresh`/`startSessionCleanup`，`createApp().listen()`，打印启动日志与无 Key 告警 |
-| 39-61 | `healthcheck` | 异步函数 | E | GET `127.0.0.1:{PORT\|CFG.port}/health`，5s 超时，要求 `body.ok===true`；成功 `exit(0)` 否则 `exit(1)` |
-| 63-72 | unhandledRejection 监听 | 逻辑 | P | `AbortError`/`ABORT_ERR` 记 info，其余记 error |
-| 74-79 | CLI 分派 | 逻辑 | P | `argv[2]==='healthcheck'` → `healthcheck()`，否则 `startServer()` |
+| 8-30 | `LISTEN_OPTIONS` | 常量 | E | `{ port, hostname, idleTimeout: 0 }`；覆盖 Elysia Bun adapter 写死的 idleTimeout:30，超时只归 runtime.ts；导出供 test/idle-transport.ts 复用 |
+| 32-59 | `startServer` | 函数 | E | 启动 `startVersionRefresh`/`startSessionCleanup`，`createApp().listen(LISTEN_OPTIONS)`，打印启动日志与无 Key 告警 |
+| 61-84 | `healthcheck` | 异步函数 | E | GET `127.0.0.1:{PORT\|CFG.port}/health`，5s 超时，要求 `body.ok===true`；成功 `exit(0)` 否则 `exit(1)` |
+| 86-95 | unhandledRejection 监听 | 逻辑 | P | `AbortError`/`ABORT_ERR` 记 info，其余记 error |
+| 97-134 | CLI 分派 | 逻辑 | P | `argv[2]==='healthcheck'` → `healthcheck()`，否则 `startServer()` |
 
 依赖：`./shared/config` `./shared/logger` `./modules/models/catalog` `./infra/session` `./shared/version` `./app`
 
@@ -966,6 +967,26 @@ SSE 心跳单元测试：验证 `startSseHeartbeat` 的四种状态闸门与两�
 | 112-114 | 退出 / 导出 | 输出 | fail>0 exit1、export {} |
 
 依赖：`../src/index.ts`（动态 import） `../src/shared/runtime.ts`（门控动态 import）
+
+---
+
+## test/idle-transport.ts（66 行 · 测试）
+
+传输层空闲上限回归（约 33s）：复用生产 `LISTEN_OPTIONS`，验证慢 GET 越过旧 30s 上限。
+
+| 行号 | 符号/段落 | 类别 | 说明 |
+|---|---|---|---|
+| 9-12 | env 注入 | env | `PORT=4231`/`HOST=127.0.0.1`/`CC_API_BASE=http://127.0.0.1:4130`/`CC_API_KEY=''` |
+| 14 | `elysia` import | import | `Elysia` |
+| 18-19 | 生产入口动态 import | 基建 | 启动真实服务器并取回 `LISTEN_OPTIONS`；sleep300 |
+| 21-22 | `PORT`/`SLOW_MS` | 状态 | 临时服务器 4230 / 慢 GET 32000ms |
+| 24-30 | 临时服务器 | 基建 | `new Elysia().get('/slow', …sleep32s…).listen({ ...LISTEN_OPTIONS, port: 4230 })` |
+| 32-36 | `check` | 断言 | PASS/FAIL 计数 |
+| 38 | 断言 `idleTimeout:0` | 断言 | 配置层守护 |
+| 40-56 | 慢 GET 存活用例 | 用例组 | 200 `ok` 且耗时 > 30000ms（行为层守护） |
+| 58-59 | 结果 / 退出 | 输出 | RESULT、`app.stop(true)`、fail>0 exit1 |
+
+依赖：`elysia` `../src/index.ts`（动态 import，取 `LISTEN_OPTIONS`）
 
 ---
 
