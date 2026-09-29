@@ -1,22 +1,31 @@
 # 完整代码段映射报告（Code Map）
 
-> 扫描范围：`src/` 40 个源文件（`shared/` 9、`infra/` 6、`modules/` 19、`plugins/` 4，外加 `app.ts` + `index.ts`）+ `test/` 4 个测试；共 44 个 TS 文件、约 4 518 行（源码约 3 718 + 测试约 800 行）。
+> 扫描范围：`src/` 47 个源文件（`shared/` 15、`infra/` 7、`modules/` 19、`plugins/` 4，外加 `app.ts` + `index.ts`）+ `test/` 5 个测试；共 52 个 TS 文件、约 4 569 行源码 + 950 行测试。
 > 行号基于当前工作区文件内容；「可见性」中 `E`=export、`P`=模块私有。
 > 分层：入口（index/app）→ 插件（plugins）→ 协议模块（modules）→ 共享管道/上游对接（infra）/ 基础设施（shared）。
+> ⚠ **未接线标注**：`infra/proxy-slot.ts`、`shared/context.ts`、`shared/model-windows.ts`
+> 三个文件无任何 import 方，不在运行时路径上；连带 `shared/api-keys.ts`、
+> `shared/concurrency.ts`、`shared/limit.ts`、`shared/retry.ts` 仅被 `proxy-slot` 引用。
+> 详见各文件小节与末尾「未接线子图」。
 
 ---
 
-## src/index.ts（79 行 · 入口层）
+## src/index.ts（80 行 · 入口层）
 
-服务启动入口：拉起后台任务、创建并监听 Elysia app、提供 `healthcheck` CLI 与 `unhandledRejection` 兜底。
+服务启动入口：拉起后台任务、创建并监听 Elysia app、提供 `healthcheck` CLI 与 `unhandledRejection` 兜底。**本文件不注册任何路由**，HTTP 层全部来自 `createApp()`。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
 | 1-6 | — | import | — | `./shared/config`(CFG) `./shared/logger`(log) `./modules/models/catalog`(MODELS) `./infra/session`(startSessionCleanup) `./shared/version`(startVersionRefresh) `./app`(createApp) |
-| 8-37 | `startServer` | 函数 | E | 启动 `startVersionRefresh`/`startSessionCleanup`，`createApp().listen()`，打印启动日志与无 Key 告警 |
-| 39-61 | `healthcheck` | 异步函数 | E | GET `127.0.0.1:{PORT\|CFG.port}/health`，5s 超时，要求 `body.ok===true`；成功 `exit(0)` 否则 `exit(1)` |
-| 63-72 | unhandledRejection 监听 | 逻辑 | P | `AbortError`/`ABORT_ERR` 记 info，其余记 error |
-| 74-79 | CLI 分派 | 逻辑 | P | `argv[2]==='healthcheck'` → `healthcheck()`，否则 `startServer()` |
+| 8-38 | `startServer` | 函数 | E | 启动 `startVersionRefresh`/`startSessionCleanup`，`createApp().listen()`，打印启动日志与无 Key 告警 |
+| 9 | └ `startVersionRefresh()` | 逻辑 | P | CC 版本刷新后台任务 |
+| 10 | └ `startSessionCleanup()` | 逻辑 | P | 会话清理后台任务 |
+| 12 | └ `createApp().listen()` | 逻辑 | P | 监听 `{port: CFG.port, hostname: CFG.host}`；CORS/错误/体限流/鉴权/4 路由由 `src/app.ts` 装配 |
+| 14-31 | └ 启动日志 | 逻辑 | P | url/api/models/CORS 三态/session/ZDR/emptySystemPlaceholder/logFile |
+| 33-35 | └ 无兜底 Key 告警 | 逻辑 | P | `CFG.apiKey` 为空时提示须带 `Authorization: Bearer` 或 `x-api-key` |
+| 40-62 | `healthcheck` | 异步函数 | E | GET `127.0.0.1:{PORT\|CFG.port}/health`，5s 超时，要求 `body.ok===true`；成功 `exit(0)` 否则 `exit(1)` |
+| 64-73 | unhandledRejection 监听 | 逻辑 | P | `AbortError`/`ABORT_ERR` 记 info，其余记 error |
+| 75-80 | CLI 分派 | 逻辑 | P | `argv[2]==='healthcheck'` → `healthcheck()`，否则 `startServer()` |
 
 依赖：`./shared/config` `./shared/logger` `./modules/models/catalog` `./infra/session` `./shared/version` `./app`
 
@@ -101,29 +110,30 @@ scoped `onError`：404 / 413 / PARSE / VALIDATION / 500 归一化，`/v1/message
 
 ---
 
-## src/shared/config.ts（148 行 · 基础设施层）
+## src/shared/config.ts（168 行 · 基础设施层）
 
 三层覆盖（默认值 → config.json → 环境变量）的全局配置单例与请求体/空闲超时常量。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 1-13 | `AppConfig` | interface | E | 11 字段配置接口 |
-| 15-18 | `die` | 函数 | P | `[config]` 报错 + `exit(1)` |
-| 20-37 | `candidateDirs` | 函数 | P | 独立二进制与源码两种目录探测顺序 |
-| 39-52 | `findConfigJson` | 函数 | P | 逐目录查找并解析 config.json，损坏返回 null |
-| 54-56 | `AppConfigWithSource` | interface | E | 追加可选 `configPath` |
-| 58-61 | `envString` | 函数 | P | 空串视为未设置 |
-| 63-69 | `envNumber` | 函数 | P | 非有限数字 `die()` |
-| 71-75 | `envBool` | 函数 | P | 仅 `1`/`true` 为真 |
-| 77-83 | `envBoolDefaultTrue` | 函数 | P | 仅 `false`/`0`/`no` 为假 |
-| 85-127 | `loadConfig` | 函数 | P | 默认值 + 文件合并 + 校验 + 11 项 env 覆盖 |
-| 129 | `CFG` | 常量 | E | 顶层 await 得到的配置单例 |
-| 131-134 | `MAX_BODY_SIZE` | 常量 | E | `CC_MAX_BODY_MB`，默认 100MiB |
-| 136-139 | `STREAM_IDLE_TIMEOUT_MS` | 常量 | E | `CC_STREAM_IDLE_MS`，默认 30_000 |
-| 140-143 | `NONSTREAM_IDLE_TIMEOUT_MS` | 常量 | E | `CC_NONSTREAM_IDLE_MS`，默认 90_000 |
-| 144-148 | `THINKING_IDLE_TIMEOUT_MS` | 常量 | E | `CC_THINKING_IDLE_MS`，默认 120_000 |
+| 1 | — | import | — | `./api-keys`(ApiKeyPool 类型) |
+| 3-22 | `AppConfig` | interface | E | 18 字段配置接口 |
+| 24-27 | `die` | 函数 | P | `[config]` 报错 + `exit(1)` |
+| 29-46 | `candidateDirs` | 函数 | P | 独立二进制（cwd → import.meta.dir）与源码（`src/shared/../..` → cwd）两种目录探测顺序 |
+| 48-61 | `findConfigJson` | 函数 | P | 逐目录查找并解析 config.json，损坏返回 null |
+| 63-65 | `AppConfigWithSource` | interface | E | 追加可选 `configPath` |
+| 67-70 | `envString` | 函数 | P | 空串视为未设置 |
+| 72-78 | `envNumber` | 函数 | P | 非有限数字 `die()` |
+| 80-84 | `envBool` | 函数 | P | 仅 `1`/`true` 为真 |
+| 86-92 | `envBoolDefaultTrue` | 函数 | P | 仅 `false`/`0`/`no` 为假 |
+| 94-147 | `loadConfig` | 函数 | P | 默认值 + config.json 合并 + 校验 + 15 项 env 覆盖 |
+| 149 | `CFG` | 常量 | E | 顶层 await 得到的配置单例 |
+| 151-154 | `MAX_BODY_SIZE` | 常量 | E | `CC_MAX_BODY_MB`，默认 100MiB |
+| 156-159 | `STREAM_IDLE_TIMEOUT_MS` | 常量 | E | `CC_STREAM_IDLE_MS`，默认 30_000 |
+| 160-163 | `NONSTREAM_IDLE_TIMEOUT_MS` | 常量 | E | `CC_NONSTREAM_IDLE_MS`，默认 90_000 |
+| 165-168 | `THINKING_IDLE_TIMEOUT_MS` | 常量 | E | `CC_THINKING_IDLE_MS`，默认 120_000 |
 
-依赖：无（Bun 全局/process）
+依赖：`./api-keys`（仅类型 `ApiKeyPool`）+ Bun 全局/process
 
 ---
 
@@ -937,31 +947,196 @@ SSE 心跳单元测试：验证 `startSseHeartbeat` 的四种状态闸门与两�
 
 ---
 
-## test/timeouts.ts（114 行 · 测试）
+## test/timeouts.ts（92 行 · 测试）
 
-真实时间超时专项（约 30s）：mock 上游零字节挂起，验证 30s 空闲超时、上游取消与断连级联取消。
+真实时间超时专项（约 40s）：mock 上游发单条 `{type:'start'}` 后挂起，验证空闲超时返回 JSON 429、上游取消与断连级联取消。
 
 | 行号 | 符号/段落 | 类别 | 说明 |
 |---|---|---|---|
 | 1-4 | env 注入 | env | `PORT=4210`/`HOST=127.0.0.1`/`CC_API_BASE=http://127.0.0.1:4110`/`CC_API_KEY=''` |
-| 6 | `enc` | 工具 | TextEncoder 单例 |
-| 7 | `generateCancelled` | 状态 | 上游是否被取消 |
-| 9-33 | mock `Bun.serve(:4110)` | mock | 上游桩服务，idleTimeout:120 |
-| 14 | `/alpha/fingerprint/record` | mock | 返回 {} |
-| 15 | `/alpha/lifecycle-events` | mock | 返回 {} |
-| 16 | `/provider/v1/models` | mock | `{data:[{id:'m'}]}` |
-| 17-30 | `/alpha/generate` | mock | abort 监听置位 + 零字节挂起 120s + cancel 回调置位 |
-| 31 | 兜底 404 | mock | 返回 `nf` |
-| 35-36 | 启动 | 基建 | import `../src/index.ts` + sleep300 |
-| 38-39 | `BASE`/`KEY` | 状态 | :4210 基址 + 测试 Key |
-| 41-45 | `check` | 断言 | PASS/FAIL 计数 |
-| 47-65 | 用例组① stream idle timeout | 用例组 | 429 rate_limit_error(retry_after 5)、耗时 28-35s、上游已取消 |
-| 67-83 | 用例组② anthropic 断连 | 用例组 | abort 后上游取消、/health 200 |
-| 85 | 结果 | 输出 | RESULT 行 |
-| 87-111 | ENABLE_THINKING_ASSERT 门控 | 用例组 | 纯函数断言 isThinkingWait/idleTimeoutFor 映射，默认跳过 |
-| 112-114 | 退出 / 导出 | 输出 | fail>0 exit1、export {} |
+| 5-10 | thinking 预算覆盖 | env | `CC_THINKING_IDLE_MS='30000'` + 注释；`start` 命中 `isThinkingWait()` 故预算取 thinking 窗口，压回 30s |
+| 12 | `enc` | 工具 | TextEncoder 单例 |
+| 13 | `generateCancelled` | 状态 | 上游是否被取消 |
+| 15-42 | mock `Bun.serve(:4110)` | mock | 上游桩服务，idleTimeout:120 |
+| 20 | `/alpha/fingerprint/record` | mock | 返回 {} |
+| 21 | `/alpha/lifecycle-events` | mock | 返回 {} |
+| 22 | `/provider/v1/models` | mock | `{data:[{id:'m'}]}` |
+| 23-38 | `/alpha/generate` | mock | abort 监听置位 + 单条 `start` 后挂起 120s + cancel 回调置位 |
+| 40 | 兜底 404 | mock | 返回 `nf` |
+| 44-45 | 启动 | 基建 | 动态 import `../src/index.ts` + sleep300 |
+| 47-48 | `BASE`/`KEY` | 状态 | :4210 基址 + 测试 Key |
+| 50-54 | `check` | 断言 | PASS/FAIL 计数 |
+| 56-69 | 用例组① stream idle timeout | 用例组 | 429 rate_limit_error(retry_after 5)、耗时 28-45s、上游已取消 |
+| 71-87 | 用例组② anthropic 断连 | 用例组 | abort 后上游取消、/health 200 |
+| 89 | 结果 | 输出 | RESULT 行 |
+| 90-92 | 退出 / 导出 | 输出 | `exit(fail>0?1:0)`、`export {}` |
 
-依赖：`../src/index.ts`（动态 import） `../src/shared/runtime.ts`（门控动态 import）
+依赖：`../src/index.ts`（动态 import）
+
+---
+
+## src/infra/proxy-slot.ts（164 行 · 共享管道层 · ⚠ 未接线）
+
+多 Key 池化 + 并发闸门 + 限流退避的上游调用封装。**无任何 import 方**，不在运行时路径上。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 4-14 | — | import | — | `../shared/config`(CFG) `../shared/concurrency` `../shared/api-keys` `../shared/limit` `../shared/retry` `./cc`(forwardToCC) `../shared/errors` `./fingerprint`(ensureInitialized) `../shared/logger` `./proxy-handler`(UpstreamCallArgs 类型) |
+| 16-20 | `gate` | 常量 | P | `ConcurrencyGate` 模块级单例 |
+| 22-27 | `keyPool` | 常量 | P | `ApiKeyPool` 实例，策略取自 `CFG.keySelectionStrategy` |
+| 29-33 | `upstreamKeyFor` | 函数 | **E** | 客户端 Key → 上游 Key 映射（`resolveUpstreamKey`） |
+| 35-37 | `upstreamPoolInfo` | 函数 | **E** | `{keys, strategy}`，供启动日志/探针观测 |
+| 39-76 | `concurrencyErrorToMapped` | 函数 | P | `ConcurrencyRoomFull`/`ConcurrencyTimeout` → `MappedError`（`queue_full`/`timeout`） |
+| 78-163 | `callUpstreamWithSlots<T>` | 异步函数 | **E** | 取 Key → 抢位 → `ensureInitialized` → `forwardToCC` → 非 2xx 走 `mapCcError`+`limitMeta`+退避重试 |
+| 108 | — | 逻辑 | P | 实际转发（比 `proxy-handler` 多一个 `upstreamKey` 参数） |
+| 114-115 | — | 逻辑 | P | 读 `Retry-After` 头交给 `mapCcError` |
+| 119-137 | — | 逻辑 | P | 取 `error.category` 喂 `limitMeta` 判定限流语义 |
+| 138-142 | — | 逻辑 | P | `parseRetryAfter` 优先，其次 `backoffDelay`，取较大等待 |
+
+依赖：`../shared/config` `../shared/concurrency` `../shared/api-keys` `../shared/limit` `../shared/retry` `./cc` `../shared/errors` `./fingerprint` `../shared/logger` `./proxy-handler`
+
+**未接线**：`modules/chat/handler.ts:51` 与 `modules/messages/handler.ts:64` 直接调用
+`infra/proxy-handler.ts` 的 `createUpstreamFlow`/`callUpstream`，绕过本模块。
+多 Key 轮询、每 Key 并发上限、限流退避三项能力生产环境均未生效。
+
+---
+
+## src/shared/context.ts（124 行 · 基础设施层 · ⚠ 未接线）
+
+上下文 token 粗估与窗口检查。**无任何 import 方**。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 6 | — | import | — | `./model-windows`(contextWindowFor) |
+| 8 | `CHARS_PER_TOKEN` | 常量 | P | 4 字符 ≈ 1 token（刻意高估） |
+| 9 | `TOKENS_PER_MESSAGE_OVERHEAD` | 常量 | P | 每消息 4 token 开销 |
+| 11-13 | `charsToTokens` | 函数 | P | `Math.ceil(chars/4)` |
+| 15-18 | `estimateTextTokens` | 函数 | P | 空串返回 0 |
+| 20-40 | `estimatePartTokens` | 函数 | P | `text` 字符估算；`image` 固定 1000；`tool_use` 记 name+input；`tool_result` 记 output |
+| 42-54 | `estimateTokensForCcMessages` | 函数 | **E** | CC 形态消息数组求和 |
+| 56-82 | `estimateTokensForOpenAIMessages` | 函数 | **E** | OpenAI 形态消息数组求和（字符串/part 数组兼容） |
+| 84-90 | `ContextCheck` | interface | **E** | 判定结果结构 |
+| 92 | `WARN_THRESHOLD` | 常量 | P | 0.85 |
+| 93 | `EXCEED_THRESHOLD` | 常量 | P | 0.98 |
+| 95-112 | `checkContextWindow` | 函数 | **E** | 算 `utilization` 后按阈值返回；窗口未知（`null`）放行 |
+| 114 | `DEFAULT_MAX_TOOL_CHARS` | 常量 | **E** | 30 000 |
+| 116-123 | `truncateToolOutput` | 函数 | **E** | 返回 `{text, truncated, originalLength}` |
+
+依赖：`./model-windows`
+
+**未接线**：handler 不做事前预估；超长依赖 `shared/errors.ts` 的
+`isContextWindowExceeded` 在上游返回 400 之后才归一化，属事后补救。
+
+---
+
+## src/shared/model-windows.ts（37 行 · 基础设施层 · ⚠ 未接线）
+
+模型 ID → 上下文窗口静态映射。**仅被 `context.ts:6` 引用，而 context 亦未接线**。
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 6-33 | `MODEL_CONTEXT_WINDOWS` | 常量 | **E** | `Record<string, number \| null>`；`null` = 窗口未知，不判定 |
+| 35-37 | `contextWindowFor` | 函数 | **E** | 查表，未命中返回 `null`（退化为不告警而非误杀） |
+
+依赖：无
+
+---
+
+## src/shared/api-keys.ts（75 行 · 基础设施层 · 仅被未接线的 proxy-slot 引用）
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 6-13 | `ApiKeyPool` | interface | **E** | `{keys, strategy, roundRobinCursor}` |
+| 15-26 | `parseApiKeyEnv` | 函数 | **E** | 从 `CC_API_KEY`（单）与 `CC_API_KEYS`（逗号分隔）解析 Key 池 |
+| 28-31 | `envOrEmpty` | 函数 | P | 空串视为未设置 |
+| 33-38 | `splitComma` | 函数 | P | 逗号切分 + trim + 去空 |
+| 40-59 | `resolveUpstreamKey` | 函数 | **E** | 按 `affinity`（keyHash 稳定映射）或 `roundRobin`（游标轮转）选 Key |
+| 61-66 | `setPoolStrategy` | 函数 | **E** | 切换池策略 |
+| 68-74 | `keyHash` | 函数 | P | Key → 稳定数值哈希，供 affinity 使用 |
+
+依赖：无（process.env）
+
+---
+
+## src/shared/concurrency.ts（220 行 · 基础设施层 · 仅被未接线的 proxy-slot 引用）
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 3-9 | `ConcurrencyConfig` | interface | **E** | `maxInFlightPerKey`/`maxQueuePerKey`/`queueTimeoutMs` |
+| 11-17 | `DEFAULT` | 常量 | P | 默认配置 |
+| 19-22 | `AcquireOptions` | interface | **E** | `{signal?, timeoutMs?}` |
+| 24 | `Release` | type | **E** | `() => void` |
+| 26-33 | `ConcurrencyRoomFull` | class | **E** | 队列已满 |
+| 35-42 | `ConcurrencyTimeout` | class | **E** | 排队超时 |
+| 44-51 | `ConcurrencyAborted` | class | **E** | 等待期间被 abort |
+| 53-57 | `Entry` | interface | P | 每 Key 的 inFlight + waiters 状态 |
+| 59-67 | `Waiter` | interface | P | 单个等待者 |
+| 69-216 | `ConcurrencyGate` | class | **E** | 闸门主体：`acquire`(69+)、`getOrCreate`、`removeWaiter`、`promote`（队首提升）、`snapshot`、`prune` |
+| 78-116 | └ `acquire` | 方法 | E | 抢位或入队；L94 挂 abort 监听；L101 计算空位 |
+| 165-172 | └ `release` | 方法 | E | 释放并触发队首提升 |
+| 218-220 | `createConcurrencyGate` | 函数 | **E** | 工厂（合并默认配置） |
+
+依赖：无
+
+---
+
+## src/shared/limit.ts（177 行 · 基础设施层 · 仅被未接线的 proxy-slot 引用）
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 6-17 | `UpstreamLimitKind` | type | **E** | 限流语义分类联合类型 |
+| 19-48 | `classifyUpstreamLimit` | 函数 | **E** | 按 status + message 文本判定限流种类 |
+| 50-59 | `LimitMeta` | interface | **E** | `{kind, retryAfterMs, retryable, ...}` |
+| 61-111 | `limitMeta` | 函数 | **E** | 主入口；L66 先分类，L84/L99 优先采用 `Retry-After` 头 |
+| 113-123 | `noRetry` | 函数 | P | 不可重试种类的统一构造 |
+| 125-128 | `USAGE_WINDOW_PATTERNS` | 常量 | P | 用量窗口类消息正则 |
+| 130-136 | `isUsageWindow` | 函数 | P | 用量窗口判定 |
+| 138-143 | `containsUsageWindow` | 函数 | P | 标记匹配 |
+| 145-159 | `hasLimitVerb` | 函数 | P | 限流动词判定 |
+| 161-164 | `isRateLimit` | 函数 | P | 真限流判定 |
+| 166-177 | `likelyContextOverflow` | 函数 | P | 上下文溢出疑似判定 |
+
+依赖：无
+
+---
+
+## src/shared/retry.ts（33 行 · 基础设施层 · 仅被未接线的 proxy-slot 引用）
+
+| 行号 | 符号 | 类别 | 可见性 | 说明 |
+|---|---|---|---|---|
+| 3-16 | `parseRetryAfter` | 函数 | **E** | 解析 `Retry-After`（秒数或 HTTP-date），无法解析返回 `null` |
+| 18-23 | `backoffDelay` | 函数 | **E** | `min(cap, base*2^attempt)` + ±25% 抖动 |
+| 25-33 | `sleep` | 函数 | **E** | 可被 `AbortSignal` 中断的 sleep |
+
+依赖：无
+
+---
+
+## test/unit.ts（172 行 · 测试）
+
+纯函数单元测试，**不启动服务、不联网**。41 项断言，覆盖 5 个 shared 模块。
+
+| 行号 | 符号/段落 | 类别 | 说明 |
+|---|---|---|---|
+| 5-9 | import | import | `../src/shared/limit` `retry` `api-keys` `concurrency` `errors` |
+| 13-17 | `check` | 断言 | PASS/FAIL 计数 |
+| 20-30 | 退避单调性 | 用例组 | `backoffDelay` 随 attempt 单调递增且受 cap 约束 |
+| 32-49 | `limitMeta` 分类 | 用例组 | 真限流 / 5 小时用量窗口 / 上下文溢出(400) / `Retry-After` 头优先 |
+| 51-60 | `parseRetryAfter` HTTP-date | 用例组 | 解析为期望 delta |
+| 62-72 | Key 池策略 | 用例组 | affinity 稳定、亲和有界、roundRobin 轮转 |
+| 74-88 | 并发闸门排队 | 用例组 | inFlight=2、排队等待、释放后唤醒、inFlight 回落 |
+| 90-101 | 队列已满 | 用例组 | `ConcurrencyRoomFull` 抛出、边界值判定 |
+| 103-111 | 排队超时 | 用例组 | `ConcurrencyTimeout` 定时器触发 |
+| 112-121 | 等待者 abort | 用例组 | `ConcurrencyAborted`、已 abort 信号立即拒绝 |
+| 122-134 | 队列边界 | 用例组 | 队列内仍可准入、闸门完全排空 |
+| 136-144 | 空池边界 | 用例组 | 池为空时的闸门行为 |
+| 146-171 | `mapCcError` / `mapCcEventError` | 用例组 | 400/402/404/429/500 与 `<429>` 事件流的类型映射 |
+
+依赖：`../src/shared/limit` `../src/shared/retry` `../src/shared/api-keys` `../src/shared/concurrency` `../src/shared/errors`
+
+> ⚠ 本文件是 `api-keys`/`concurrency`/`limit`/`retry` 四个模块的**唯一**测试覆盖。
+> 由于这四个模块随 `proxy-slot` 一同未接线，它们在生产环境不会被加载 ——
+> 测试全绿并不代表线上生效。
 
 ---
 
@@ -990,27 +1165,63 @@ SSE 心跳单元测试：验证 `startSseHeartbeat` 的四种状态闸门与两�
 
 ### 核心度（被依赖次数）排序
 
+> 数值由 `scripts/_fanin.ts` 静态扫描全仓相对 import 实测得出（含未接线子图的引用方）。
+
 | 排名 | 模块 | 被依赖次数 | 主要依赖方 |
 |---|---|---|---|
-| 1 | `shared/logger.ts` | 11 | index、version、cc-events、proxy-handler、session、fingerprint、chat/messages 的 handler+translator、models/catalog |
-| 2 | `shared/config.ts` | 9 | index、logger、runtime、http、auth、plugins/errors、infra/cc、infra/fingerprint、models/catalog |
+| 1 | `shared/logger.ts` | 12 | index、version、cc-events、proxy-handler、**proxy-slot**、session、fingerprint、chat/messages 的 handler+translator、models/catalog |
+| 2 | `shared/config.ts` | 11 | index、logger、runtime、http、auth、plugins/errors、infra/cc、infra/fingerprint、**infra/proxy-slot**、models/catalog |
 | 3 | `shared/util.ts` | 9 | infra/cc、infra/session、infra/fingerprint、chat handler/aggregator、messages handler/translator/aggregator、models/catalog |
-| 4 | `shared/errors.ts` | 6 | infra/proxy-handler、chat translator/aggregator、messages handler/translator/aggregator |
-| 5 | `shared/http.ts` | 6 | plugins/cors、plugins/body、infra/proxy-handler、chat handler、messages handler、models/catalog |
-| 6 | `shared/version.ts` | 4 | index、infra/cc、infra/fingerprint、models/catalog |
-| 7 | `shared/auth.ts` | 4 | plugins/auth、chat handler、messages handler、models/catalog |
-| 8 | `infra/cc.ts` | 4 | proxy-handler、chat/service(re-export)、chat handler、messages handler |
-| 9 | `infra/session.ts` | 4 | index、infra/cc、chat handler、messages handler |
-| 10 | `infra/cc-events.ts` | 4 | chat translator/aggregator、messages translator/aggregator |
+| 4 | `shared/errors.ts` | 9 | infra/proxy-handler、**infra/proxy-slot**、chat translator/aggregator、messages handler/translator/aggregator |
+| 5 | `infra/cc-events.ts` | 8 | chat translator/aggregator、messages translator/aggregator（每协议 2 处 import：类型 + 值） |
+| 6 | `shared/http.ts` | 6 | plugins/cors、plugins/body、infra/proxy-handler、chat handler、messages handler、models/catalog |
+| 7 | `modules/messages/translator.ts` | 5 | messages aggregator、handler、protocol |
+| 7 | `infra/cc.ts` | 5 | infra/proxy-handler、**infra/proxy-slot**、chat handler、chat service(re-export)、messages handler |
+| 7 | `infra/proxy-handler.ts` | 5 | chat handler、messages handler、**infra/proxy-slot** |
+| 10 | `infra/session.ts` | 4 | index、infra/cc、chat handler、messages handler |
+| 10 | `shared/version.ts` | 4 | index、infra/cc、infra/fingerprint、models/catalog |
+| 10 | `shared/auth.ts` | 4 | plugins/auth、chat handler、messages handler、models/catalog |
+| 13 | `plugins/auth.ts` | 3 | app、chat/index、messages/index |
 
-> 统计口径：仅计 `src/` 内 import；`test/` 另行依赖 `src/index.ts`、`src/infra/sse.ts`、`src/shared/config.ts`、`src/shared/runtime.ts`。
+> 统计口径：仅计 `src/` 内 import。`test/` 另行依赖 `src/index.ts`（e2e / timeouts）、
+> `src/infra/sse.ts`（heartbeat）、`src/shared/config.ts`（idle-timeout-env）、
+> `src/shared/runtime.ts`（e2e），以及 `src/shared/{api-keys,concurrency,limit,retry,errors}.ts`（unit）。
+
+### 未接线子图（⚠ 不在运行时路径上）
+
+以下 7 个文件构成一个**封闭子图**，入口为零 —— 它们互相引用，但没有任何运行时代码导入该子图：
+
+```
+（无引用方）
+      │
+      ▼
+infra/proxy-slot.ts ──┬─► shared/api-keys.ts
+                     ├─► shared/concurrency.ts
+                     ├─► shared/limit.ts
+                     ├─► shared/retry.ts
+                     ├─► shared/config.ts        （已接线，此处为额外引用）
+                     ├─► shared/errors.ts        （已接线，此处为额外引用）
+                     ├─► shared/logger.ts        （已接线，此处为额外引用）
+                     ├─► infra/cc.ts             （已接线）
+                     ├─► infra/fingerprint.ts    （已接线）
+                     └─► infra/proxy-handler.ts  （已接线）
+shared/context.ts ─────► shared/model-windows.ts
+```
+
+- **零引用方**：`infra/proxy-slot.ts`、`shared/context.ts`、`shared/model-windows.ts`
+- **仅被未接线方引用**：`shared/api-keys.ts`、`shared/concurrency.ts`、`shared/limit.ts`、`shared/retry.ts`
+- **生产未生效的能力**：多 Key 轮询/亲和、每 Key 并发上限与排队、上游限流退避重试、上下文窗口事前预判、工具输出截断
+- **仍然生效的部分**：`shared/config.ts` 等被上表虚线标注的文件同时在已接线路径上被引用，其配置项（`maxConcurrencyPerKey`/`retryMax`/`maxQueuePerKey` 等）虽可配置但**无消费方**
+- **测试覆盖**：`test/unit.ts` 41 项断言全绿，但覆盖的是这批未接线模块 —— **测试通过 ≠ 线上生效**
+
 
 ### 观察要点
 
-1. `shared/` 是典型高扇入地基：`logger`(11)、`config`(9)、`util`(9)、`errors`(6)、`http`(6) 构成全仓最底层，且 shared 内部仅指向 `config`/`logger`，无回边。
+1. `shared/` 是典型高扇入地基：`logger`(12)、`config`(11)、`util`(9)、`errors`(9)、`http`(6) 构成全仓最底层，且 shared 内部仅指向 `config`/`logger`/`api-keys`/`model-windows`，无回边。
 2. `infra/` 承担上游对接与共享管道：`cc`+`session`+`fingerprint` 管请求构建与会话/指纹，`proxy-handler` 抽出双协议共用的读体、断连级联与上游调用，`cc-events` 统一 NDJSON 解析。
 3. 分层方向清晰为 入口 → 插件/协议模块 → infra → shared，矩阵中无反向依赖、无环；`plugins` 只依赖 `shared`，`health` 为仅依赖 `elysia` 的叶子。
 4. chat 与 messages 的 `handler/translator/aggregator` 结构对称，差异集中在传输层：chat 的 `SsePipeline(true)` 用 `autoStart=true`，messages 用 `SsePipeline(false)` 缓冲头部并走 `emitAnthropic` + 两跳 Anthropic↔OpenAI 转换。
 5. `models/catalog` 是唯一同时依赖 `config/logger/version/auth/util/http` 六个 shared 模块的聚合点，也是连通 `shared` 与 `modules-models` 的关键。
+6. ⚠ **存在一个封闭的未接线子图**（7 个文件，见上节）：`proxy-slot` 及其 4 个 shared 依赖、`context`+`model-windows` 均无运行时引用方。这是当前架构最大的一处缺口 —— `config.json` 中的 `maxConcurrencyPerKey` / `maxQueuePerKey` / `queueTimeoutMs` / `keySelectionStrategy` / `retryMax` / `retryBaseMs` / `retryCapMs` 七项配置**可配但无消费方**，环境变量 `CC_API_KEYS`、`CC_KEY_SELECTION_STRATEGY` 同理。接入 `proxy-slot` 即可一次性激活这七项。
 
 *本报告由全量源码扫描生成；行号对应当前工作区版本。*

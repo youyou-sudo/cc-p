@@ -1,6 +1,9 @@
 # Command Code Proxy 项目文档
 
-> 生成时间：2026-09-10 · 基于工作区全量扫描（`src/` 40 个源文件、`test/` 4 个测试，共约 4 518 行 TypeScript）
+> 生成时间：2026-09-29 · 基于工作区全量扫描（`src/` 47 个源文件、`test/` 5 个测试，共约 4 569 行 TypeScript）
+>
+> 其中 `src/infra/proxy-slot.ts`、`src/shared/context.ts`、`src/shared/model-windows.ts` 三个文件
+> **已实现但未接线**（无任何 import 方），详见 §5.1；其余 44 个文件均在线运行路径上。
 
 ## 1. 项目简介
 
@@ -51,10 +54,23 @@
 ├──────────────────────────────────────────────────────────────────────┤
 │  基础设施层  src/shared/config.ts  src/shared/http.ts  src/shared/auth.ts   │
 │             src/shared/logger.ts  src/shared/util.ts  src/shared/runtime.ts │
-│             src/shared/errors.ts  src/shared/version.ts                     │
+│             src/shared/errors.ts  src/shared/version.ts  src/shared/retry.ts│
 │             src/shared/cc-types.ts（纯类型）                                 │
+├──────────────────────────────────────────────────────────────────────┤
+│  已实现未接线 ⚠ src/infra/proxy-slot.ts   密钥池 + 并发闸门 + 限流 + 退避     │
+│             src/shared/context.ts       上下文 token 估算                   │
+│             src/shared/model-windows.ts  按模型的上下文窗口表                │
+│             （另：src/shared/api-keys.ts  src/shared/concurrency.ts          │
+│               src/shared/limit.ts 仅被未接线的 proxy-slot 引用）             │
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
+> ⚠ **未接线说明**：`proxy-slot` 提供多 API Key 轮询、每 Key 并发上限、排队超时与指数退避；
+> `context` / `model-windows` 提供请求体 token 粗估与窗口检查。当前
+> `chat/handler.ts` 与 `messages/handler.ts` 均直接调用 `infra/proxy-handler.ts` 的
+> `createUpstreamFlow` / `callUpstream`，**绕过 proxy-slot**，故上述能力两端都未生效。
+> 接入点：把 handler 的上游调用换成 `proxy-slot` 导出的封装，并按需调用
+> `shared/context.ts` 的估算函数。
 
 ## 4. 请求流转（核心数据流）
 
@@ -96,6 +112,9 @@ createApp                     (src/app.ts)
        → sendJSON / sendAnthropicError (src/shared/http.ts) → JSON
 ```
 
+> ⚠ 此处的上游调用走 `infra/proxy-handler.ts`，**不经过** `infra/proxy-slot.ts`
+> （密钥池 / 并发闸门 / 限流退避均未接入，详见 §3 与 §5.1）。
+
 **流式与非流式的差异**
 
 - chat 流式：`SsePipeline(true)`（`autoStart=true`）+ 工厂函数翻译器 `createSseTranslator`，心跳用 SSE 注释帧 `SSE_KEEPALIVE_COMMENT`（OpenAI SDK 只认 `data:` 行）。
@@ -108,13 +127,13 @@ createApp                     (src/app.ts)
 
 | # | 报告 | 源文件 | 行数 | 层级 |
 |---|---|---|---|---|
-| 01 | [01-index.md](modules/01-index.md) | `src/index.ts` | 79 | 入口层 |
+| 01 | [01-index.md](modules/01-index.md) | `src/index.ts` | 80 | 入口层 |
 | 02 | [02-app.md](modules/02-app.md) | `src/app.ts` | 21 | 入口层 |
 | 03 | [03-plugins-cors.md](modules/03-plugins-cors.md) | `src/plugins/cors.ts` | 16 | 插件层 |
 | 04 | [04-plugins-errors.md](modules/04-plugins-errors.md) | `src/plugins/errors.ts` | 60 | 插件层 |
 | 05 | [05-plugins-body.md](modules/05-plugins-body.md) | `src/plugins/body.ts` | 77 | 插件层 |
 | 06 | [06-plugins-auth.md](modules/06-plugins-auth.md) | `src/plugins/auth.ts` | 70 | 插件层 |
-| 07 | [07-config.md](modules/07-config.md) | `src/shared/config.ts` | 148 | 基础设施层 |
+| 07 | [07-config.md](modules/07-config.md) | `src/shared/config.ts` | 168 | 基础设施层 |
 | 08 | [08-logger.md](modules/08-logger.md) | `src/shared/logger.ts` | 16 | 基础设施层 |
 | 09 | [09-util.md](modules/09-util.md) | `src/shared/util.ts` | 75 | 基础设施层 |
 | 10 | [10-runtime.md](modules/10-runtime.md) | `src/shared/runtime.ts` | 139 | 基础设施层 |
@@ -151,35 +170,58 @@ createApp                     (src/app.ts)
 | 41 | [41-test-e2e.md](modules/41-test-e2e.md) | `test/e2e.ts` | 486 | 测试 |
 | 42 | [42-test-heartbeat.md](modules/42-test-heartbeat.md) | `test/heartbeat.ts` | 89 | 测试 |
 | 43 | [43-test-idle-timeout-env.md](modules/43-test-idle-timeout-env.md) | `test/idle-timeout-env.ts` | 111 | 测试 |
-| 44 | [44-test-timeouts.md](modules/44-test-timeouts.md) | `test/timeouts.ts` | 114 | 测试 |
+| 44 | [44-test-timeouts.md](modules/44-test-timeouts.md) | `test/timeouts.ts` | 92 | 测试 |
+| 45 | [45-proxy-slot.md](modules/45-proxy-slot.md) | `src/infra/proxy-slot.ts` | 164 | ⚠ 未接线 |
+| 46 | [46-context.md](modules/46-context.md) | `src/shared/context.ts` | 124 | ⚠ 未接线 |
+| 47 | [47-model-windows.md](modules/47-model-windows.md) | `src/shared/model-windows.ts` | 37 | ⚠ 未接线 |
+| — | （无独立报告） | `src/shared/api-keys.ts` | 75 | 基础设施层 |
+| — | （无独立报告） | `src/shared/concurrency.ts` | 220 | 基础设施层 |
+| — | （无独立报告） | `src/shared/limit.ts` | 177 | 基础设施层 |
+| — | （无独立报告） | `src/shared/retry.ts` | 33 | 基础设施层 |
+| — | （无独立报告） | `test/unit.ts` | 172 | 测试 |
+
+### 5.1 已实现但未接线的模块
+
+| 文件 | 行数 | 提供的能力 | 为何未生效 | 接入点 |
+|---|---|---|---|---|
+| `src/infra/proxy-slot.ts` | 164 | 多 Key 轮询/亲和选择、每 Key 并发闸门与排队超时、`limitMeta` 限流元数据、指数退避重试 | 无任何 import 方 | `modules/chat/handler.ts:51` 与 `modules/messages/handler.ts:64` 的 `createUpstreamFlow` 调用处，改为走 proxy-slot |
+| `src/shared/context.ts` | 124 | 请求体 token 粗估（4 字符/token + 每消息 4 token）、按模型窗口检查 | 无任何 import 方 | handler 入口处做 `context_window_exceeded` 预判 |
+| `src/shared/model-windows.ts` | 37 | 模型名 → 上下文窗口映射表 | 仅被 `shared/context.ts` 引用 | 随 `context.ts` 一同接入 |
+
+连带未接入但本身有引用的文件：`src/shared/api-keys.ts`、`src/shared/concurrency.ts`、
+`src/shared/limit.ts`、`src/shared/retry.ts` —— 四者**仅**被 `infra/proxy-slot.ts` 引用，
+因此随 proxy-slot 一同处于未接线状态。`test/unit.ts` 覆盖了其中
+`api-keys` / `concurrency` / `limit` / `retry` 的行为（41 项断言全绿），但生产路径未使用。
 
 ### 总报告
 
 | 文档 | 内容 |
 |---|---|
-| [code-map.md](code-map.md) | 全部 44 个文件（src 40 + test 4）符号级映射 + 依赖矩阵 |
+| [code-map.md](code-map.md) | 全部 47 个文件（src 47 + test 5，含 4 个无独立报告的 shared 文件）符号级映射 + 依赖矩阵 |
 
 ## 6. 关键运行参数（速查）
 
 | 常量 | 值 | 定义处 |
 |---|---|---|
-| 流式空闲超时 `STREAM_IDLE_TIMEOUT_MS` | 30 000 ms（`CC_STREAM_IDLE_MS` 可覆盖，默认不变） | `src/shared/config.ts:136-139` |
-| 非流式空闲超时 `NONSTREAM_IDLE_TIMEOUT_MS` | 90 000 ms（`CC_NONSTREAM_IDLE_MS` 可覆盖，默认不变） | `src/shared/config.ts:140-143` |
-| thinking 空闲宽限 `THINKING_IDLE_TIMEOUT_MS` | 120 000 ms（`CC_THINKING_IDLE_MS` 可覆盖，默认不变） | `src/shared/config.ts:145-148` |
+| 流式空闲超时 `STREAM_IDLE_TIMEOUT_MS` | 30 000 ms（`CC_STREAM_IDLE_MS` 可覆盖，默认不变） | `src/shared/config.ts:156-159` |
+| 非流式空闲超时 `NONSTREAM_IDLE_TIMEOUT_MS` | 90 000 ms（`CC_NONSTREAM_IDLE_MS` 可覆盖，默认不变） | `src/shared/config.ts:160-163` |
+| thinking 空闲宽限 `THINKING_IDLE_TIMEOUT_MS` | 120 000 ms（`CC_THINKING_IDLE_MS` 可覆盖，默认不变） | `src/shared/config.ts:165-168` |
 | 上述超时常量重导出 | — | `src/shared/runtime.ts:9` |
-| 连续超时降级阈值 | 3 次 → 提示缩减上下文 | `src/shared/runtime.ts:11` |
+| 连续超时降级阈值 `TIMEOUT_REDUCE_CONTEXT_THRESHOLD` | 3 次 → 提示缩减上下文 | `src/shared/runtime.ts:11` |
 | 大上下文阈值 `TIMEOUT_LARGE_CONTEXT_TOKENS` | 80 000 tokens | `src/shared/runtime.ts:13` |
 | 超时状态 TTL `TIMEOUT_STATE_TTL_MS` | 30 min | `src/shared/runtime.ts:16` |
-| 空闲预算选择 `idleTimeoutFor` | thinking→120s；否则 streaming?30s:90s | `src/shared/runtime.ts:136-139` |
+| 空闲预算选择 `idleTimeoutFor` | thinking→120s；否则 streaming?30s:90s | `src/shared/runtime.ts:136` |
+| 超时计数分桶键 `scopeKey` | `${apiKey}::${sessionId ?? 'default'}` | `src/shared/runtime.ts` |
 | 会话有效期 | 12 h + ≤1 h 抖动，按 API key | `src/infra/session.ts:5-6` |
 | 指纹/生命周期刷新 | 8 h + ≤2 h 抖动，按 API key | `src/infra/fingerprint.ts:115-116` |
 | CC 版本刷新 | 24 h（npm registry） | `src/shared/version.ts:4` |
-| 模型列表刷新 | 300 000 ms（`CC_MODEL_REFRESH_INTERVAL_MS` 可配） | `src/shared/config.ts:97` |
-| 请求体上限 `MAX_BODY_SIZE` | 100 MB（`CC_MAX_BODY_MB` 可配） | `src/shared/config.ts:131-134` |
+| 模型列表刷新 | 300 000 ms（`CC_MODEL_REFRESH_INTERVAL_MS` 可配） | `src/shared/config.ts:106` |
+| 空 system 占位符 `emptySystemPlaceholder` | 默认 `true`（`CC_EMPTY_SYSTEM_PLACEHOLDER` 可关） | `src/shared/config.ts:115,144` |
+| 请求体上限 `MAX_BODY_SIZE` | 100 MB（`CC_MAX_BODY_MB` 可配） | `src/shared/config.ts:151-154` |
 | 超限排水上限 `DRAIN_LIMIT` | 32 MB（防慢速攻击） | `src/shared/http.ts:58` |
 | SSE 心跳 interval | 5 s | `src/infra/sse.ts:8` |
 | SSE 心跳 idle | 15 s | `src/infra/sse.ts:9` |
-| 监听端口/地址 | 3050 / 0.0.0.0 | `src/shared/config.ts:89-90` |
+| 监听端口/地址 | 3050 / 0.0.0.0 | `src/shared/config.ts:98-99` |
 
 ## 7. 长会话 / 上下文管理（客户端止血习惯）
 
@@ -214,6 +256,7 @@ createApp                     (src/app.ts)
 | `bun run dev` | watch 模式启动（`src/index.ts`） |
 | `bun run build` | 编译单文件二进制 `server` |
 | `bun run test` | e2e：`test/e2e.ts`，mock 上游(4100) + 被测服务(4200) |
-| `bun run test:timeouts` | 真实时间验证流式空闲超时 / 断连取消 / 服务存活（`test/timeouts.ts`） |
+| `bun run test:timeouts` | 真实时间验证流式空闲超时 / 断连取消 / 服务存活（`test/timeouts.ts`，约 40s） |
 | `bun run test:heartbeat` | SSE 心跳行为验证（`test/heartbeat.ts`） |
 | `bun run test/idle-timeout-env.ts` | 空闲超时环境变量验证（`package.json` 无该 script，直接运行） |
+| `bun run test/unit.ts` | 单元测试（`test/unit.ts`，41 项：api-keys / concurrency / limit / retry / errors；`package.json` 无该 script，直接运行） |
