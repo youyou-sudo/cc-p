@@ -109,8 +109,23 @@ export async function fetchModels(apiKey?: string | null): Promise<ModelEntry[]>
 
 export async function handleModels(headers: Record<string, string | undefined>): Promise<Response> {
   const apiKey = getApiKey(headers)
+  // Distinguish a fresh provider fetch from a cache hit and from the
+  // hardcoded fallback. Without this, a client reporting "my model is
+  // missing" is indistinguishable from a stale cache, and the only signals
+  // are the two warns emitted inside fetchModels (which a cache hit skips).
+  const hadCache = dynamicModels !== null && Date.now() - modelsLastFetch < CFG.modelRefreshIntervalMs
   const models = await fetchModels(apiKey)
+  const source = models === MODELS ? 'fallback' : hadCache ? 'cache' : 'provider'
   const now = nowUnix()
+  // nowUnix() is whole SECONDS, so the age must be computed in ms from
+  // Date.now() — mixing the two units is what produced a negative cacheAgeMs.
+  const cacheAgeMs = dynamicModels ? Date.now() - modelsLastFetch : undefined
+  log('info', 'Models list served', {
+    source,
+    count: models.length,
+    keyPrefix: apiKey ? apiKey.slice(0, 8) : '(none)',
+    cacheAgeMs,
+  })
   return sendJSON(200, {
     object: 'list',
     data: models.map((m) => ({

@@ -1,5 +1,7 @@
 import { Elysia } from 'elysia'
 import { readJsonBody, BodyTooLargeError } from '../shared/http'
+import { MAX_BODY_SIZE } from '../shared/config'
+import { log } from '../shared/logger'
 
 // 单次限流 JSON 解析插件：复用 readJsonBody 不变式，消除 Elysia 内建解析与
 // readJsonBody 双解析冲突。
@@ -56,11 +58,13 @@ export const bodyLimitPlugin = new Elysia({ name: 'body-limit' })
       if (e instanceof BodyTooLargeError) {
         // 不在此直抛：会被 compose 包成 ParseError（status=400），413 分支不可达。
         // stash 到 onTransform 再抛普通 Error(status=413)，走 errorsPlugin 413 双形。
+        // readJsonBody 已记录拒绝原因（content-length 预检 / 流式超限 / 排水中止），
+        // 此处只补插件视角的路由信息，便于按 path 聚合超限来源。
         tooLargeByRequest.set(request, e.message)
         return TOO_LARGE_BODY as any
       }
       // Invalid JSON / timeout / 空流：抛普通 Error，让 Elysia 包成 PARSE →
-      // errorsPlugin 400 双形。保留原始 message（含 'Invalid JSON'）供日志。
+      // errorsPlugin 400 双形。原始 message 已由 readJsonBody 记录。
       throw e
     }
   })
@@ -68,6 +72,13 @@ export const bodyLimitPlugin = new Elysia({ name: 'body-limit' })
     const msg = tooLargeByRequest.get(request)
     if (msg !== undefined) {
       tooLargeByRequest.delete(request)
+      // 记录 path：readJsonBody 只知道 method/content-length，这里补上是哪个
+      // 端点在被灌大包（客户端 bug 还是定向攻击，靠这个区分）。
+      log('warn', 'Body limit enforced', {
+        path: new URL(request.url).pathname,
+        method: request.method,
+        limitBytes: MAX_BODY_SIZE,
+      })
       // 普通 Error + status=413（不要用 status()，否则被 errorsPlugin 穿透），
       // 让 errorsPlugin 走 413 双形分支（/v1/messages 分 Anthropic 形否则 OpenAI 形）
       const err: any = new Error(msg)
