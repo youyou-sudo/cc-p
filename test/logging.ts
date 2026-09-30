@@ -7,7 +7,17 @@
 // CFG is snapshotted when shared/config is first evaluated, so the environment
 // must be set BEFORE that module loads. Static imports are hoisted above these
 // statements, so the src modules are pulled in dynamically instead.
-process.env.LOG_FILE = 'D:/Git/cc_p_forked/.hb/_logging-test.log'
+//
+// The log file goes under the OS temp dir, not .hb/ (git-ignored and absent on
+// a fresh clone — writing there failed with ENOENT once the directory was
+// removed). mkdir -p equivalent so the test does not depend on it pre-existing.
+import { mkdirSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+const LOG_DIR = join(tmpdir(), 'cc-proxy-logging-test')
+mkdirSync(LOG_DIR, { recursive: true })
+process.env.LOG_FILE = join(LOG_DIR, 'logging-test.log')
 // Shrink the cap so the size-limit paths are reachable with a small fixture.
 // The default is 100MB, which would need a 100MB body to exercise.
 process.env.CC_MAX_BODY_MB = '1'
@@ -360,6 +370,69 @@ check('auth: malformed key logs a distinct reason',
 check('auth: malformed key log notes the presented header',
   find('Authentication failed (pre-check)')[0]?.data?.hasXApiKey === true,
   find('Authentication failed (pre-check)')[0])
+
+// ── 7. retry safety: a non-idempotent endpoint must not re-POST ───────
+// /alpha/generate re-sends the whole conversation, so retrying an error the
+// upstream may already have accepted and billed costs the user twice. These
+// assert the guard that separates "transient" from "safe to repeat".
+const { isSafeToRetryForTest } = await import('../src/infra/proxy-slot')
+const { clientDeadlineFrom } = await import('../src/infra/proxy-handler')
+const { MODELS, MODELS_BASE } = await import('../src/modules/models/catalog')
+const { contextWindowFor, MODEL_CONTEXT_WINDOWS } = await import('../src/shared/model-windows')
+
+check('retry: 429 is safe to repeat (rejected at admission)',
+  isSafeToRetryForTest(429, true) === true)
+check('retry: 402/401 are safe to repeat', isSafeToRetryForTest(402, true) === true)
+check('retry: 5xx is NOT retried even when classified transient',
+  isSafeToRetryForTest(500, true) === false)
+check('retry: 503 is NOT retried either', isSafeToRetryForTest(503, true) === false)
+check('retry: non-retryable 429 is still refused', isSafeToRetryForTest(429, false) === false)
+check('retry: non-retryable 5xx refused', isSafeToRetryForTest(500, false) === false)
+check('retry: 400 is never retried', isSafeToRetryForTest(400, true) === false)
+
+// The deadline is read from a client header, never invented.
+const dl = clientDeadlineFrom({ 'x-request-timeout-ms': '5000' })
+check('deadline: derived from client header', dl !== undefined && dl > Date.now(), dl)
+check('deadline: absent header -> undefined', clientDeadlineFrom({}) === undefined)
+check('deadline: garbage header ignored', clientDeadlineFrom({ 'x-request-timeout-ms': 'abc' }) === undefined)
+check('deadline: non-positive header ignored', clientDeadlineFrom({ 'x-request-timeout-ms': '0' }) === undefined)
+
+// ── 8. context windows: one table, served values unchanged ────────────
+// /v1/models must keep serving exactly what it served before the tables were
+// unified, while the guardrail table no longer disagrees with it.
+// EXPOSED_IDS mirrors catalog.ts; asserted here so the served set cannot drift.
+const EXPOSED_IDS = new Set([
+  'claude-sonnet-4-6', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-haiku-4-5-20251001',
+  'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex',
+  'deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4-flash',
+  'google/gemini-3.5-flash', 'google/gemini-3.1-flash-lite',
+])
+const served = MODELS.filter((m) => m.context_window !== undefined)
+const EXPECTED_SERVED: Record<string, number> = {
+  'claude-sonnet-4-6': 200000, 'claude-opus-4-8': 200000, 'claude-opus-4-7': 200000,
+  'claude-haiku-4-5-20251001': 200000, 'gpt-5.5': 400000, 'gpt-5.4': 400000,
+  'gpt-5.4-mini': 400000, 'gpt-5.3-codex': 400000,
+  'deepseek/deepseek-v4-pro': 131072, 'deepseek/deepseek-v4-flash': 65536,
+  'google/gemini-3.5-flash': 1048576, 'google/gemini-3.1-flash-lite': 1048576,
+}
+check('models: still 26 entries', MODELS.length === 26, MODELS.length)
+check('models: exactly 12 expose context_window', served.length === 12, served.length)
+check('models: served values unchanged (no observable API change)',
+  served.every((m) => EXPECTED_SERVED[m.id] === m.context_window),
+  served.filter((m) => EXPECTED_SERVED[m.id] !== m.context_window))
+check('models: served windows now match the guardrail table exactly',
+  served.every((m) => contextWindowFor(m.id) === m.context_window),
+  served.filter((m) => contextWindowFor(m.id) !== m.context_window))
+check('models: ids and order preserved',
+  MODELS.map((m) => m.id).join(',') === MODELS_BASE.map((m) => m.id).join(','))
+check('models: unexposed ids still omit the field',
+  MODELS.filter((m: { id: string; context_window?: number }) => !EXPOSED_IDS.has(m.id))
+    .every((m: { context_window?: number }) => m.context_window === undefined))
+check('models: unexposed ids still resolvable by the guardrail table',
+  contextWindowFor('moonshotai/Kimi-K2.6') === 256000)
+check('models: unknown id -> null (never a guessed default)', contextWindowFor('nope/nope') === null)
+check('models: table covers every catalog id',
+  MODELS.every((m) => m.id in MODEL_CONTEXT_WINDOWS))
 
 // ── 6. log file writer ────────────────────────────────────────────────
 const logFile = process.env.LOG_FILE!
