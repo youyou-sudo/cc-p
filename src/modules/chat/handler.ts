@@ -1,4 +1,5 @@
 import { authErrorMessage, getApiKey } from '../../shared/auth'
+import { CFG } from '../../shared/config'
 import { buildCcRequest } from '../../infra/cc'
 import { SSE_HEADERS, readWithTimeout, sendJSON } from '../../shared/http'
 import { log } from '../../shared/logger'
@@ -34,6 +35,16 @@ export async function handleChatCompletions(request: Request, headers: Record<st
 export async function handleChatCompletionsBody(openaiReq: any, headers: Record<string, string | undefined>, signal?: AbortSignal): Promise<Response> {
   const apiKey = getApiKey(headers)
   if (!apiKey) {
+    // Key rotation, a bad CC_API_KEY fallback, or a client bug all land here.
+    // Silent before, so a 401 storm (wrong key deployed, SDK sending the wrong
+    // header) was invisible: the access log shows the status but not why.
+    log('warn', 'Authentication failed', {
+      path: '/v1/chat/completions',
+      reason: authErrorMessage(headers),
+      hasAuthorization: !!headers['authorization'] || !!headers['Authorization'],
+      hasXApiKey: !!headers['x-api-key'] || !!headers['X-Api-Key'],
+      fallbackKeyConfigured: !!CFG.apiKey,
+    })
     return sendJSON(401, { error: { message: authErrorMessage(headers), type: 'auth_error' } })
   }
 
@@ -189,7 +200,21 @@ export async function handleChatCompletionsBody(openaiReq: any, headers: Record<
           }
         } finally {
           clearInterval(heartbeat)
-          pipeline.close()
+          const snap = pipeline.snapshot()
+          // Only log when something went wrong downstream, so a healthy stream
+          // does not double its own log volume. Non-zero enqueue/close/heartbeat
+          // errors mean we were writing into a socket the client had abandoned;
+          // clientCancelled is Bun's own signal for the same thing.
+          if (snap.enqueueErrorCount > 0 || snap.closeErrorCount > 0
+            || snap.heartbeatErrorCount > 0 || snap.clientCancelled) {
+            log('warn', 'SSE pipeline write failed (client likely gone)', {
+              path: '/v1/chat/completions',
+              model,
+              completionId,
+              ...snap,
+            })
+          }
+          pipeline.close('pump-finished')
         }
       }
 
@@ -274,6 +299,15 @@ export async function handleChatCompletionsBody(openaiReq: any, headers: Record<
       aggregator.flush()
     } catch (e: any) {
       if (aborted()) {
+        log('warn', 'Request cancelled (non-stream, client gone)', {
+          path: '/v1/chat/completions',
+          model,
+          completionId,
+          phase: 'reading-upstream',
+          elapsedMs: Date.now() - startTime,
+          bytesReceived,
+          lastCcEvent: lastCcEvent || '(none)',
+        })
         return new Response(null, { status: 499 })
       }
       if (e?.message === 'STREAM_IDLE_TIMEOUT') {
@@ -314,6 +348,15 @@ export async function handleChatCompletionsBody(openaiReq: any, headers: Record<
     }
 
     if (aborted()) {
+      log('warn', 'Request cancelled (non-stream, client gone)', {
+        path: '/v1/chat/completions',
+        model,
+        completionId,
+        phase: 'after-upstream-drain',
+        elapsedMs: Date.now() - startTime,
+        bytesReceived,
+        lastCcEvent: lastCcEvent || '(none)',
+      })
       return new Response(null, { status: 499 })
     }
 
@@ -364,10 +407,18 @@ export async function handleChatCompletionsBody(openaiReq: any, headers: Record<
         path: '/v1/chat/completions',
         model,
         completionId,
+        phase: 'awaiting-cc-response',
+        elapsedMs: Date.now() - startTime,
       })
       return new Response(null, { status: 499 })
     }
-    log('error', 'Upstream error', { message: e?.message })
+    log('error', 'Upstream error', {
+      path: '/v1/chat/completions',
+      model,
+      completionId,
+      message: e?.message,
+      elapsedMs: Date.now() - startTime,
+    })
     try { abortController.abort() } catch {}
     return sendJSON(502, { error: { message: `Upstream error: ${e?.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 })
   }

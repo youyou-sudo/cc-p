@@ -1,4 +1,5 @@
 import { authErrorMessage, getApiKey } from '../../shared/auth'
+import { CFG } from '../../shared/config'
 import { buildCcRequest } from '../../infra/cc'
 import { normalizeUsage } from '../../shared/errors'
 import { SSE_HEADERS, readWithTimeout, sendAnthropicError, sendJSON } from '../../shared/http'
@@ -48,6 +49,15 @@ export async function handleMessages(request: Request, headers: Record<string, s
 export async function handleMessagesBody(anthropicReq: any, headers: Record<string, string | undefined>, signal?: AbortSignal): Promise<Response> {
   const apiKey = getApiKey(headers)
   if (!apiKey) {
+    // See the matching block in chat/handler.ts: records which credential was
+    // presented so a 401 storm is diagnosable.
+    log('warn', 'Authentication failed', {
+      path: '/v1/messages',
+      reason: authErrorMessage(headers),
+      hasAuthorization: !!headers['authorization'] || !!headers['Authorization'],
+      hasXApiKey: !!headers['x-api-key'] || !!headers['X-Api-Key'],
+      fallbackKeyConfigured: !!CFG.apiKey,
+    })
     return sendJSON(401, { type: 'error', error: { type: 'authentication_error', message: authErrorMessage(headers) } })
   }
 
@@ -137,6 +147,24 @@ export async function handleMessagesBody(anthropicReq: any, headers: Record<stri
               try { abortController.abort() } catch {}
             } else {
               pipeline.start()
+              // Mirrors chat's 'OpenAI stream finish' (chat/translator.ts) so
+              // both protocols log successful streams. Without this, a
+              // successful /v1/messages request left no trace at all and a
+              // "slow but working" report had nothing to compare against.
+              log('info', 'Anthropic stream finish', {
+                path: '/v1/messages',
+                model,
+                messageId,
+                streaming: true,
+                elapsedMs: Date.now() - startTime,
+                bytesReceived: ctx.bytesReceived,
+                lastCcEvent: ctx.lastCcEvent || '(none)',
+                inputTokens: ctx.inputTokens,
+                outputTokens: ctx.outputTokens,
+                cachedInputTokens: ctx.cachedInputTokens,
+                keepaliveCount: pipeline.keepaliveCount,
+                pingCount: pipeline.pingCount,
+              })
             }
           }
         } catch (e: any) {
@@ -190,7 +218,19 @@ export async function handleMessagesBody(anthropicReq: any, headers: Record<stri
         } finally {
           reader.cancel().catch(() => {})
           clearInterval(heartbeat)
-          pipeline.close()
+          const snap = pipeline.snapshot()
+          // See the identical block in chat/handler.ts: only log when a
+          // downstream write actually failed, so healthy streams stay quiet.
+          if (snap.enqueueErrorCount > 0 || snap.closeErrorCount > 0
+            || snap.heartbeatErrorCount > 0 || snap.clientCancelled) {
+            log('warn', 'SSE pipeline write failed (client likely gone)', {
+              path: '/v1/messages',
+              model,
+              messageId,
+              ...snap,
+            })
+          }
+          pipeline.close('pump-finished')
         }
       }
 
@@ -301,6 +341,15 @@ export async function handleMessagesBody(anthropicReq: any, headers: Record<stri
       aggregator.flush()
     } catch (e: any) {
       if (aborted()) {
+        log('warn', 'Request cancelled (non-stream, client gone)', {
+          path: '/v1/messages',
+          model,
+          messageId,
+          phase: 'reading-upstream',
+          elapsedMs: Date.now() - startTime,
+          bytesReceived,
+          lastCcEvent: aggregator.lastCcEvent || '(none)',
+        })
         return new Response(null, { status: 499 })
       }
       if (e?.message === 'STREAM_IDLE_TIMEOUT') {
@@ -345,6 +394,15 @@ export async function handleMessagesBody(anthropicReq: any, headers: Record<stri
     }
 
     if (aborted()) {
+      log('warn', 'Request cancelled (non-stream, client gone)', {
+        path: '/v1/messages',
+        model,
+        messageId,
+        phase: 'after-upstream-drain',
+        elapsedMs: Date.now() - startTime,
+        bytesReceived,
+        lastCcEvent: aggregator.lastCcEvent || '(none)',
+      })
       return new Response(null, { status: 499 })
     }
 
@@ -400,10 +458,12 @@ export async function handleMessagesBody(anthropicReq: any, headers: Record<stri
     return sendJSON(200, buildAnthropicResponse(model, agg.fullText, agg.toolCalls, agg.finishReason, usage, agg.thinkingText))
   } catch (e: any) {
     if (aborted() || abortController.signal.aborted) {
-      log('warn', 'Request cancelled (client disconnected before CC response)', {
+        log('warn', 'Request cancelled (client disconnected before CC response)', {
         path: '/v1/messages',
         model,
         messageId,
+        phase: 'awaiting-cc-response',
+        elapsedMs: Date.now() - startTime,
       })
       return new Response(null, { status: 499 })
     }
