@@ -1,33 +1,36 @@
-// Retry helpers: parse Retry-After, exponential backoff + jitter, abort-aware sleep.
+// Layer: domain（可依赖 kernel / toolkit，不可被 kernel 依赖）
+// Retry helpers: Retry-After parsing and capped exponential backoff with
+// jitter. Pure functions, no I/O — covered by test/unit.ts.
 
-export function parseRetryAfter(header: string | undefined | null): number | null {
-  if (!header) return null
-  const trimmed = header.trim()
-  if (/^\d+$/.test(trimmed)) {
-    const sec = Number(trimmed)
-    return Number.isFinite(sec) && sec >= 0 ? sec : null
+/** Parse a Retry-After header value into seconds. Accepts delta-seconds or an
+ *  HTTP-date; returns null when unparseable or non-positive. */
+export function parseRetryAfter(value: string | null | undefined): number | null {
+  if (value === null || value === undefined) return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  const secs = Number(trimmed)
+  if (Number.isFinite(secs)) {
+    return secs > 0 ? secs : null
   }
-  const d = new Date(trimmed)
-  if (!isNaN(d.getTime())) {
-    const diff = d.getTime() - Date.now()
-    return diff > 0 ? Math.ceil(diff / 1000) : 0
+  const when = Date.parse(trimmed)
+  if (Number.isFinite(when)) {
+    const delta = Math.ceil((when - Date.now()) / 1000)
+    return delta > 0 ? delta : null
   }
   return null
 }
 
-export function backoffDelay(attempt: number, baseMs: number, capMs: number, jitterRate: number = 0.25): number {
-  const factor = Math.pow(2, attempt)
-  const delay = Math.min(capMs, baseMs * factor)
-  const jitter = (Math.random() * 2 - 1) * jitterRate * delay
-  return Math.max(1, delay + jitter)
-}
-
-export function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const id = setTimeout(resolve, ms)
-    signal.addEventListener('abort', () => {
-      clearTimeout(id)
-      reject(new Error('ABORT_ERR'))
-    }, { once: true })
-  })
+/** Capped exponential backoff: base * 2^attempt plus uniform jitter in
+ *  [0, jitterMs]. Pass jitterMs=0 for deterministic tests. */
+export function backoffDelay(
+  attempt: number,
+  baseMs: number,
+  capMs: number,
+  jitterMs: number = baseMs * 0.25,
+): number {
+  const safeAttempt = Math.max(0, Math.floor(attempt))
+  const grown = baseMs * 2 ** safeAttempt
+  const capped = Math.min(grown, capMs)
+  if (jitterMs <= 0) return capped
+  return capped + Math.random() * jitterMs
 }

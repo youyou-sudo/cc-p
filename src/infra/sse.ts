@@ -4,18 +4,43 @@
 // idle-heartbeat timer. Protocol-specific translation (e.g. the OpenAI
 // `chat.completion.chunk` translator) lives with its protocol module in
 // `src/modules/chat/translator.ts`.
+//
+// ── 双语义说明（一类两语义，策略参数显式命名） ──────────────────────────
+// 同一个 SsePipeline 服务两路协议，但心跳帧语义不同，由调用方通过
+// startSseHeartbeat(opts.pingEvent) 显式选择：
+//   - OpenAI (/v1/chat/completions): SSE 注释帧 `: keepalive`（SSE_KEEPALIVE_COMMENT）。
+//     纯 OpenAI SDK 只解析 `data:` 行，`{"type":"ping"}` 会被误解析为 chunk，
+//     所以必须用 spec-safe 的 SSE comment 心跳。
+//   - Anthropic (/v1/messages): 原生 `event: ping` 事件（SSE_PING_EVENT）。
+//     Anthropic SDK 要求保留该事件。
+// autoStart 语义（构造函数参数）：
+//   - true (chat): 任意 emit() 到来即 start()（立即刷响应头，首帧即 200）。
+//   - false (messages): 仅当 content_block_* 到来才 start()，`message_start` 及
+//     后续空响应的 `error` 事件保持 buffered，以保留零输出转 429 JSON 的能力；
+//     空响应 `error` 事件绝不能触发 start()（否则流会翻转为 SSE 200）。
+
+import { log } from '../shared/logger'
 
 export const SSE_HEARTBEAT_INTERVAL_MS = 5_000
 export const SSE_HEARTBEAT_IDLE_MS = 15_000
 export const SSE_PING_EVENT = `event: ping\ndata: {"type":"ping"}\n\n`
 export const SSE_KEEPALIVE_COMMENT = `: keepalive\n\n`
 
+/** buffered 熔断上限：条数与近似字节数（Bun ReadableStream 无可靠
+ *  desiredSize，超时空转时上游仍在推事件，用 buffered 长度熔断避免无限涨）。 */
+export const SSE_MAX_BUFFERED_EVENTS = 1000
+export const SSE_MAX_BUFFERED_BYTES = 1_000_000
+
 export class SsePipeline {
   private encoder = new TextEncoder()
   private controller: ReadableStreamDefaultController<Uint8Array> | null = null
   private buffered: string[] = []
+  private bufferedBytes = 0
   private firstOutputResolve: (() => void) | null = null
   private terminalResolve: (() => void) | null = null
+  /** 由 handler 经 attachReader() 登记的上游 reader；cancel() 负责取消它
+   *  （停止上游 fetch / 计费），与 close()（关闭下游流）语义分离。 */
+  private upstreamReader: { cancel: () => unknown } | null = null
 
   readonly stream: ReadableStream<Uint8Array>
   readonly firstOutput: Promise<void>
@@ -24,61 +49,36 @@ export class SsePipeline {
   closed = false
   keepaliveCount = 0
   pingCount = 0
-  /** Frames the downstream controller rejected (client already gone). */
-  enqueueErrorCount = 0
-  /** Frames successfully handed to the client. */
-  emittedCount = 0
-  /** Why close() was called, for the terminal log. */
-  closeReason: string | null = null
   lastSentAt = Date.now()
+  /** 成功投递给客户端的帧数。 */
+  emittedCount = 0
+  /** 未能投递给客户端的帧数：下游已断开时 controller.enqueue 抛错。 */
+  enqueueErrorCount = 0
+  /** keepalive/ping 写入失败次数（心跳写进死 socket 是客户端断开的次级信号）。 */
+  heartbeatErrorCount = 0
+  heartbeatErrorLast: string | null = null
+  closeErrorCount = 0
+  /** 客户端在流中途断开（Bun 取消 response body）时为 true。 */
+  clientCancelled = false
+  clientCancelReason: string | null = null
+  closeReason: string | null = null
 
   constructor(private readonly autoStart: boolean) {
     this.firstOutput = new Promise((r) => { this.firstOutputResolve = r })
     this.terminal = new Promise((r) => { this.terminalResolve = r })
     this.stream = new ReadableStream({
       start: (controller) => { this.controller = controller },
-      // Fires when the CLIENT goes away mid-stream (Bun cancels the response
-      // body). Previously unobserved: the pump loop would keep running until
-      // the upstream read timed out, so a disconnect looked like an upstream
-      // stall in the logs. Recorded so the terminal log can say which it was.
+      // 客户端中途离开时 Bun 会取消 response body。之前无人观察：pump 会一直
+      // 跑到上游读超时，于是一次断连在日志里看起来像上游卡死。记录下来，
+      // terminal 日志才能区分「客户端走了」和「客户端慢」。
       cancel: (reason) => {
         this.clientCancelled = true
         this.clientCancelReason = String(reason ?? '(none)')
       },
     })
-    this.clientCancelled = false
-    this.clientCancelReason = null
   }
 
-  /**
-   * Write one SSE frame.
-   *
-   * `enqueueErrorCount` tracks frames we could NOT hand to the client. That
-   * happens exactly when the downstream connection is already gone: the
-   * ReadableStream controller throws. This used to be a bare `catch {}`, which
-   * hid the single most diagnostic signal of a client-side disconnect — the
-   * heartbeat would keep counting keepaliveCount/pingCount as it wrote into a
-   * dead socket, and nothing in the log revealed it. Now the count is surfaced
-   * in the handler's terminal log (see `snapshot()`), so "the client vanished
-   * mid-stream" is distinguishable from "the client was slow".
-   */
-  private enqueue(text: string): void {
-    try {
-      this.controller?.enqueue(this.encoder.encode(text))
-      this.lastSentAt = Date.now()
-      this.emittedCount++
-    } catch {
-      this.enqueueErrorCount++
-    }
-  }
-
-  clientCancelled = false
-  clientCancelReason: string | null = null
-  closeErrorCount = 0
-  heartbeatErrorCount = 0
-  heartbeatErrorLast: string | null = null
-
-  /** Counters for the terminal log line. */
+  /** 计数器快照，供 terminal 日志使用。 */
   snapshot(): {
     keepaliveCount: number
     pingCount: number
@@ -103,11 +103,64 @@ export class SsePipeline {
     }
   }
 
+  /** 登记上游 reader，供 cancel() 调用。Handler 在 pump 内 getReader() 后应立即登记。 */
+  attachReader(reader: { cancel: () => unknown } | null): void {
+    this.upstreamReader = reader
+  }
+
+  /** 取消上游拉取（abort/超时/finally 统一路径调用）。幂等，可重复调用。 */
+  cancel(): void {
+    const r = this.upstreamReader
+    this.upstreamReader = null
+    if (!r) return
+    try {
+      const res = r.cancel() as unknown
+      if (res instanceof Promise) res.catch(() => {})
+    } catch {}
+  }
+
+  private enqueue(text: string): void {
+    if (this.closed) return
+    try {
+      this.controller?.enqueue(this.encoder.encode(text))
+      this.lastSentAt = Date.now()
+      this.emittedCount++
+    } catch (e: any) {
+      // 背压/下游已断开：队列满抛错时直接关闭，避免异常上浮杀死 pump；
+      // buffered 已在 close() 中清空，不会无限涨。
+      // enqueueErrorCount 计入终端日志：心跳会继续往死 socket 里写 keepalive，
+      // 没有这个计数就看不出「客户端已经走了」。
+      this.enqueueErrorCount++
+      log('warn', 'SSE enqueue failed, closing pipeline', { message: e?.message ?? String(e) })
+      try { this.close() } catch {}
+    }
+  }
+
+  /** buffered 入队（含 1000 条 / 1MB 熔断：超限丢最旧并记 warn）。 */
+  private pushBuffered(event: string): void {
+    const len = event.length
+    if (this.buffered.length >= SSE_MAX_BUFFERED_EVENTS || this.bufferedBytes + len > SSE_MAX_BUFFERED_BYTES) {
+      let dropped = 0
+      while (this.buffered.length > 0 && (this.buffered.length >= SSE_MAX_BUFFERED_EVENTS || this.bufferedBytes + len > SSE_MAX_BUFFERED_BYTES)) {
+        const old = this.buffered.shift()!
+        this.bufferedBytes -= old.length
+        dropped++
+      }
+      log('warn', 'SSE buffered cap hit, dropped oldest', {
+        dropped,
+        bufferedEvents: this.buffered.length,
+        autoStart: this.autoStart,
+      })
+    }
+    this.buffered.push(event)
+    this.bufferedBytes += len
+  }
+
   emit(events: string[]): void {
-    if (!events.length) return
+    if (this.closed || !events.length) return
     for (const event of events) {
       if (this.started) this.enqueue(event)
-      else this.buffered.push(event)
+      else this.pushBuffered(event)
     }
     if (this.autoStart) this.start()
   }
@@ -119,12 +172,12 @@ export class SsePipeline {
    *  "first non-message_start flushes" — narrowed here to content blocks so
    *  an empty-response `error` event can't flip the stream to SSE 200. */
   emitAnthropic(events: string[]): void {
-    if (!events.length) return
+    if (this.closed || !events.length) return
     for (const event of events) {
       if (this.started) {
         this.enqueue(event)
       } else {
-        this.buffered.push(event)
+        this.pushBuffered(event)
         if (event.startsWith('event: content_block_')) this.start()
       }
     }
@@ -132,8 +185,10 @@ export class SsePipeline {
 
   emitKeepalive(): void {
     if (!this.started || this.closed) return
-    this.enqueue(SSE_KEEPALIVE_COMMENT)
     this.keepaliveCount++
+    const before = this.enqueueErrorCount
+    this.enqueue(SSE_KEEPALIVE_COMMENT)
+    if (this.enqueueErrorCount > before) this.heartbeatErrorCount++
   }
 
   /** Idle heartbeat ping. Defaults to the Anthropic-native `ping` event
@@ -143,8 +198,13 @@ export class SsePipeline {
    *  `{"type":"ping"}` as a chunk. */
   sendPing(event: string = SSE_PING_EVENT): void {
     if (!this.started || this.closed) return
-    this.enqueue(event)
     this.pingCount++
+    const before = this.enqueueErrorCount
+    this.enqueue(event)
+    if (this.enqueueErrorCount > before) {
+      this.heartbeatErrorCount++
+      this.heartbeatErrorLast = `ping #${this.pingCount} failed`
+    }
   }
 
   writeNow(event: string): void {
@@ -156,44 +216,38 @@ export class SsePipeline {
     this.started = true
     for (const event of this.buffered) this.enqueue(event)
     this.buffered = []
+    this.bufferedBytes = 0
     this.firstOutputResolve?.()
   }
 
+  /** `reason` 仅用于诊断：记录这条流为什么结束（正常 / client-abort /
+   *  上游出错…）。第一次调用生效，后续 close() 不会覆盖 —— 客户端断连后 pump
+   *  还会再调一次 close('pump-finished')，若让后者赢，一次断连就会被记成正常结束。 */
   close(reason?: string): void {
     if (this.closed) return
     this.closed = true
-    this.closeReason = reason ?? 'normal'
+    if (reason) this.closeReason = reason
+    // 静默关闭：清空 buffered 并只 resolve terminal，不碰 firstOutput。
+    // 刻意让「未 start 即 close」（流前 abort）的 race 落到 terminal 分支，
+    // 若此处也 resolve firstOutput，race 会误判为 started（已返回 200）。
+    this.buffered = []
+    this.bufferedBytes = 0
     try {
       this.controller?.close()
     } catch {
-      // Closing a stream the client already abandoned throws. That is a
-      // disconnect, not a bug, but it must be visible: the handler logs
-      // `enqueueErrorCount`/`clientCancelled` and this is the matching signal
-      // that the failure happened at close rather than during a write.
+      // 不覆盖 closeReason：调用方给的 reason 才是「为什么结束」的答案，
+      // close() 自身的异常只是附加信息（并入计数）。
       this.closeErrorCount++
     }
     this.terminalResolve?.()
-  }
-
-  /** Flush trailing events and close. Both call sites are client-abort paths
-   *  (chat and messages `onClientAbort`), so the reason is fixed rather than
-   *  left to close()'s 'normal' default — otherwise a disconnect was recorded
-   *  as a normal close, which is the opposite of what it is. */
-  terminateWith(events: string[], reason: string = 'client-abort'): void {
-    if (this.closed) return
-    this.started = true
-    for (const event of this.buffered) this.enqueue(event)
-    this.buffered = []
-    for (const event of events) this.enqueue(event)
-    this.firstOutputResolve?.()
-    this.close(reason)
   }
 }
 
 /** Shared idle-heartbeat: every `intervalMs`, if the pipeline has been
  *  silent for `idleMs`, send an SSE ping. Caller clears the timer in
  *  `finally` (both handlers do). Pings only go out after headers started;
- *  while fully buffered, zero-output retry-ability is preserved. */
+ *  while fully buffered, zero-output retry-ability is preserved.
+ *  定时器已 unref：纯保活计时器不得拖住进程退出。 */
 export function startSseHeartbeat(
   pipeline: SsePipeline,
   opts?: { intervalMs?: number; idleMs?: number; pingEvent?: string },
@@ -201,17 +255,13 @@ export function startSseHeartbeat(
   const intervalMs = opts?.intervalMs ?? SSE_HEARTBEAT_INTERVAL_MS
   const idleMs = opts?.idleMs ?? SSE_HEARTBEAT_IDLE_MS
   const pingEvent = opts?.pingEvent ?? SSE_PING_EVENT
-  return setInterval(() => {
+  const timer = setInterval(() => {
     try {
       if (pipeline.closed) return
       if (!pipeline.started) return
       if (Date.now() - pipeline.lastSentAt > idleMs) pipeline.sendPing(pingEvent)
-    } catch (e: any) {
-      // Previously silent. A throwing heartbeat means the interval is writing
-      // into a dead pipeline, which is exactly the "sudden disconnect" shape;
-      // count it and let the handler's terminal log report it.
-      pipeline.heartbeatErrorCount++
-      pipeline.heartbeatErrorLast = e?.message ?? String(e)
-    }
+    } catch {}
   }, intervalMs)
+  try { (timer as unknown as { unref?: () => void }).unref?.() } catch {}
+  return timer
 }

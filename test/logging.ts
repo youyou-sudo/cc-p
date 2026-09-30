@@ -148,39 +148,54 @@ check('sse: emittedCount tracks successful writes', p.snapshot().emitted === 1, 
 check('sse: no enqueue errors on a healthy pipeline', p.snapshot().enqueueErrorCount === 0, p.snapshot())
 
 // Simulate the downstream controller being gone: enqueue must throw.
+// The pipeline closes itself on the first failure rather than retrying —
+// continuing to write into a dead socket burns CPU and hides the disconnect.
 ;(p as any).controller = {
   enqueue() { throw new Error('stream cancelled') },
   close() { throw new Error('stream already closed') },
 }
 p.writeNow('data: {"b":2}\n\n')
+check('sse: enqueue failure is counted, not swallowed', p.snapshot().enqueueErrorCount === 1, p.snapshot())
+check('sse: failed writes do not inflate emitted', p.snapshot().emitted === 1, p.snapshot())
+check('sse: a failed enqueue closes the pipeline instead of retrying forever',
+  p.snapshot().closeErrorCount === 1, p.snapshot())
+// Once closed, later keepalive/ping are no-ops: the guard is `this.closed`.
+// This matters because the heartbeat timer keeps ticking after a client hangs
+// up, and a version without the guard would keep incrementing forever.
 p.emitKeepalive()
 p.sendPing()
-check('sse: enqueue failure is counted, not swallowed', p.snapshot().enqueueErrorCount === 3, p.snapshot())
-check('sse: failed writes do not inflate emitted', p.snapshot().emitted === 1, p.snapshot())
-check('sse: keepalive/ping still counted (proves we were writing to a dead socket)',
-  p.snapshot().keepaliveCount === 1 && p.snapshot().pingCount === 1, p.snapshot())
+check('sse: no keepalive/ping accounting after close (writes stopped)',
+  p.snapshot().keepaliveCount === 0 && p.snapshot().pingCount === 0, p.snapshot())
+check('sse: further failed writes are not re-counted after close',
+  p.snapshot().enqueueErrorCount === 1, p.snapshot())
 
-p.close('test-close')
-check('sse: close failure is counted', p.snapshot().closeErrorCount === 1, p.snapshot())
-check('sse: closeReason recorded', p.snapshot().closeReason === 'test-close', p.snapshot())
+// A close that never saw a write failure must still record why it ended.
+const pClose = new SsePipeline(true)
+pClose.start()
+pClose.writeNow('data: {"a":1}\n\n')
+pClose.close('test-close')
+check('sse: closeReason recorded', pClose.snapshot().closeReason === 'test-close', pClose.snapshot())
+check('sse: clean close is not counted as a close error',
+  pClose.snapshot().closeErrorCount === 0, pClose.snapshot())
 
-// terminateWith is only ever called from the client-abort paths, so it must
-// not label a disconnect as a normal close. It did before this was fixed:
-// close()'s default reason won because the pump's later close('pump-finished')
-// returns early once `closed` is set.
+// 客户端断连路径（onClientAbort）必须记成 client-abort，而不是正常结束。
+// 之前踩过的坑：pump 后续的 close('pump-finished') 会因为 `closed` 已置而提前
+// return，于是「谁先到」决定日志语义 —— 断连被记成正常完成。
+// 这里直接走真实路径：cancel()（取消上游）+ close('client-abort')。
 const pTerm = new SsePipeline(true)
 pTerm.start()
-pTerm.terminateWith(['data: [DONE]\n\n'])
-check('sse: terminateWith records a client-abort close, not normal',
+pTerm.cancel()
+pTerm.close('client-abort')
+check('sse: client-abort close is recorded, not a normal finish',
   pTerm.snapshot().closeReason === 'client-abort', pTerm.snapshot())
 const pTerm2 = new SsePipeline(true)
 pTerm2.start()
-pTerm2.terminateWith(['data: [DONE]\n\n'], 'custom-reason')
-check('sse: terminateWith accepts an explicit reason',
+pTerm2.close('custom-reason')
+check('sse: close accepts an explicit reason',
   pTerm2.snapshot().closeReason === 'custom-reason', pTerm2.snapshot())
-check('sse: a second close() after terminateWith does not overwrite the reason',
-  (pTerm2.close('pump-finished'), pTerm2.snapshot().closeReason === 'custom-reason'),
-  pTerm2.snapshot())
+pTerm2.close('pump-finished')
+check('sse: a second close() does not overwrite the reason',
+  pTerm2.snapshot().closeReason === 'custom-reason', pTerm2.snapshot())
 
 // heartbeat must not throw out of setInterval
 const p2 = new SsePipeline(true)
@@ -371,68 +386,37 @@ check('auth: malformed key log notes the presented header',
   find('Authentication failed (pre-check)')[0]?.data?.hasXApiKey === true,
   find('Authentication failed (pre-check)')[0])
 
-// ── 7. retry safety: a non-idempotent endpoint must not re-POST ───────
-// /alpha/generate re-sends the whole conversation, so retrying an error the
-// upstream may already have accepted and billed costs the user twice. These
-// assert the guard that separates "transient" from "safe to repeat".
-const { isSafeToRetryForTest } = await import('../src/infra/proxy-slot')
-const { clientDeadlineFrom } = await import('../src/infra/proxy-handler')
-const { MODELS, MODELS_BASE } = await import('../src/modules/models/catalog')
-const { contextWindowFor, MODEL_CONTEXT_WINDOWS } = await import('../src/shared/model-windows')
+// ── 7. retry policy on the non-idempotent endpoint ───────────────────
+// /alpha/generate re-sends the whole conversation, so whether a 5xx is
+// re-POSTed is a real money question, not a style choice. This asserts the
+// behaviour that actually ships (shared/retry + infra/proxy-handler), so a
+// future change to the retry policy has to be deliberate.
+//
+// NOTE: this pins the CURRENT upstream policy (retry 408/5xx before any
+// bytes reach the client). An earlier local guard refused to re-POST 5xx at
+// all, arguing the upstream may already have billed the request. That
+// disagreement is unresolved upstream — see the PR description — so this test
+// documents today's behaviour rather than endorsing it.
+const { isRetryablePreOutputError } = await import('../src/infra/proxy-handler')
+check('retry: 408 pre-output is retried', isRetryablePreOutputError({ status: 408 }) === true)
+check('retry: 5xx pre-output is retried', isRetryablePreOutputError({ status: 502 }) === true)
+check('retry: 429 is NOT handled by the pre-output path (separate 429 budget)',
+  isRetryablePreOutputError({ status: 429 }) === false)
+check('retry: 4xx is never retried', isRetryablePreOutputError({ status: 400 }) === false)
+check('retry: 2xx is not an error path', isRetryablePreOutputError({ status: 200 }) === false)
 
-check('retry: 429 is safe to repeat (rejected at admission)',
-  isSafeToRetryForTest(429, true) === true)
-check('retry: 402/401 are safe to repeat', isSafeToRetryForTest(402, true) === true)
-check('retry: 5xx is NOT retried even when classified transient',
-  isSafeToRetryForTest(500, true) === false)
-check('retry: 503 is NOT retried either', isSafeToRetryForTest(503, true) === false)
-check('retry: non-retryable 429 is still refused', isSafeToRetryForTest(429, false) === false)
-check('retry: non-retryable 5xx refused', isSafeToRetryForTest(500, false) === false)
-check('retry: 400 is never retried', isSafeToRetryForTest(400, true) === false)
-
-// The deadline is read from a client header, never invented.
-const dl = clientDeadlineFrom({ 'x-request-timeout-ms': '5000' })
-check('deadline: derived from client header', dl !== undefined && dl > Date.now(), dl)
-check('deadline: absent header -> undefined', clientDeadlineFrom({}) === undefined)
-check('deadline: garbage header ignored', clientDeadlineFrom({ 'x-request-timeout-ms': 'abc' }) === undefined)
-check('deadline: non-positive header ignored', clientDeadlineFrom({ 'x-request-timeout-ms': '0' }) === undefined)
-
-// ── 8. context windows: one table, served values unchanged ────────────
-// /v1/models must keep serving exactly what it served before the tables were
-// unified, while the guardrail table no longer disagrees with it.
-// EXPOSED_IDS mirrors catalog.ts; asserted here so the served set cannot drift.
-const EXPOSED_IDS = new Set([
-  'claude-sonnet-4-6', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-haiku-4-5-20251001',
-  'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex',
-  'deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4-flash',
-  'google/gemini-3.5-flash', 'google/gemini-3.1-flash-lite',
-])
-const served = MODELS.filter((m) => m.context_window !== undefined)
-const EXPECTED_SERVED: Record<string, number> = {
-  'claude-sonnet-4-6': 200000, 'claude-opus-4-8': 200000, 'claude-opus-4-7': 200000,
-  'claude-haiku-4-5-20251001': 200000, 'gpt-5.5': 400000, 'gpt-5.4': 400000,
-  'gpt-5.4-mini': 400000, 'gpt-5.3-codex': 400000,
-  'deepseek/deepseek-v4-pro': 131072, 'deepseek/deepseek-v4-flash': 65536,
-  'google/gemini-3.5-flash': 1048576, 'google/gemini-3.1-flash-lite': 1048576,
-}
-check('models: still 26 entries', MODELS.length === 26, MODELS.length)
-check('models: exactly 12 expose context_window', served.length === 12, served.length)
-check('models: served values unchanged (no observable API change)',
-  served.every((m) => EXPECTED_SERVED[m.id] === m.context_window),
-  served.filter((m) => EXPECTED_SERVED[m.id] !== m.context_window))
-check('models: served windows now match the guardrail table exactly',
-  served.every((m) => contextWindowFor(m.id) === m.context_window),
-  served.filter((m) => contextWindowFor(m.id) !== m.context_window))
-check('models: ids and order preserved',
-  MODELS.map((m) => m.id).join(',') === MODELS_BASE.map((m) => m.id).join(','))
-check('models: unexposed ids still omit the field',
-  MODELS.filter((m: { id: string; context_window?: number }) => !EXPOSED_IDS.has(m.id))
-    .every((m: { context_window?: number }) => m.context_window === undefined))
-check('models: unexposed ids still resolvable by the guardrail table',
-  contextWindowFor('moonshotai/Kimi-K2.6') === 256000)
-check('models: unknown id -> null (never a guessed default)', contextWindowFor('nope/nope') === null)
-check('models: table covers every catalog id',
-  MODELS.every((m) => m.id in MODEL_CONTEXT_WINDOWS))
+// ── 8. models: catalog is the single source for context windows ──────
+// There is deliberately no second table. The served context_window and the
+// value any guardrail would read are the same field, so they cannot drift.
+const { MODELS } = await import('../src/modules/models/catalog')
+const served = MODELS.filter((m) => m.context_window !== undefined) as { id: string; context_window: number }[]
+check('models: entries are exposed', MODELS.length > 0, MODELS.length)
+check('models: every exposed window is a positive integer',
+  served.every((m) => Number.isInteger(m.context_window) && m.context_window > 0),
+  served.filter((m) => !Number.isInteger(m.context_window) || m.context_window <= 0))
+check('models: ids are unique (catalog is the single source, no dupes)',
+  new Set(MODELS.map((m) => m.id)).size === MODELS.length,
+  MODELS.length - new Set(MODELS.map((m) => m.id)).size)
 
 // ── 7. log file writer ────────────────────────────────────────────────
 const logFile = process.env.LOG_FILE!

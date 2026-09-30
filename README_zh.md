@@ -2,7 +2,7 @@
 
 > [English](README.md)
 
-把 Command Code API 暴露为 **OpenAI Chat Completions** 与 **Anthropic Messages** 兼容接口的反向代理。
+把 Command Code API 暴露为 **OpenAI Chat Completions**、**OpenAI Responses** 与 **Anthropic Messages** 兼容接口的反向代理。
 
 通过观察官方 CLI 流量，忠实复刻上游协议——设备指纹、生命周期事件、会话头、版本号与链路追踪。
 
@@ -10,11 +10,12 @@
 
 ## 功能
 
-- **双协议**：`POST /v1/chat/completions`（OpenAI）+ `POST /v1/messages`（Anthropic）
+- **三协议**：`POST /v1/chat/completions`（OpenAI）+ `POST /v1/responses`（OpenAI Responses）+ `POST /v1/messages`（Anthropic）
 - **流式 / 非流式**、工具调用、多模态图片、`reasoning_effort` / `thinking`
 - **动态模型**：`GET /v1/models` 从 Provider API 获取（5 分钟缓存），失败回退内置列表
-- **CLI 仿真**：按 Key 的设备指纹（8h + 2h 抖动）、`cli_session_exists` 生命周期事件、按 Key 会话（12h + 1h 抖动）、`x-command-code-version` 取自 npm（每天刷新）、`traceparent`、`x-project-slug`
-- **容错**：零输出 → 可重试 `429`，空闲超时（流式 30s / 非流式 90s，可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变；思考期 `start`/`start-step`/`reasoning-start`/`reasoning-delta` 走 120s 宽限 `CC_THINKING_IDLE_MS`）→ `429`，断连立刻中止上游
+- **账户余额**：`GET /v1/dashboard/billing/credit_grants` 返回 OpenAI `credit_summary` 格式的月度额度
+- **CLI 仿真**：按 Key 的设备指纹（8h + 2h 抖动，官方 `thumbmark` 公式）、生命周期事件（`cli_installed` / `cli_session_exists` / `cli_first_message`）、按 Key 会话 `sess_<16hex>`（12h + 1h 抖动）及派生的 `threadId`、`User-Agent: cli`、`x-command-code-version` 取自 npm（每天刷新）、`traceparent`、`x-project-slug`
+- **容错**：零输出 → 可重试 `429`，空闲超时（流式 30s / 非流式 90s，可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变；思考期 `start`/`start-step`/`reasoning-start`/`reasoning-delta` 走 120s 宽限 `CC_THINKING_IDLE_MS`）→ `429`，断连立刻中止上游。Bun 传输层空闲上限已关闭（`idleTimeout: 0`，覆盖 Elysia 写死的 30s），上述预算为唯一权威。
 - **认证灵活**：按请求的 `Bearer user_*` / `x-api-key`，自托管可选 `CC_API_KEY` 兜底
 - **开箱可运维**：`GET /health`、`server healthcheck` CLI、Docker HEALTHCHECK、隐私日志（不记 Key、包体与堆栈）
 
@@ -79,6 +80,15 @@ msg = client.messages.create(
 )
 ```
 
+```python
+# OpenAI SDK（Responses API）
+resp = client.responses.create(
+    model="deepseek/deepseek-v4-flash",
+    input="hi",
+    stream=True,
+)
+```
+
 任何 OpenAI 兼容客户端（Claude Code、Cline、Roo、NextChat 等）只要把 `base_url`
 指向 `/v1` 并使用 `user_*` Key 即可。
 
@@ -89,7 +99,9 @@ msg = client.messages.create(
 | `GET` | `/` | `OK`（纯文本） |
 | `GET` | `/health` | `{"ok":true}` |
 | `GET` | `/v1/models` | OpenAI 风格模型列表 |
+| `GET` | `/v1/dashboard/billing/credit_grants` | 账户余额（OpenAI `credit_summary`） |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
+| `POST` | `/v1/responses` | OpenAI Responses |
 | `POST` | `/v1/messages` | Anthropic Messages |
 
 ### `POST /v1/chat/completions`
@@ -109,18 +121,49 @@ Anthropic 结构，自动转换：
 | `user` 块中的 `tool_result` | → `role: "tool"` 消息 |
 | `tools[].input_schema` | → `parameters` |
 | `tool_choice: auto / any / tool / none` | → `auto / required / {function} / none` |
-| `thinking.budget_tokens` | → `reasoning_effort`（≥10000 high，≥5000 medium，≥2000 low） |
+| `thinking.budget_tokens` | → `reasoning_effort`（≥50000 max，≥25000 xhigh，≥10000 high，≥5000 medium，否则 low） |
 | `thinking.type: adaptive` | → `reasoning_effort: effort` |
 | CC `finishReason` | → `end_turn / max_tokens / tool_use` |
 
 流式输出 `message_start / content_block_* / message_delta / message_stop`；
-`thinking` 块会带一个合成 `signature`，满足严格 SDK 的校验。
+`thinking` 块带官方同款空 `signature`（字段必须存在，内容上游不校验）。
+
+### `POST /v1/responses`
+
+OpenAI Responses 结构，自动转换：
+
+| Responses | 处理 |
+|-----------|------|
+| `instructions` | → OpenAI `system` 消息 |
+| `input`（字符串 / items） | → `messages`；`input_text` / `input_image` / `output_text` 分片透传 |
+| `input[].type: function_call` | → assistant `tool_calls` |
+| `input[].type: function_call_output` | → `role: "tool"` 消息 |
+| `tools[].{name,parameters,strict}`（扁平） | → 嵌套 `{type:"function",function:{…}}` |
+| `tool_choice: auto / none / required / {function}` | → `auto / none / required / {function}` |
+| `reasoning.effort` | → `reasoning_effort` |
+| `max_output_tokens` | → `max_tokens` |
+| `metadata.user_id` | → `user` |
+| `store` / `previous_response_id` / `include` / `truncation` / `text` | 忽略（无状态代理，记 debug 日志） |
+
+流式输出 `response.created / response.in_progress / response.output_item.added /
+response.output_text.delta / response.function_call_arguments.delta / … / response.completed`
+（无 `[DONE]`，SDK 以 `response.completed` 终止）。推理内容以
+`{type:"reasoning",summary:[…]}` item + `response.reasoning_summary_text.delta` 事件下发。
+`finishReason: length` 映射为 `status: "incomplete"` + `incomplete_details.reason: "max_output_tokens"`。
+内置工具（web_search/file_search 等）在 CC 侧无对应实现，丢弃并记 warn。
 
 ### `GET /v1/models`
 
 用你的 Key 请求 `GET {CC_API_BASE}/provider/v1/models`（10s 超时），按
 `CC_MODEL_REFRESH_INTERVAL_MS` 缓存。任何失败都回退到 `src/modules/models/catalog.ts` 内置列表。
 `CC_USE_PROVIDER_MODELS=false` 则始终用内置列表。
+
+### `GET /v1/dashboard/billing/credit_grants`
+
+用你的 Key 请求 `GET {CC_API_BASE}/alpha/billing/credits`（10s 超时），把 CC 的月度额度
+映射成 OpenAI `credit_summary`：`total_granted` = 本月授予总额，`total_used` = 已用，
+`total_available` = 剩余 + 另购额度（`purchasedCredits`），并附单条 `grants.data[]`。
+无 Key → OpenAI 形 `401`；上游失败 → `502 api_error`（绝不伪造余额）。
 
 ## 配置
 
@@ -145,6 +188,7 @@ Bun 启动时自动加载 `.env`。空值 = 沿用 `config.json`；真实 shell 
 | `CC_STREAM_IDLE_MS` | ——（仅环境变量） | `30000` |
 | `CC_NONSTREAM_IDLE_MS` | ——（仅环境变量） | `90000` |
 | `CC_THINKING_IDLE_MS` | ——（仅环境变量） | `120000`（思考期宽限：`start`/`start-step`/`reasoning-start`/`reasoning-delta`；深度推理/高 `reasoning_effort` 建议 `180000`；调大代价是真 hang 时失败感知更慢） |
+| `CC_FORWARD_SAMPLING_PARAMS` | ——（仅环境变量） | `false`（忠实复刻 CLI 线格式：`top_p` / `stop` / `user` / `seed` 仍接受但不外发，因为官方 CLI 从不发送；设 `true` 恢复透传。工具协议字段 `tool_choice` / `parallel_tool_calls` 始终转发——丢弃会静默改变工具调用行为） |
 
 > **默认值说明：** 源码运行（`bun start`）、Docker 镜像、Release 二进制共用同一套
 > 内置默认值——`3050` / `0.0.0.0`，与入库的 `config.json` 一致。`PORT` / `HOST`
@@ -186,11 +230,17 @@ CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64
 | `429` | 零输出（`retry_after: 10`）、空闲超时（`retry_after: 5`） | SDK 按 `Retry-After` 自动重试；连续 3 次超时后提示压缩上下文 |
 | `502/503` | CC 上游错误（由 CC 状态/事件映射） | 重试 / 退避 |
 
-上游映射（`src/shared/errors.ts`）：CC `402/429` → `429`，`401/403` → `401`，
+上游映射（`src/shared/errors.ts`）：CC 真限流 `429` → `429`（仅上游带 `Retry-After` 才带 `retry_after`）；`402` → `402` 无 `retry_after`；usage_window/payment/auth/context 类不带 `retry_after`、不可重试；`401/403` → `401`/`403`，
 `400/422` → `400`，`500/502` → `502`，`503` → `503`。CC 的 `tool-calls`
 在流式与非流式路径统一归一化为 OpenAI `tool_calls` / Anthropic `tool_use`。
 
 客户端断开（`request.signal`）会立刻 abort 上游 `fetch`，未完成的流直接关闭，不泄漏连接。
+
+重试集合与官方 CLI 对齐（`408` / `429` / `5xx`）：真 429 走 HTTP 重试循环；
+**输出前流错误**——上游网关故障以 HTTP 200 流的首个 NDJSON 事件出现
+（如 `Gateway request failed`）——在客户端收到任何字节前重发。
+业务终局类（usage window / payment / model-not-in-plan / auth / context overflow）
+一律不重试。`CC_RETRY_MAX`（默认 `3`）限定上游总尝试次数。
 
 ## 长会话 / 上下文管理（Context）
 
@@ -233,7 +283,7 @@ CC_API_KEY=user_xxxxxxxxx ./cc-p-linux-x64
 | `429` `Empty response` / 零输出，`retry_after: 10` | 上游零输出 token（zero-output） | 可退避重试一次；反复出现则压缩上下文、简化上一轮。 |
 | `429` 空闲超时，`retry_after: 5` | 上游 30s（流式）/ 90s（非流式）无字节（可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变）；**思考期**（`lastCcEvent` 为 `start`/`start-step`/`reasoning-start`/`reasoning-delta`）走 120s 宽限（`CC_THINKING_IDLE_MS`）；按 Key 记连续超时，≥3 次后消息提示压缩上下文——**即使当前请求很小（空闲≠上下文大）** | 别无脑压缩：先看是哪个 `429`（见下）。`retry_after: 5` 优先怀疑上游慢 / 并发 fan-out / 超大 `tool_result` / 推理停顿；拆任务、截断 tool 结果、降并发。日志若为 `thinkingPhase=true` + `lastCcEvent=reasoning-start` + `elapsedMs≈timeoutMs`，应调大 `CC_THINKING_IDLE_MS`（见下“思考时报错”）。 |
 | `429` 思考超时，`retry_after: 5` + `thinkingPhase=true` | `reasoning-start` 后 30s+ 上游零字节：旧逻辑下 `readWithTimeout` 在 30s 误杀（120s 思考宽限之前）。与上下文大小无关——流式超时 `inputTokens` 恒为 `0`，不能判大小。自证三件套：`lastCcEvent=reasoning-start`/`start` 无 delta + `bytesReceived` 几十字节 + `elapsedMs` 顶格阈值。Opencode 包装为 `failed to send message`。 | 别压缩上下文。调大 `CC_THINKING_IDLE_MS`（深度推理如 `180000`），或拆任务/降 `reasoning_effort`。真 hang 代价：失败感知延迟到阈值。 |
-| `429` 真限流，`retry_after: 30` | 真实上游 `402/429`，经 `src/shared/errors.ts` 映射 | 按 `Retry-After` 退避等待。裁剪没用——等，再重试。 |
+| `429` 真限流（有 `Retry-After` 才带 `retry_after`） | 真实上游 `429`，经 `src/shared/errors.ts` 映射 | 按 `Retry-After` 退避等待。裁剪没用——等，再重试。`402` → `402` 无 `retry_after`；usage_window/payment/auth/context 类不带 `retry_after`、不可重试。 |
 | `502/503` 其他 | 真实上游错误（`CC_STATUS_MAP`；未列出 → `502 upstream_error`） | 重试 / 退避。 |
 
 区分三个 `429`：读包体——`message` 文案 + 数字 `retry_after`
@@ -278,13 +328,15 @@ rate_limit_error`——看到该包装先拆开看内层 `retry_after` 再决策
 
 按 API Key，在首次调用上游前（之后约每 8h）执行：
 
-1. `POST /alpha/fingerprint/record` ——随机但合理的可信指纹（SHA-256 哈希的机器/MAC/用户/主机名、CPU 池、内存、时区、`win32/x64`），与 Key 绑定。
-2. `POST /alpha/lifecycle-events`（`cli_session_exists`）——与指纹并行发送。
+1. `POST /alpha/fingerprint/record` ——随机但合理的可信指纹（官方 `thumbmark` 公式：`sha256("command-code:device-fingerprint:v1" + "\0machine\0" + 机器信号)`，组件哈希同盐派生），与 Key 绑定。
+2. `POST /alpha/lifecycle-events` ——`cli_installed` / `cli_session_exists` / `cli_first_message`（官方 4 种中反代适用的 3 种），与指纹并行发送。
 
-每次 `POST /alpha/generate` 携带 `Authorization`、`x-cli-environment: production`、
+每次 `POST /alpha/generate` 携带 `User-Agent: cli`、`Authorization`、`x-cli-environment: production`、
 `x-command-code-version`（npm `command-code@latest`，每天刷新）、`x-session-id`
-（按 Key 12h 会话，可经 `x-session-id` / `prompt_cache_key` 复用）、`x-project-slug`、
-`traceparent`（W3C），以及可选的 `x-cmd-zdr: 1`。
+（`sess_<16hex>`，按 Key 12h 会话，可经 `x-session-id` / `prompt_cache_key` 复用）、`x-project-slug`、
+`traceparent`（W3C），以及可选的 `x-cmd-zdr: 1`。请求体顶层与 CLI 一致：
+`config` / `memory` / `taste` / `skills: null` / `permissionMode` / `threadId` / `params`，
+其中 `params` 只带 `model` / `messages` / `tools` / `system` / `max_tokens` / `stream` / `temperature?` / `reasoning_effort?`。
 
 ## 项目结构
 
@@ -296,6 +348,7 @@ rate_limit_error`——看到该包装先拆开看内层 `retry_after` 再决策
 │   ├── index.ts           # 路由、CORS、错误映射、启动、healthcheck CLI
 │   ├── config.ts          # config.json + 环境变量解析、包体上限
 │   ├── openai.ts          # POST /v1/chat/completions（流式 + 非流式）
+│   ├── responses.ts       # POST /v1/responses + Responses↔OpenAI 转换
 │   ├── anthropic.ts       # POST /v1/messages + Anthropic↔OpenAI 转换
 │   ├── cc.ts              # CC 请求构建 + 转发（/alpha/generate）
 │   ├── sse.ts             # SSE 管道 + CC NDJSON → OpenAI chunk
@@ -357,6 +410,7 @@ Mock 上游，无真实 API 调用：
 ```bash
 bun run test            # e2e（协议、流式、错误）
 bun run test:timeouts   # 空闲超时 + 客户端断连
+bun run test:idle-transport  # 传输层空闲上限回归（约 33s）
 bunx tsc --noEmit       # 类型检查（CI 同样会跑）
 ```
 

@@ -2,7 +2,7 @@
 
 > [中文文档](README_zh.md)
 
-A reverse proxy that exposes the Command Code API as **OpenAI Chat Completions** and **Anthropic Messages** compatible endpoints.
+A reverse proxy that exposes the Command Code API as **OpenAI Chat Completions**, **OpenAI Responses**, and **Anthropic Messages** compatible endpoints.
 
 Built by observing official CLI traffic to faithfully replicate the upstream protocol — device fingerprint, lifecycle events, session headers, versioning, and tracing.
 
@@ -10,11 +10,12 @@ Stack: **Bun + Elysia + TypeScript**. Single-file binary via `bun build --compil
 
 ## Features
 
-- **Dual protocol**: `POST /v1/chat/completions` (OpenAI) + `POST /v1/messages` (Anthropic)
+- **Triple protocol**: `POST /v1/chat/completions` (OpenAI) + `POST /v1/responses` (OpenAI Responses) + `POST /v1/messages` (Anthropic)
 - **Streaming & non-streaming**, tool calling, multimodal images, `reasoning_effort` / `thinking`
 - **Dynamic models**: `GET /v1/models` from Provider API (5 min cache) with builtin fallback
-- **CLI emulation**: per-key device fingerprint (8h + 2h jitter), lifecycle `cli_session_exists`, per-key session (12h + 1h jitter), `x-command-code-version` from npm (24h refresh), `traceparent`, `x-project-slug`
-- **Resilience**: zero-output → `429` retryable, idle timeout (30s stream / 90s non-stream, overridable via `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS`, defaults unchanged; thinking phase `start`/`start-step`/`reasoning-start`/`reasoning-delta` gets a 120s window via `CC_THINKING_IDLE_MS`) → `429`, disconnect aborts upstream
+- **Account balance**: `GET /v1/dashboard/billing/credit_grants` returns the monthly allowance as OpenAI `credit_summary`
+- **CLI emulation**: per-key device fingerprint (8h + 2h jitter, official `thumbmark` formula), lifecycle events (`cli_installed` / `cli_session_exists` / `cli_first_message`), per-key session `sess_<16hex>` (12h + 1h jitter) with derived `threadId`, `User-Agent: cli`, `x-command-code-version` from npm (24h refresh), `traceparent`, `x-project-slug`
+- **Resilience**: zero-output → `429` retryable, idle timeout (30s stream / 90s non-stream, overridable via `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS`, defaults unchanged; thinking phase `start`/`start-step`/`reasoning-start`/`reasoning-delta` gets a 120s window via `CC_THINKING_IDLE_MS`) → `429`, disconnect aborts upstream. The Bun transport-layer idle cap is disabled (`idleTimeout: 0`, overriding Elysia's hardcoded 30s) so these budgets are the sole authority.
 - **Auth flexibility**: per-request `Bearer user_*` / `x-api-key`, optional `CC_API_KEY` fallback for self-host
 - **Ops ready**: `GET /health`, `server healthcheck` CLI, Docker HEALTHCHECK, privacy-aware logs (no keys, bodies, or stacks)
 
@@ -82,6 +83,15 @@ msg = client.messages.create(
 )
 ```
 
+```python
+# OpenAI SDK (Responses API)
+resp = client.responses.create(
+    model="deepseek/deepseek-v4-flash",
+    input="hi",
+    stream=True,
+)
+```
+
 Any OpenAI-compatible tool (Claude Code, Cline, Roo, NextChat, etc.) works by pointing `base_url` at `/v1` and using a `user_*` key.
 
 ## API Reference
@@ -92,6 +102,7 @@ Any OpenAI-compatible tool (Claude Code, Cline, Roo, NextChat, etc.) works by po
 | `GET` | `/health` | `{"ok":true}` |
 | `GET` | `/v1/models` | OpenAI-style model list |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
+| `POST` | `/v1/responses` | OpenAI Responses |
 | `POST` | `/v1/messages` | Anthropic Messages |
 
 ### `POST /v1/chat/completions`
@@ -112,11 +123,34 @@ Anthropic schema with automatic conversion:
 | `thinking.type: adaptive` | → `reasoning_effort: effort` |
 | CC `finishReason` | → `end_turn / max_tokens / tool_use` |
 
-Streaming emits `message_start / content_block_* / message_delta / message_stop`; `thinking` blocks get a synthetic `signature` so strict SDKs validate.
+Streaming emits `message_start / content_block_* / message_delta / message_stop`; `thinking` blocks carry the same empty `signature` the official CLI emits (the field must be present, its content is not validated upstream).
+
+### `POST /v1/responses`
+
+OpenAI Responses schema with automatic conversion:
+
+| Responses | Handling |
+|-----------|----------|
+| `instructions` | → OpenAI `system` message |
+| `input` (string / items) | → `messages`; `input_text` / `input_image` / `output_text` parts pass through |
+| `input[].type: function_call` | → assistant `tool_calls` |
+| `input[].type: function_call_output` | → `role: "tool"` message |
+| `tools[].{name,parameters,strict}` (flat) | → nested `{type:"function",function:{…}}` |
+| `tool_choice: auto / none / required / {function}` | → `auto / none / required / {function}` |
+| `reasoning.effort` | → `reasoning_effort` |
+| `max_output_tokens` | → `max_tokens` |
+| `metadata.user_id` | → `user` |
+| `store` / `previous_response_id` / `include` / `truncation` / `text` | ignored (stateless proxy; debug-logged) |
+
+Streaming emits `response.created / response.in_progress / response.output_item.added / response.output_text.delta / response.function_call_arguments.delta / … / response.completed` (no `[DONE]`; the SDK terminates on `response.completed`). Reasoning surfaces as a `{type:"reasoning",summary:[…]}` item with `response.reasoning_summary_text.delta` events. `finishReason: length` maps to `status: "incomplete"` + `incomplete_details.reason: "max_output_tokens"`. Built-in tools (web_search/file_search/…) have no CC equivalent and are dropped with a warning.
 
 ### `GET /v1/models`
 
 Tries `GET {CC_API_BASE}/provider/v1/models` with your key (10s timeout); caches for `CC_MODEL_REFRESH_INTERVAL_MS`. Falls back to the builtin list in `src/modules/models/catalog.ts` on any failure. Set `CC_USE_PROVIDER_MODELS=false` to always use the builtin list.
+
+### `GET /v1/dashboard/billing/credit_grants`
+
+Tries `GET {CC_API_BASE}/alpha/billing/credits` with your key (10s timeout) and maps the CC monthly allowance to OpenAI `credit_summary`: `total_granted` (monthly granted), `total_used`, `total_available` (remaining plus purchased credits), with a single `grants.data[]` entry. No key → OpenAI-shaped `401`; upstream failure → `502 api_error` (never fabricates a balance).
 
 ## Configuration
 
@@ -140,6 +174,7 @@ Precedence (low → high): **builtin defaults → `config.json` → `.env` / env
 | `CC_STREAM_IDLE_MS` | — (env only) | `30000` |
 | `CC_NONSTREAM_IDLE_MS` | — (env only) | `90000` |
 | `CC_THINKING_IDLE_MS` | — (env only) | `120000` (thinking-phase grace: `start`/`start-step`/`reasoning-start`/`reasoning-delta`; use `180000` for deep reasoning / high `reasoning_effort`; cost of raising is slower failure detection on true hangs) |
+| `CC_FORWARD_SAMPLING_PARAMS` | — (env only) | `false` (faithful CLI wire: `top_p` / `stop` / `user` / `seed` are accepted but **not** forwarded upstream, because the official CLI never sends them; set `true` to restore passthrough. Tool-protocol fields `tool_choice` / `parallel_tool_calls` are always forwarded — dropping them would silently change tool-call behaviour) |
 
 > **Note on defaults:** source runs (`bun start`), Docker images, and Release
 > binaries all share one set of builtin defaults — `3050` / `0.0.0.0` — matching
@@ -182,9 +217,11 @@ Oversized bodies (> `CC_MAX_BODY_MB`) are rejected with `413`.
 | `429` | Zero output tokens (`retry_after: 10`), idle timeout (`retry_after: 5`) | SDK auto-retries via `Retry-After`; after 3 consecutive timeouts the message suggests reducing context |
 | `502/503` | Upstream CC error (mapped from CC status/event) | Retry / backoff |
 
-Upstream mapping (`src/shared/errors.ts`): CC `402/429` → `429`, `401/403` → `401`, `400/422` → `400`, `500/502` → `502`, `503` → `503`. CC `tool-calls` is normalized to OpenAI `tool_calls` and Anthropic `tool_use` on both stream and non-stream paths.
+Upstream mapping (`src/shared/errors.ts`): CC true `429` → `429` (carries `retry_after` only when upstream sent `Retry-After`); `402` → `402` with no `retry_after`; usage_window/payment/auth/context classes carry no `retry_after` and are not retryable; `401/403` → `401`/`403`, `400/422` → `400`, `500/502` → `502`, `503` → `503`. CC `tool-calls` is normalized to OpenAI `tool_calls` and Anthropic `tool_use` on both stream and non-stream paths.
 
 Client disconnects (`request.signal`) abort the upstream `fetch` immediately; unfinished streams are closed without leaking sockets.
+
+Retries match the official CLI's retryable set (`408` / `429` / `5xx`): a true rate limit is retried in the HTTP retry loop, and a **pre-output stream error** — an upstream gateway failure that arrives as the first NDJSON event of an HTTP 200 stream (e.g. `Gateway request failed`) — is retried before anything reaches the client. Terminal business errors (usage window / payment / model-not-in-plan / auth / context overflow) are never retried. `CC_RETRY_MAX` (default `3`) bounds total upstream attempts.
 
 ## Long Sessions / Context Management
 
@@ -237,7 +274,7 @@ Client disconnects (`request.signal`) abort the upstream `fetch` immediately; un
 | `429` `Empty response` / zero output, `retry_after: 10` | Upstream returned zero output tokens | Safe to retry once with backoff; if it repeats, shrink context and simplify the last turn. |
 | `429` idle timeout, `retry_after: 5` | No upstream bytes for 30s (stream) / 90s (non-stream) (overridable via `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS`, defaults unchanged); **thinking phase** (`lastCcEvent` in `start`/`start-step`/`reasoning-start`/`reasoning-delta`) gets a 120s window (`CC_THINKING_IDLE_MS`); per-key consecutive counter, ≥3 → message tells you to reduce context **even when the current request is small (idle ≠ large context)** | Don't blind-compress: first check which `429` it is (see below). If `retry_after: 5`, suspect slow upstream / fan-out / huge `tool_result` / reasoning pause; split the task, cap tool results, lower concurrency. If the log shows `thinkingPhase=true` + `lastCcEvent=reasoning-start` + `elapsedMs≈timeoutMs`, raise `CC_THINKING_IDLE_MS` instead (see "Fails while thinking" below). |
 | `429` thinking timeout, `retry_after: 5` + `thinkingPhase=true` | `reasoning-start` followed by 30s+ of zero upstream bytes: `readWithTimeout` used to kill it at 30s (before the 120s thinking grace existed). Unrelated to context size — streaming-timeout `inputTokens` is always `0`, so it can't judge size. Self-proof triple: `lastCcEvent=reasoning-start`/`start` with no delta + `bytesReceived` of tens of bytes + `elapsedMs` pinned at the threshold. Opencode wraps it as `failed to send message`. | Don't compress context. Raise `CC_THINKING_IDLE_MS` (e.g. `180000` for deep reasoning), or split the task / lower `reasoning_effort`. True hang cost: failure detection is delayed to the threshold. |
-| `429` true rate limit, `retry_after: 30` | Real upstream `402/429` mapped through `src/shared/errors.ts` | Back off and honor `Retry-After`. Trimming won't help — wait, then retry. |
+| `429` true rate limit (has `Retry-After` → has `retry_after`) | Real upstream `429` mapped through `src/shared/errors.ts` | Back off and honor `Retry-After`. Trimming won't help — wait, then retry. `402` → `402` with no `retry_after`; usage_window/payment/auth/context classes carry no `retry_after` and are not retryable. |
 | `502/503` other | Genuine upstream error (`CC_STATUS_MAP`; unlisted → `502 upstream_error`) | Retry / backoff. |
 
 How to tell the three `429`s apart: read the body — `message` text plus the
@@ -290,7 +327,7 @@ Per API key, before the first upstream call (and every ~8h after):
 1. `POST /alpha/fingerprint/record` — random but plausible fingerprint (SHA-256 hashed machine/MAC/user/hostname IDs, CPU pool, memory, timezone, `win32/x64`), bound to the key.
 2. `POST /alpha/lifecycle-events` (`cli_session_exists`) — sent in parallel with the fingerprint.
 
-Each `POST /alpha/generate` then carries `Authorization`, `x-cli-environment: production`, `x-command-code-version` (npm `command-code@latest`, refreshed daily), `x-session-id` (12h per-key session, reusable via `x-session-id` / `prompt_cache_key` headers), `x-project-slug`, `traceparent` (W3C), and optional `x-cmd-zdr: 1`.
+Each `POST /alpha/generate` then carries `User-Agent: cli`, `Authorization`, `x-cli-environment: production`, `x-command-code-version` (npm `command-code@latest`, refreshed daily), `x-session-id` (`sess_<16hex>`, 12h per-key session, reusable via `x-session-id` / `prompt_cache_key` headers), `x-project-slug`, `traceparent` (W3C), and optional `x-cmd-zdr: 1`. The request body mirrors the CLI's top-level shape: `config` / `memory` / `taste` / `skills: null` / `permissionMode` / `threadId` / `params`, where `params` carries only `model` / `messages` / `tools` / `system` / `max_tokens` / `stream` / `temperature?` / `reasoning_effort?`.
 
 ## Project Structure
 
@@ -302,6 +339,7 @@ Each `POST /alpha/generate` then carries `Authorization`, `x-cli-environment: pr
 │   ├── index.ts           # Routes, CORS, error mapping, startup, healthcheck CLI
 │   ├── config.ts          # config.json + env resolution, body-limit
 │   ├── openai.ts          # POST /v1/chat/completions (stream + non-stream)
+│   ├── responses.ts       # POST /v1/responses + Responses↔OpenAI conversion
 │   ├── anthropic.ts       # POST /v1/messages + Anthropic↔OpenAI conversion
 │   ├── cc.ts              # CC request building + forwarding (/alpha/generate)
 │   ├── sse.ts             # SSE pipeline + CC NDJSON → OpenAI chunks
@@ -363,6 +401,7 @@ Mock upstream — no real API calls:
 ```bash
 bun run test            # e2e suite (protocol, streaming, errors)
 bun run test:timeouts   # idle timeout + client disconnect
+bun run test:idle-transport  # transport idle cap regression (~33s)
 bunx tsc --noEmit       # typecheck (also runs in CI)
 ```
 

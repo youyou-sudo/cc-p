@@ -58,6 +58,7 @@
 | 440-465 | anthropic 零输出 / 上游错误 | 用例组 | P | 零输出 429（Anthropic error 形状 + `retry_after:10` + 头）；上游 429 映射 429 + `retry_after:30`；流前 error → JSON 429（非 event-stream） |
 | 467-481 | 客户端断连 | 用例组 | P | `AbortController` 读取一块后 abort，sleep 600 后 `/health` 仍 200（服务未被断连击穿） |
 | 483-486 | 结果 / 导出 | 输出 | E | 打印 `RESULT: N passed, M failed`；`fail>0` → `process.exit(1)`；`export {}` 使文件成为模块 |
+| 1044-1119 | tool-call 身份兜底 | 用例组 | P | mock `tool-noname`（名字只在 `tool-input-start`）/`tool-fully-noname`（全程无名字）：chat 流恢复 `get_weather`+`call_nn_1`、空名兜底 `unknown_tool`；anthropic `tool_use.name`、responses `function_call.name`/`call_id` 均非空 |
 
 ## 关键行为
 

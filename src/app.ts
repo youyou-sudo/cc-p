@@ -6,8 +6,10 @@ import { bodyLimitPlugin } from './plugins/body'
 import { authPlugin } from './plugins/auth'
 import { healthController } from './modules/health/index'
 import { modelsController } from './modules/models/index'
+import { billingController } from './modules/billing/index'
 import { chatController } from './modules/chat/index'
 import { messagesController } from './modules/messages/index'
+import { responsesController } from './modules/responses/index'
 
 export function createApp() {
   return new Elysia()
@@ -21,6 +23,8 @@ export function createApp() {
     .use(authPlugin)
     .use(healthController)
     .use(modelsController)
+    .use(billingController)
     .use(chatController)
     .use(messagesController)
+    .use(responsesController)
 }

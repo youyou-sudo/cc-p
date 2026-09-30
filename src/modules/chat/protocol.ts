@@ -1,4 +1,4 @@
-export { handleChatCompletions, handleChatCompletionsBody } from './handler'
+export { handleChatCompletionsBody } from './handler'
 export { createSseTranslator, zeroUsageChunk } from './translator'
 export type { ChatStreamTranslator } from './translator'
 export { createChatAggregator, buildChatCompletion, rawUsageFromCcUsage } from './aggregator'

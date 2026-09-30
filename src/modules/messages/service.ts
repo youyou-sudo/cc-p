@@ -9,17 +9,12 @@ export {
   buildAnthropicResponse,
   convertAnthropicToOpenAI,
   createAnthropicSseTranslator,
-  fakeThinkingSignature,
-  handleMessages,
+  EMPTY_THINKING_SIGNATURE,
   handleMessagesBody,
 } from './protocol'
 export type { AnthropicStreamContext } from './protocol'
 
 export abstract class MessagesService {
-  static async handle(request: Request, headers: Record<string, string | undefined>): Promise<Response> {
-    const { handleMessages } = await import('./protocol')
-    return handleMessages(request, headers)
-  }
   static async handleBody(body: any, headers: Record<string, string | undefined>, signal?: AbortSignal): Promise<Response> {
     const { handleMessagesBody } = await import('./protocol')
     return handleMessagesBody(body, headers, signal)

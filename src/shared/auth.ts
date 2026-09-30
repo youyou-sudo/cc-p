@@ -1,11 +1,16 @@
+// Layer: kernel（底层，可被所有人依赖，自己只依赖 kernel）
 import { CFG } from './config'
 
-export const KEY_PATTERN = /user_[a-zA-Z0-9_-]+/
+export const KEY_PATTERN = /^user_[a-zA-Z0-9_-]+$/
+
+export const MAX_API_KEY_LENGTH = 256
 
 function extractKey(value: string | undefined): string | null {
   if (!value) return null
-  const match = value.match(KEY_PATTERN)
-  return match ? match[0] : null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  if (trimmed.length > MAX_API_KEY_LENGTH) return null
+  return KEY_PATTERN.test(trimmed) ? trimmed : null
 }
 
 export function getApiKey(headers: Record<string, string | undefined>): string | null {
@@ -25,10 +30,15 @@ export function keyFormatError(headers: Record<string, string | undefined>): str
   const auth = headers['authorization'] || headers['Authorization'] || ''
   const xKey = headers['x-api-key'] || headers['X-Api-Key'] || ''
   const presented = auth.startsWith('Bearer ') ? auth.slice(7).trim() : (xKey || '').trim()
-  if (!presented) return null
+  if (!presented) {
+    // No per-request key: a misconfigured fallback must not masquerade as "Missing".
+    if (CFG.apiKey && !extractKey(CFG.apiKey)) {
+      return 'Invalid fallback API key: expected "user_" followed by base64url characters (e.g. user_abc123). Check CC_API_KEY.'
+    }
+    return null
+  }
   if (!extractKey(presented)) {
-    return 'Invalid API key: expected "user_" followed by base64url characters (e.g. user_abc123), got "' +
-      presented.slice(0, 12) + (presented.length > 12 ? '…"' : '"')
+    return 'Invalid API key: expected "user_" followed by base64url characters (e.g. user_abc123).'
   }
   return null
 }

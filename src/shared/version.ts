@@ -1,3 +1,4 @@
+// Layer: kernel（底层，可被所有人依赖，自己只依赖 kernel）
 import { log } from './logger'
 
 export let CC_VERSION = '0.32.3'
@@ -21,5 +22,6 @@ export async function refreshCCVersion(): Promise<void> {
 
 export function startVersionRefresh(): void {
   void refreshCCVersion()
-  setInterval(() => void refreshCCVersion(), CC_VERSION_REFRESH_MS)
+  // unref：后台日更 timer 不应拖住进程退出（测试/CLI 健康检查场景下尤为重要）。
+  setInterval(() => void refreshCCVersion(), CC_VERSION_REFRESH_MS).unref()
 }

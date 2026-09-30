@@ -1,220 +1,225 @@
-// Per-key concurrency control: bounded in-flight slots + FIFO queue with timeout.
+// Layer: domain（可依赖 kernel / toolkit，不可被 kernel 依赖）
+// Per-key concurrency gate: bound in-flight requests per upstream key, queue
+// the overflow with a deadline, fail fast when the queue is full. Covered by
+// test/unit.ts.
+//
+// Isolation key is the effective upstream key (the same `apiKey` string that
+// session.ts / fingerprint.ts / runtime.ts already scope on): one Map bucket
+// per key, keys never share slots. Single-process singleton via proxy-handler.
 
-export interface ConcurrencyConfig {
-  maxInFlightPerKey: number
-  maxQueuePerKey: number
-  queueTimeoutMs: number
-  maxKeys: number
-  keyTtlMs: number
-}
-
-const DEFAULT: ConcurrencyConfig = {
-  maxInFlightPerKey: 4,
-  maxQueuePerKey: 16,
-  queueTimeoutMs: 15000,
-  maxKeys: 5000,
-  keyTtlMs: 30 * 60 * 1000,
-}
-
-export interface AcquireOptions {
-  signal: AbortSignal
-  timeoutMs?: number
-}
-
-export type Release = () => void
-
-export class ConcurrencyRoomFull extends Error {
-  public readonly kind = 'queue_full'
-  constructor() {
-    super('Concurrency room full')
-    this.name = 'ConcurrencyRoomFull'
-    Object.setPrototypeOf(this, ConcurrencyRoomFull.prototype)
+export class ConcurrencyAborted extends Error {
+  constructor(message = 'Concurrency acquire aborted') {
+    super(message)
+    this.name = 'ConcurrencyAborted'
   }
 }
 
 export class ConcurrencyTimeout extends Error {
-  public readonly kind = 'queue_timeout'
-  constructor() {
-    super('Concurrency wait timed out')
+  constructor(message = 'Concurrency queue timeout') {
+    super(message)
     this.name = 'ConcurrencyTimeout'
-    Object.setPrototypeOf(this, ConcurrencyTimeout.prototype)
   }
 }
 
-export class ConcurrencyAborted extends Error {
-  public readonly kind = 'aborted'
-  constructor() {
-    super('Concurrency wait aborted')
-    this.name = 'ConcurrencyAborted'
-    Object.setPrototypeOf(this, ConcurrencyAborted.prototype)
+export class ConcurrencyRoomFull extends Error {
+  constructor(message = 'Concurrency queue full') {
+    super(message)
+    this.name = 'ConcurrencyRoomFull'
   }
 }
 
-interface Entry {
+export interface ConcurrencyGateOptions {
+  maxInFlightPerKey?: number
+  maxQueuePerKey?: number
+  queueTimeoutMs?: number
+}
+
+export interface AcquireOptions {
+  signal?: AbortSignal
+}
+
+export interface GateSnapshot {
   inFlight: number
-  waiters: Waiter[]
-  lastActiveMs: number
+  queued: number
 }
+
+/** Aggregate water-level for readyz/health. Non-breaking additive API. */
+export interface GateStats extends GateSnapshot {
+  keys: number
+  maxInFlightPerKey: number
+  maxQueuePerKey: number
+  queueTimeoutMs: number
+}
+
+export type ReleaseFn = () => void
 
 interface Waiter {
-  opts: AcquireOptions
-  deadline: number
-  resolve: (release: Release) => void
+  key: string
+  resolve: (release: ReleaseFn) => void
   reject: (err: Error) => void
-  signalListener?: () => void
-  timer?: ReturnType<typeof setTimeout>
-  started: boolean
+  timer: ReturnType<typeof setTimeout> | undefined
+  onAbort: (() => void) | undefined
+  signal: AbortSignal | undefined
+  settled: boolean
+}
+
+const DEFAULT_MAX_IN_FLIGHT = 16
+const DEFAULT_MAX_QUEUE = 64
+const DEFAULT_QUEUE_TIMEOUT_MS = 60_000
+
+const allGates = new Set<ConcurrencyGate>()
+
+/** Global prune for session cleanup: drops empty buckets on every gate
+ *  without needing a handle to the proxy-handler singleton (avoids a
+ *  session -> proxy-handler -> cc -> session import cycle). */
+export function pruneAllGatesEmpty(): void {
+  for (const g of allGates) {
+    try { g.pruneEmpty() } catch {}
+  }
 }
 
 export class ConcurrencyGate {
-  private readonly config: ConcurrencyConfig
-  private store: Map<string, Entry> = new Map()
+  private readonly maxInFlightPerKey: number
+  private readonly maxQueuePerKey: number
+  private readonly queueTimeoutMs: number
+  private readonly inFlight = new Map<string, number>()
+  private readonly queues = new Map<string, Waiter[]>()
 
-  constructor(config: Partial<ConcurrencyConfig> = {}) {
-    this.config = { ...DEFAULT, ...config }
+  constructor(opts: ConcurrencyGateOptions = {}) {
+    this.maxInFlightPerKey = opts.maxInFlightPerKey ?? DEFAULT_MAX_IN_FLIGHT
+    this.maxQueuePerKey = opts.maxQueuePerKey ?? DEFAULT_MAX_QUEUE
+    this.queueTimeoutMs = opts.queueTimeoutMs ?? DEFAULT_QUEUE_TIMEOUT_MS
+    allGates.add(this)
   }
 
-  acquire(key: string, opts: AcquireOptions): Promise<Release> {
-    const entry = this.getOrCreate(key)
-    const deadline = (opts.timeoutMs ?? this.config.queueTimeoutMs) + Date.now()
-    return new Promise<Release>((resolve, reject) => {
-      if (opts.signal.aborted) {
-        reject(new ConcurrencyAborted())
-        return
+  snapshot(key?: string): GateSnapshot {
+    if (key !== undefined) {
+      return {
+        inFlight: this.inFlight.get(key) ?? 0,
+        queued: this.queues.get(key)?.length ?? 0,
       }
+    }
+    let inFlight = 0
+    let queued = 0
+    for (const n of this.inFlight.values()) inFlight += n
+    for (const q of this.queues.values()) queued += q.length
+    return { inFlight, queued }
+  }
+
+  /** Aggregate water-level for readyz/health. Additive only, no breaking change. */
+  getStats(): GateStats {
+    const snap = this.snapshot()
+    const keys = new Set<string>([...this.inFlight.keys(), ...this.queues.keys()]).size
+    return {
+      ...snap,
+      keys,
+      maxInFlightPerKey: this.maxInFlightPerKey,
+      maxQueuePerKey: this.maxQueuePerKey,
+      queueTimeoutMs: this.queueTimeoutMs,
+    }
+  }
+
+  /** Non-blocking acquire: returns a release fn when a slot is free, else null
+   *  without queueing. Used for water-level probes / load-shedding. */
+  tryAcquire(key: string): ReleaseFn | null {
+    const inFlight = this.inFlight.get(key) ?? 0
+    if (inFlight < this.maxInFlightPerKey) {
+      this.inFlight.set(key, inFlight + 1)
+      return this.makeRelease(key)
+    }
+    return null
+  }
+
+  /** Defensive cleanup of empty buckets (queues already delete on drain, but
+   *  long-lived processes can accumulate empty keys via races). Idempotent. */
+  pruneEmpty(): void {
+    for (const [k, q] of this.queues) {
+      if (q.length === 0) this.queues.delete(k)
+    }
+    for (const [k, n] of this.inFlight) {
+      if (n <= 0) this.inFlight.delete(k)
+    }
+  }
+
+  acquire(key: string, opts: AcquireOptions = {}): Promise<ReleaseFn> {
+    const signal = opts.signal
+    if (signal?.aborted) return Promise.reject(new ConcurrencyAborted())
+    const inFlight = this.inFlight.get(key) ?? 0
+    if (inFlight < this.maxInFlightPerKey) {
+      this.inFlight.set(key, inFlight + 1)
+      return Promise.resolve(this.makeRelease(key))
+    }
+    const queue = this.queues.get(key) ?? []
+    if (queue.length >= this.maxQueuePerKey) {
+      return Promise.reject(new ConcurrencyRoomFull(`No queue room for key (queued=${queue.length})`))
+    }
+    return new Promise<ReleaseFn>((resolve, reject) => {
       const waiter: Waiter = {
-        opts,
-        deadline,
+        key,
         resolve,
         reject,
-        signalListener: undefined,
         timer: undefined,
-        started: false,
+        onAbort: undefined,
+        signal,
+        settled: false,
       }
-      const onAbort = () => this.removeWaiter(entry, waiter, true)
-      waiter.signalListener = onAbort
-      opts.signal.addEventListener('abort', onAbort, { once: true })
-      entry.waiters.push(waiter)
-      // Queue capacity only bites when no slot is free: an idle gate always
-      // admits immediately (tryDrain promotes before returning), while a
-      // saturated one fast-fails once more than maxQueuePerKey are queued.
-      const freeSlots = this.config.maxInFlightPerKey - entry.inFlight
-      if (freeSlots <= 0 && entry.waiters.length > this.config.maxQueuePerKey) {
-        this.removeWaiter(entry, waiter, false)
-        reject(new ConcurrencyRoomFull())
-        return
-      }
-      // Enforce the queue deadline even when no release ever triggers a
-      // drain (e.g. every in-flight request stalls past the queue timeout).
       waiter.timer = setTimeout(() => {
-        waiter.timer = undefined
-        if (!waiter.started && entry.waiters.includes(waiter)) {
-          this.removeWaiter(entry, waiter, false)
-          waiter.reject(new ConcurrencyTimeout())
+        this.settleWaiter(waiter, (w) => w.reject(new ConcurrencyTimeout(`Queued wait exceeded ${this.queueTimeoutMs}ms`)))
+      }, this.queueTimeoutMs)
+      if (signal) {
+        waiter.onAbort = () => {
+          this.settleWaiter(waiter, (w) => w.reject(new ConcurrencyAborted()))
         }
-      }, Math.max(0, deadline - Date.now()))
-      this.tryDrain(entry)
+        signal.addEventListener('abort', waiter.onAbort, { once: true })
+      }
+      queue.push(waiter)
+      this.queues.set(key, queue)
     })
   }
 
-  release(key: string): void {
-    if (!key) return
-    const entry = this.store.get(key)
-    if (!entry) return
-    entry.lastActiveMs = Date.now()
-    if (entry.inFlight > 0) entry.inFlight--
-    this.tryDrain(entry)
-  }
-
-  snapshot(): { keys: number; inFlight: number; queued: number } {
-    let keys = 0
-    let inFlight = 0
-    let queued = 0
-    for (const [, e] of this.store) {
-      keys++
-      inFlight += e.inFlight
-      queued += e.waiters.length
-    }
-    return { keys, inFlight, queued }
-  }
-
-  private tryDrain(entry: Entry): void {
-    if (entry.inFlight >= this.config.maxInFlightPerKey) return
-    if (entry.waiters.length === 0) return
-    const waiter = entry.waiters[0]
-    if (!waiter) return
-    if (waiter.started) {
-      entry.waiters.shift()
-      this.tryDrain(entry)
-      return
-    }
-    if (Date.now() >= waiter.deadline) {
-      this.removeWaiter(entry, waiter, false)
-      waiter.reject(new ConcurrencyTimeout())
-      this.tryDrain(entry)
-      return
-    }
-    entry.waiters.shift()
-    waiter.started = true
-    this.clearWaiterTimer(waiter)
-    if (waiter.signalListener) {
-      waiter.opts.signal.removeEventListener('abort', waiter.signalListener)
-      waiter.signalListener = undefined
-    }
-    entry.inFlight++
-    const release: Release = () => {
-      if (entry.inFlight > 0) entry.inFlight--
-      this.tryDrain(entry)
-    }
-    waiter.resolve(release)
-  }
-
-  private removeWaiter(entry: Entry, waiter: Waiter, aborted: boolean): void {
-    this.clearWaiterTimer(waiter)
-    const idx = entry.waiters.indexOf(waiter)
-    if (idx !== -1) entry.waiters.splice(idx, 1)
-    if (waiter.signalListener) {
-      try { waiter.opts.signal.removeEventListener('abort', waiter.signalListener) } catch {}
-      waiter.signalListener = undefined
-    }
-    if (aborted && !waiter.started) {
-      waiter.reject(new ConcurrencyAborted())
+  private makeRelease(key: string): ReleaseFn {
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.release(key)
     }
   }
 
-  private clearWaiterTimer(waiter: Waiter): void {
-    if (waiter.timer !== undefined) {
-      clearTimeout(waiter.timer)
-      waiter.timer = undefined
+  /** Remove a waiter from its queue, clear its timer/abort hook, then run fn.
+   *  Returns false when the waiter already settled (timeout/abort/promotion). */
+  private settleWaiter(waiter: Waiter, fn: (w: Waiter) => void): boolean {
+    if (waiter.settled) return false
+    waiter.settled = true
+    if (waiter.timer !== undefined) clearTimeout(waiter.timer)
+    if (waiter.onAbort && waiter.signal) waiter.signal.removeEventListener('abort', waiter.onAbort)
+    const q = this.queues.get(waiter.key)
+    if (q) {
+      const idx = q.indexOf(waiter)
+      if (idx >= 0) q.splice(idx, 1)
+      if (q.length === 0) this.queues.delete(waiter.key)
     }
+    fn(waiter)
+    return true
   }
 
-  private getOrCreate(key: string): Entry {
-    let entry = this.store.get(key)
-    const now = Date.now()
-    // Only recycle a TTL-expired entry that is completely idle: resetting one
-    // that still owns in-flight slots would drop their accounting.
-    if (!entry || (now - entry.lastActiveMs > this.config.keyTtlMs && entry.inFlight === 0 && entry.waiters.length === 0)) {
-      entry = { inFlight: 0, waiters: [], lastActiveMs: now }
-      this.store.set(key, entry)
-    } else {
-      entry.lastActiveMs = now
-    }
-    return entry
-  }
-
-  pruneIfNecessary(): void {
-    if (this.store.size < this.config.maxKeys) return
-    const now = Date.now()
-    for (const [key, entry] of [...this.store]) {
-      // Never drop an entry that still owns slots or queued waiters.
-      if (now - entry.lastActiveMs > this.config.keyTtlMs && entry.inFlight === 0 && entry.waiters.length === 0) {
-        this.store.delete(key)
+  private release(key: string): void {
+    const queue = this.queues.get(key)
+    if (queue) {
+      // Slot transfers directly to the oldest live waiter: in-flight count is
+      // unchanged, so no new acquire can sneak in between.
+      while (queue.length > 0) {
+        const waiter = queue[0]!
+        const admitted = this.settleWaiter(waiter, (w) => w.resolve(this.makeRelease(key)))
+        if (admitted) {
+          if (queue.length === 0) this.queues.delete(key)
+          return
+        }
       }
+      this.queues.delete(key)
     }
+    const current = this.inFlight.get(key) ?? 0
+    if (current <= 1) this.inFlight.delete(key)
+    else this.inFlight.set(key, current - 1)
   }
-}
-
-export function createConcurrencyGate(config: Partial<ConcurrencyConfig> = {}): ConcurrencyGate {
-  return new ConcurrencyGate(config)
 }

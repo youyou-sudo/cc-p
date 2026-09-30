@@ -5,11 +5,6 @@
 export { buildCcRequest } from '../../infra/cc'
 
 export abstract class ChatService {
-  static async handle(request: Request, headers: Record<string, string | undefined>): Promise<Response> {
-    const { handleChatCompletions } = await import('./protocol')
-    return handleChatCompletions(request, headers)
-  }
-
   static async handleBody(body: unknown, headers: Record<string, string | undefined>, signal?: AbortSignal): Promise<Response> {
     const { handleChatCompletionsBody } = await import('./protocol')
     return handleChatCompletionsBody(body, headers, signal)

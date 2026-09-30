@@ -1,7 +1,84 @@
-import { CFG } from '../shared/config'
-import { getSessionId } from './session'
+import { CFG, FORWARD_SAMPLING_PARAMS } from '../shared/config'
+import { getSessionContext } from './session'
 import { CC_VERSION } from '../shared/version'
-import { fakeProjectSlug, generateTraceparent, getDateStr, getEnvironment, tryParseJSON } from '../shared/util'
+import { fakeProjectSlug, generateTraceparent, getDateStr, getEnvironment, tryParseJSONStrict, isJSONParseFailure, randHex, redactLargeDataUrls } from '../shared/util'
+import { log } from '../shared/logger'
+
+/** buildCcRequest 参数非法时抛出的 400 错误，由上层统一转 invalid_request_error。 */
+export class CcBadRequestError extends Error {
+  status = 400
+  code = 'BAD_REQUEST'
+  constructor(message: string) {
+    super(message)
+    this.name = 'CcBadRequestError'
+  }
+}
+
+function badRequest(message: string): never {
+  throw new CcBadRequestError(message)
+}
+
+/**
+ * 大小写不敏感的头读取 helper。
+ * 不依赖框架（Elysia/Bun）是否归一化 header 大小写，统一按小写匹配。
+ */
+function getHeader(headers: Record<string, string | undefined>, name: string): string | undefined {
+  if (!headers) return undefined
+  const lower = name.toLowerCase()
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase() === lower) return headers[k]
+  }
+  return undefined
+}
+
+/** 未知 role / 未知 content 形状的安全 stringify：数组/对象走 JSON，避免 [object Object]。 */
+function stringifyUnknownContent(content: any): string {
+  if (content == null) return ''
+  if (typeof content === 'string') return content
+  try {
+    return JSON.stringify(content) ?? ''
+  } catch {
+    return String(content)
+  }
+}
+
+/** Anthropic 形 image source → data:/plain URL（translator.ts 同款逻辑，cc 侧本地一份避免循环）。 */
+function anthropicSourceToUrl(source: any): string {
+  if (!source) return ''
+  if (typeof source === 'string') return source
+  if (typeof source.url === 'string' && source.url) return source.url
+  if (typeof source.data === 'string' && source.data) {
+    const media = source.media_type || source.mediaType || 'image/jpeg'
+    return `data:${media};base64,${source.data}`
+  }
+  return ''
+}
+
+/** 从任意疑似图片分片提取 URL：OpenAI image_url + Anthropic {type:image,source} 兼容。 */
+function extractImageUrl(part: any): string {
+  if (!part || typeof part !== 'object') return ''
+  if (part.type === 'image_url') {
+    const v = part.image_url
+    if (typeof v === 'string') return v
+    if (v && typeof v.url === 'string') return v.url
+    return ''
+  }
+  if (part.type === 'image') {
+    if (typeof part.image === 'string' && part.image) return part.image
+    if (part.image && typeof part.image.url === 'string' && part.image.url) return part.image.url
+    if (typeof part.image_url === 'string' && part.image_url) return part.image_url
+    if (part.image_url && typeof part.image_url.url === 'string') return part.image_url.url
+    if (typeof part.url === 'string' && part.url) return part.url
+    return anthropicSourceToUrl(part.source)
+  }
+  return ''
+}
+
+/** 日志/占位用 URL 缩写：data: URL 只留前缀，避免打爆日志。 */
+function shortUrl(url: string): string {
+  if (url.length <= 120) return url
+  return url.slice(0, 120) + '...'
+}
 
 function isEphemeralCacheControl(v: any): boolean {
   return !!v && v.type === 'ephemeral'
@@ -21,14 +98,184 @@ function stripNonEphemeralCacheControl<T extends Record<string, any>>(part: T): 
   return rest as T
 }
 
+const MAX_TOKENS_DEFAULT = 64000
+const MAX_TOKENS_HARD_LIMIT = 200000
+
+function resolveMaxTokens(openaiReq: any): number {
+  const raw = openaiReq.max_tokens ?? openaiReq.max_completion_tokens
+  if (raw === undefined || raw === null || raw === 0 || raw === '') {
+    log('debug', 'cc max_tokens default', { reason: 'undefined_or_zero', default: MAX_TOKENS_DEFAULT })
+    return MAX_TOKENS_DEFAULT
+  }
+  const n = Number(raw)
+  if (!Number.isFinite(n)) {
+    badRequest(`Invalid max_tokens: ${JSON.stringify(raw)} (expected finite number)`)
+  }
+  if (n < 0) {
+    badRequest(`Invalid max_tokens: ${JSON.stringify(raw)} (must be >= 0)`)
+  }
+  if (n === 0) {
+    log('debug', 'cc max_tokens default', { reason: 'zero', default: MAX_TOKENS_DEFAULT })
+    return MAX_TOKENS_DEFAULT
+  }
+  if (n > MAX_TOKENS_HARD_LIMIT) {
+    log('warn', 'cc max_tokens clamped', { requested: n, clamped: MAX_TOKENS_HARD_LIMIT })
+    return MAX_TOKENS_HARD_LIMIT
+  }
+  return Math.floor(n)
+}
+
+function assertTemperature(v: any): void {
+  if (v === undefined) return
+  const n = Number(v)
+  if (!Number.isFinite(n) || n < 0 || n > 2) {
+    badRequest(`Invalid temperature: ${JSON.stringify(v)} (expected 0..2)`)
+  }
+}
+
+function assertTopP(v: any): void {
+  if (v === undefined) return
+  const n = Number(v)
+  if (!Number.isFinite(n) || n < 0 || n > 1) {
+    badRequest(`Invalid top_p: ${JSON.stringify(v)} (expected 0..1)`)
+  }
+}
+
+function assertSeed(v: any): void {
+  if (v === undefined) return
+  if (!Number.isInteger(v)) {
+    badRequest(`Invalid seed: ${JSON.stringify(v)} (expected integer)`)
+  }
+}
+
+function normalizeStop(stop: any): any {
+  if (stop === undefined) return undefined
+  if (typeof stop === 'string') return [stop]
+  if (Array.isArray(stop)) {
+    for (const s of stop) {
+      if (typeof s !== 'string') {
+        badRequest(`Invalid stop: expected string|string[], got ${JSON.stringify(stop)}`)
+      }
+    }
+    return stop
+  }
+  badRequest(`Invalid stop: expected string|string[], got ${JSON.stringify(stop)}`)
+}
+
+/** 上游对重复 tool_call_id 零容忍：一旦历史里出现重复，整个会话会被
+ *  "Duplicate value for 'tool_call_id' of X in message[N]" 永久 400。
+ *  重复主要来自上游重复投递 tool-call（各 translator 已按 id 去重，见
+ *  createToolCallIdGuard），但客户端历史里可能已经沉淀了重复，所以这里再做一层
+ *  收敛修复：
+ *   - 设某 id 在 assistant tool-call 中出现 A 次、在 tool-result 中出现 R 次；
+ *   - R < A：丢弃多余的重复调用（只留前 R 个），避免出现无结果的裸调用；
+ *   - R >= A：保留全部调用，第 2..A 次换发新 id，并按出现顺序重新配对
+ *     tool-result（不丢任何工具结果）。
+ *  没有重复时是纯 no-op，不触碰任何 id。 */
+function repairDuplicateToolCallIds(ccMessages: any[]): number {
+  const callSlots = new Map<string, Array<{ msg: any; part: any }>>()
+  const resultSlots = new Map<string, Array<{ msg: any; part: any }>>()
+  for (const msg of ccMessages) {
+    if (!Array.isArray(msg?.content)) continue
+    for (const part of msg.content) {
+      const id = typeof part?.toolCallId === 'string' ? part.toolCallId : ''
+      if (!id) continue
+      const bucket = part.type === 'tool-call' ? callSlots
+        : part.type === 'tool-result' ? resultSlots
+          : null
+      if (!bucket) continue
+      const list = bucket.get(id) ?? []
+      list.push({ msg, part })
+      bucket.set(id, list)
+    }
+  }
+
+  let repaired = 0
+  for (const [id, calls] of callSlots) {
+    if (calls.length <= 1) continue
+    const results = resultSlots.get(id) ?? []
+    const keep = Math.min(calls.length, Math.max(results.length, 1))
+    log('warn', 'cc duplicate tool_call_id in history', { toolCallId: id, calls: calls.length, results: results.length, keep })
+
+    // 多余重复：整块移除（无对应结果的裸调用上游同样会拒）。
+    const touched = new Set<any>()
+    for (let i = keep; i < calls.length; i++) {
+      const { msg, part } = calls[i]!
+      msg.content = msg.content.filter((p: any) => p !== part)
+      touched.add(msg)
+      repaired++
+    }
+
+    // 保留的重复调用：第 2..keep 次换新 id，并按序重映射对应结果。
+    for (let i = 1; i < keep; i++) {
+      const newId = `call_${randHex(10)}`
+      calls[i]!.part.toolCallId = newId
+      const target = results[i]
+      if (target) target.part.toolCallId = newId
+      repaired++
+    }
+
+    // 被清空的 assistant 消息整条移除，避免上游收到空 content。
+    for (const msg of touched) {
+      if (Array.isArray(msg.content) && msg.content.length === 0) {
+        const idx = ccMessages.indexOf(msg)
+        if (idx >= 0) ccMessages.splice(idx, 1)
+      }
+    }
+  }
+
+  if (repaired > 0) log('warn', 'cc repaired duplicate tool_call_id in history', { repaired })
+  return repaired
+}
+
+/** 递归清扫文本通道里过大的内联 data: URL（截图 base64）。真正的图片分片
+ *  （type:'image'）不在此列，视觉输入不受影响；只清理会被当成文本回灌的字段。
+ *  `touched` 计数被改写过的字符串，供调用方决定是否打日志（避免额外 stringify）。 */
+function redactLargeDataUrlsIn(value: any, touched: { n: number }): any {
+  if (typeof value === 'string') {
+    const out = redactLargeDataUrls(value)
+    if (out !== value) touched.n++
+    return out
+  }
+  if (Array.isArray(value)) return value.map((v) => redactLargeDataUrlsIn(v, touched))
+  if (value && typeof value === 'object') {
+    // 图片分片（type:'image'）的载荷是视觉输入，保持原样，绝不降级。
+    if (value.type === 'image') return value
+    const out: any = {}
+    for (const k of Object.keys(value)) out[k] = redactLargeDataUrlsIn(value[k], touched)
+    return out
+  }
+  return value
+}
+
 export function buildCcRequest(openaiReq: any): any {
   const { model, messages, max_tokens, temperature, tools, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key, top_p, stop, user, seed } = openaiReq
+
+  if (!Array.isArray(messages)) {
+    badRequest('Invalid messages: expected array')
+  }
+
+  // 范围校验：非法直接抛 400，由上层转 invalid_request_error。
+  assertTemperature(temperature)
+  assertTopP(top_p)
+  assertSeed(seed)
+  const normalizedStop = normalizeStop(stop)
+  const resolvedMaxTokens = resolveMaxTokens(openaiReq)
 
   const systemMsgs = messages.filter((m: any) => m.role === 'system' || m.role === 'developer')
   const systemPrompt = systemMsgs.map((m: any) => {
     if (typeof m.content === 'string') return m.content
-    if (Array.isArray(m.content)) return m.content.map((c: any) => c?.text ?? c?.content ?? '').join('\n')
-    return m.content == null ? '' : String(m.content)
+    if (Array.isArray(m.content)) return m.content.map((c: any) => {
+      if (c?.type === 'text') return c.text ?? ''
+      if (c?.type === 'image_url' || c?.type === 'image') {
+        // CC system param 只支持 string：图片转占位说明，不静默丢。
+        const url = extractImageUrl(c)
+        log('warn', 'cc system image demoted to placeholder', { url: url ? shortUrl(url) : '(empty)' })
+        return url ? `[image: ${shortUrl(url)}]` : '[image omitted: empty url]'
+      }
+      return c?.text ?? c?.content ?? ''
+    }).join('\n')
+    return m.content == null ? '' : stringifyUnknownContent(m.content)
   }).join('\n')
   const chatMessages = messages.filter((m: any) => m.role !== 'system' && m.role !== 'developer')
 
@@ -37,7 +284,9 @@ export function buildCcRequest(openaiReq: any): any {
     if (msg.role === 'assistant' && msg.tool_calls) {
       for (const tc of msg.tool_calls) {
         if (tc.id) {
-          toolNameMap[tc.id] = tc.function?.name || ''
+          // 与下面的 tool-call 占位名保持一致：空名会让上游 400，且结果的
+          // toolName 也应与调用一致（而非退化成 tool_call_id）。
+          toolNameMap[tc.id] = tc.function?.name || 'unknown_tool'
         }
       }
     }
@@ -50,8 +299,18 @@ export function buildCcRequest(openaiReq: any): any {
       }
       if (Array.isArray(msg.content)) {
         const parts = msg.content.map((part: any) => {
-          if (part.type === 'image_url') {
-            const url = part.image_url?.url || ''
+          if (part.type === 'image_url' || part.type === 'image') {
+            const url = extractImageUrl(part)
+            if (!url) {
+              log('warn', 'cc image omitted: empty url', { partType: part?.type || '' })
+              return { type: 'text', text: '[image omitted: empty url]' }
+            }
+            if (typeof url === 'string' && url.startsWith('data:') && url.length > 10 * 1024 * 1024) {
+              log('warn', 'cc image large dataURL', { bytes: url.length })
+            }
+            if (part.type === 'image') {
+              log('warn', 'cc anthropic-shape image normalized to image_url chain', { url: shortUrl(url) })
+            }
             const img: any = { type: 'image', image: url }
             const cc = pickEphemeralCacheControl(part?.cache_control)
             if (cc) img.cache_control = cc
@@ -59,44 +318,156 @@ export function buildCcRequest(openaiReq: any): any {
           }
           return stripNonEphemeralCacheControl(part)
         }).filter(Boolean)
+        if (parts.length === 0) {
+          return { role: 'user', content: [{ type: 'text', text: '[image omitted: empty url]' }] }
+        }
         return { role: 'user', content: parts }
       }
-      return { role: 'user', content: [{ type: 'text', text: String(msg.content) }] }
+      return { role: 'user', content: [{ type: 'text', text: stringifyUnknownContent(msg.content) }] }
     }
     if (msg.role === 'assistant') {
       const parts: any[] = []
+      // 思考历史必须回灌：官方与生态（cpa-plugin/cmdcode2api/dsh/nodejs）都把
+      // assistant 的 thinking 作为 {type:'reasoning',text} 带上；本地此前对
+      // reasoning/thinking 分片一律 warn+丢弃，多轮 tool-loop 会丢推理上下文。
+      const reasoningText = typeof msg.reasoning_content === 'string' ? msg.reasoning_content.trim() : ''
+      if (reasoningText) parts.push({ type: 'reasoning', text: reasoningText })
       if (msg.content && typeof msg.content === 'string') {
         parts.push({ type: 'text', text: msg.content })
       } else if (msg.content && Array.isArray(msg.content)) {
         for (const part of msg.content) {
           if (part.type === 'text') parts.push(stripNonEphemeralCacheControl(part))
+          else if (part.type === 'reasoning') {
+            const text = typeof part.text === 'string' ? part.text : ''
+            if (text) parts.push({ type: 'reasoning', text })
+          } else if (part.type === 'thinking') {
+            const text = typeof part.thinking === 'string' ? part.thinking : ''
+            if (text) parts.push({ type: 'reasoning', text })
+          } else if (part.type === 'redacted_thinking') {
+            // 上游 gateway 路线本身不校验 signature/密文（官方发空 signature），
+            // 只保留文本语义：无明文则跳过，绝不伪造密文。
+            log('debug', 'cc assistant redacted_thinking skipped (no plaintext)', {})
+          } else if (part.type === 'image_url' || part.type === 'image') {
+            const url = extractImageUrl(part)
+            if (!url) {
+              log('warn', 'cc assistant image omitted: empty url', {})
+              continue
+            }
+            log('warn', 'cc assistant image preserved', { url: shortUrl(url) })
+            const img: any = { type: 'image', image: url }
+            const cc = pickEphemeralCacheControl(part?.cache_control)
+            if (cc) img.cache_control = cc
+            parts.push(img)
+          } else if (part?.type) {
+            log('warn', 'cc assistant part dropped', { partType: part.type })
+          }
         }
       }
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
+          let toolCallId = tc.id
+          if (!toolCallId) {
+            toolCallId = `call_${randHex(8)}`
+            log('warn', 'cc tool_call missing id, generated fallback', { fallback: toolCallId, toolName: tc.function?.name || '' })
+          }
+          const rawArgs = tc.function?.arguments
+          let input: any
+          if (typeof rawArgs === 'string') {
+            const parsed = tryParseJSONStrict(rawArgs)
+            if (isJSONParseFailure(parsed)) {
+              // 上游 tool-call.input 只接受对象（cmdcode2api 实测：标量/尾随内容被拒），
+              // 透传裸字符串会被判 Param Incorrect 并 400 掉整轮。回退空对象保活，
+              // 原始片段留在日志里便于定位（原先 passthrough raw 就是 400 的来源之一）。
+              log('warn', 'cc tool arguments parse failed, using empty object', { raw: rawArgs.slice(0, 200), message: parsed.message })
+              input = {}
+            } else if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              log('warn', 'cc tool arguments not an object, using empty object', { type: Array.isArray(parsed) ? 'array' : typeof parsed })
+              input = {}
+            } else {
+              input = parsed
+            }
+          } else if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
+            input = rawArgs
+          } else {
+            input = {}
+          }
+          const toolName = tc.function?.name || tc.name || ''
+          if (!toolName) {
+            // 上游要求工具名非空（"`name` must be non-empty"）：空名会 400 掉整轮。
+            // 与 tool-result 侧一致，回退到非空占位名。
+            log('warn', 'cc tool_call empty name, using unknown_tool', { toolCallId })
+          }
           parts.push({
             type: 'tool-call',
-            toolCallId: tc.id,
-            toolName: tc.function?.name || '',
-            input: (typeof tc.function?.arguments === 'string' ? tryParseJSON(tc.function.arguments) : (tc.function?.arguments || {})),
+            toolCallId,
+            toolName: toolName || 'unknown_tool',
+            input,
           })
         }
       }
       return { role: 'assistant', content: parts }
     }
     if (msg.role === 'tool') {
+      const hasExplicitName = !!msg.name
+      const mappedName = toolNameMap[msg.tool_call_id]
+      const toolName = msg.name || mappedName || msg.tool_call_id || 'unknown_tool'
+      if (!hasExplicitName && !mappedName) {
+        log('debug', 'cc tool-result unknown_tool fallback', { tool_call_id: msg.tool_call_id || '' })
+      }
+      let toolText: string
+      if (typeof msg.content === 'string') {
+        toolText = redactLargeDataUrls(msg.content)
+      } else if (Array.isArray(msg.content)) {
+        toolText = redactLargeDataUrls(msg.content.map((c: any) => {
+          if (c == null) return ''
+          if (typeof c === 'string') return c
+          if (c.type === 'text') return c.text || ''
+          if (c.type === 'image_url' || c.type === 'image') {
+            const url = extractImageUrl(c)
+            log('warn', 'cc tool image demoted to placeholder', { url: url ? shortUrl(url) : '(empty)' })
+            return url ? `[image: ${shortUrl(url)}]` : '[image omitted: empty url]'
+          }
+          // 文件/附件分片：内联 base64 截图可达数 MB，stringify 进 tool 文本后
+          // 会随历史每轮重发、直接顶爆上下文。降级为占位符，绝不整段搬运。
+          if (c.type === 'file' || c.type === 'input_file' || c.type === 'document') {
+            const name = c.filename || c.name || ''
+            const uri = typeof c.uri === 'string' ? c.uri : (typeof c.url === 'string' ? c.url : '')
+            const size = uri.startsWith('data:') ? `, ${uri.length} chars inline` : ''
+            log('warn', 'cc tool file demoted to placeholder', { name, inline: uri.startsWith('data:') })
+            return `[file: ${name || 'attachment'}${size}]`
+          }
+          if (typeof c.text === 'string') return c.text
+          try { return JSON.stringify(c) } catch { return String(c) }
+        }).join('\n'))
+      } else {
+        toolText = redactLargeDataUrls(JSON.stringify(msg.content))
+      }
       return {
         role: 'tool',
         content: [{
           type: 'tool-result',
           toolCallId: msg.tool_call_id,
-          toolName: msg.name || toolNameMap[msg.tool_call_id] || msg.tool_call_id || 'unknown_tool',
-          output: { type: 'text', value: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) },
+          toolName,
+          output: { type: 'text', value: toolText },
         }],
       }
     }
-    return { role: 'user', content: [{ type: 'text', text: String(msg.content ?? '') }] }
+    log('warn', 'cc unknown role mapped to user', { role: msg.role })
+    return { role: 'user', content: [{ type: 'text', text: stringifyUnknownContent(msg.content ?? '') }] }
   })
+
+  // 收敛历史里的重复 tool_call_id（上游对此零容忍，见 repairDuplicateToolCallIds）。
+  repairDuplicateToolCallIds(ccMessages)
+
+  // 最后一道安全网：任何消息形状里残留的巨型内联 data: URL（截图 base64）
+  // 都以占位符落地，绝不随历史每轮重发顶爆上下文。type:'image' 分片原样保留。
+  const touched = { n: 0 }
+  for (let i = 0; i < ccMessages.length; i++) {
+    ccMessages[i] = redactLargeDataUrlsIn(ccMessages[i], touched)
+  }
+  if (touched.n > 0) {
+    log('warn', 'cc redacted oversized inline data URLs in history', { strings: touched.n })
+  }
 
   const hasMessageCacheMarker = ccMessages.some((msg: any) =>
     Array.isArray(msg.content) && msg.content.some((part: any) => part?.cache_control))
@@ -104,10 +475,15 @@ export function buildCcRequest(openaiReq: any): any {
     const firstUserMessage = ccMessages.find((msg: any) => msg.role === 'user' && Array.isArray(msg.content))
     const cacheBoundary = firstUserMessage?.content.findLast((part: any) => part?.type === 'text')
     if (cacheBoundary) cacheBoundary.cache_control = { type: 'ephemeral' }
+  } else if (prompt_cache_key && hasMessageCacheMarker) {
+    // 双源并存时优先显式 cache_control（已存在标记则不再按 prompt_cache_key 注入）。
+    log('debug', 'cc cache prefers explicit cache_control over prompt_cache_key', {})
   }
 
   const body = {
     config: {
+      // workingDir / environment 为 CLI 仿真必需：上游按真实 CLI 请求计费/风控，
+      // 缺失或伪造不一致会导致指纹异常；此处保留当前进程值以模拟 CLI 环境。
       workingDir: process.cwd(),
       date: getDateStr(),
       environment: getEnvironment(),
@@ -120,12 +496,13 @@ export function buildCcRequest(openaiReq: any): any {
     },
     memory: null,
     taste: null,
-    skills: '',
+    // 官方恒为 null（1.62.1 bundle 实测）；此前发空串属于形状不一致。
+    skills: null,
     permissionMode: 'standard',
     params: {
       model: model || 'deepseek/deepseek-v4-flash',
       messages: ccMessages,
-      max_tokens: Math.min(max_tokens || 64000, 200000),
+      max_tokens: resolvedMaxTokens,
       stream: true,
     },
   }
@@ -145,38 +522,81 @@ export function buildCcRequest(openaiReq: any): any {
     ;(body.params as any).reasoning_effort = reasoning_effort
   }
   if (tools && tools.length > 0) {
-    ;(body.params as any).tools = tools.map((t: any) => ({
-      type: t.type || 'function',
-      name: t.function?.name || t.name || '',
-      description: t.function?.description || t.description || '',
-      input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
-    }))
+    ;(body.params as any).tools = tools.map((t: any) => {
+      const name = t.function?.name || t.name || ''
+      if (name === '') {
+        badRequest('Invalid tools: function name must not be empty')
+      }
+      const hasParams = t.function?.parameters !== undefined || t.input_schema !== undefined
+      const input_schema = t.function?.parameters ?? t.input_schema ?? { type: 'object', properties: {} }
+      if (!hasParams) {
+        log('debug', 'cc tools missing parameters, using default', { name })
+      }
+      const out: any = {
+        type: t.type || 'function',
+        name,
+        description: t.function?.description || t.description || '',
+        input_schema,
+      }
+      const strict = t.function?.strict ?? (t as any)?.strict
+      if (strict !== undefined) out.strict = strict
+      return out
+    })
   }
+  // 工具协议字段无条件转发：tool_choice / parallel_tool_calls 决定「怎么调用工具」，
+  // 丢掉会改变工具调用语义（客户端要求串行/强制某个工具时会被静默降级），
+  // 风险高于指纹收益。它们不在下面的采样参数收敛范围内。
   if (tool_choice !== undefined) {
     if (typeof tool_choice === 'string') {
       const map: Record<string, string> = { 'auto': 'auto', 'none': 'none', 'required': 'any' }
       ;(body.params as any).tool_choice = { type: map[tool_choice] || 'auto' }
-    } else if (tool_choice.type === 'function') {
-      ;(body.params as any).tool_choice = { type: 'tool', name: tool_choice.function?.name }
+    } else if (tool_choice && tool_choice.type === 'function') {
+      const out: any = { type: 'tool', name: tool_choice.function?.name }
+      // 显式透传并行/白名单开关，未知键也不丢（避免静默降级）。
+      if (tool_choice.allowed_tools !== undefined) out.allowed_tools = tool_choice.allowed_tools
+      if (tool_choice.disable_parallel_tool_use !== undefined) out.disable_parallel_tool_use = tool_choice.disable_parallel_tool_use
+      for (const k of Object.keys(tool_choice)) {
+        if (!(k in out) && k !== 'type' && k !== 'function') out[k] = tool_choice[k]
+      }
+      ;(body.params as any).tool_choice = out
     } else {
+      // 未知对象（含 allowed_tools / disable_parallel_tool_use）整体透传不丢。
       ;(body.params as any).tool_choice = tool_choice
     }
   }
   if (parallel_tool_calls !== undefined) {
     ;(body.params as any).parallel_tool_calls = parallel_tool_calls
   }
-  if (top_p !== undefined) {
-    ;(body.params as any).top_p = top_p
+
+  // 采样/提示参数默认不外发：官方 /alpha/generate 只带 model/messages/tools/
+  // system/max_tokens/stream/temperature?/reasoning_effort?，多带 top_p/stop/user/
+  // seed 会让请求体与真实 CLI 不一致（可被风控识别）。客户端仍可传这些字段
+  // （schema 不变、非法值照旧 400），只是不再转发；CC_FORWARD_SAMPLING_PARAMS=true
+  // 可恢复旧行为（见 shared/config.ts）。
+  if (FORWARD_SAMPLING_PARAMS) {
+    if (top_p !== undefined) {
+      ;(body.params as any).top_p = top_p
+    }
+    if (normalizedStop !== undefined) {
+      ;(body.params as any).stop = normalizedStop
+    }
+    if (user !== undefined) {
+      ;(body.params as any).user = user
+    }
+    if (seed !== undefined) {
+      ;(body.params as any).seed = seed
+    }
+  } else {
+    log('debug', 'cc sampling params not forwarded (faithful CLI wire)', {
+      dropped: [
+        top_p !== undefined ? 'top_p' : '',
+        normalizedStop !== undefined ? 'stop' : '',
+        user !== undefined ? 'user' : '',
+        seed !== undefined ? 'seed' : '',
+      ].filter(Boolean),
+    })
   }
-  if (stop !== undefined) {
-    ;(body.params as any).stop = stop
-  }
-  if (user !== undefined) {
-    ;(body.params as any).user = user
-  }
-  if (seed !== undefined) {
-    ;(body.params as any).seed = seed
-  }
+  void max_tokens
 
   return body
 }
@@ -189,28 +609,70 @@ export async function forwardToCC(
   promptCacheKey?: string,
 ): Promise<Response> {
   const url = `${CFG.apiBase}/alpha/generate`
-  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey)
+  // session 查找同样走大小写不敏感归一，避免框架未归一化时取不到显式 session。
+  const normalizedForSession: Record<string, string | undefined> = { ...incomingHeaders }
+  for (const k of Object.keys(incomingHeaders)) {
+    const lower = k.toLowerCase()
+    if (normalizedForSession[lower] === undefined) normalizedForSession[lower] = incomingHeaders[k]
+  }
+  const { sessionId, threadId } = getSessionContext(normalizedForSession, apiKey, promptCacheKey)
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    // 官方 CLI 固定发 User-Agent: cli（bundle buildCommandAuthHeaders）；缺失会被
+    // Cloudflare 以 403 Error 1010 拦截，本地此前完全没有这个头。
+    'User-Agent': 'cli',
     'Authorization': `Bearer ${apiKey}`,
     'x-cli-environment': 'production',
     'x-command-code-version': CC_VERSION,
     'x-session-id': sessionId,
-    'x-co-flag': 'false',
+    // x-co-flag 已从官方 1.62.1 移除（bundle 内 0 命中，仅旧版本存在）；继续发送
+    // 反而是可识别的旧版指纹，故删除。
     'x-taste-learning': 'false',
     'x-project-slug': fakeProjectSlug(sessionId),
     'traceparent': generateTraceparent(),
   }
 
-  if (CFG.zdr || incomingHeaders['x-cmd-zdr'] === '1') {
+  // 官方 body 顶层带 threadId（合法 UUID）；非 UUID 官方会省略，本地用派生的
+  // 稳定 UUID 恒定发送（同一 session 恒同一 thread）。
+  body.threadId = threadId
+
+  // generate 侧统一 ZDR：CFG.zdr || 请求头 x-cmd-zdr==='1'（大小写不敏感）。
+  if (CFG.zdr || getHeader(incomingHeaders, 'x-cmd-zdr') === '1') {
     headers['x-cmd-zdr'] = '1'
   }
 
-  return fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal,
-  })
+  // 总超时 300s，与调用方 signal 级联：任一 abort 即取消 fetch。
+  const timeoutSignal = AbortSignal.timeout(300_000)
+  const combinedSignal = typeof (AbortSignal as any).any === 'function'
+    ? (AbortSignal as any).any([signal, timeoutSignal])
+    : signal
+
+  try {
+    return await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: combinedSignal,
+    })
+  } catch (e: any) {
+    // 客户端断连必须透传 Abort，由上层转 499/停泵，绝不能变成 502。
+    if (signal.aborted) throw e
+    if (e?.name === 'AbortError' && signal.aborted) throw e
+    const msg = e?.message ?? String(e)
+    const causeCode = (e?.cause as any)?.code ? String((e.cause as any).code) : ''
+    const hay = `${msg} ${causeCode}`
+    const ctx = { apiBase: CFG.apiBase }
+    if (timeoutSignal.aborted || e?.name === 'TimeoutError') {
+      log('error', 'CC fetch timeout', { ...ctx, message: msg })
+    } else if (/ENOTFOUND|EAI_AGAIN|getaddrinfo|DNS/i.test(hay)) {
+      log('error', 'CC fetch DNS error', { ...ctx, message: msg, code: causeCode || undefined })
+    } else if (/ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|EPIPE/i.test(hay)) {
+      log('error', 'CC fetch connection error', { ...ctx, message: msg, code: causeCode || undefined })
+    } else {
+      log('error', 'CC fetch failed', { ...ctx, message: msg })
+    }
+    // 固定外发文案，不泄 IP/内网细节；分类细节只进日志。
+    throw new Error('Upstream fetch failed')
+  }
 }

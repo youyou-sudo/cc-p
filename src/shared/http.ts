@@ -1,22 +1,32 @@
+// Layer: kernel（底层，可被所有人依赖，自己只依赖 kernel）
 import { CFG, MAX_BODY_SIZE } from './config'
 import { log } from './logger'
 
 // Default CORS policy. `*` (any web page may call the proxy) is fine when no
 // `CC_API_KEY` fallback is set — every request must still present its own key.
-// Once a fallback key is configured, the proxy becomes fully open to keyless
-// browser calls from any origin, so unless the operator opts in via
-// `CORS_ALLOW_ORIGIN`, we refuse browser cross-origin calls entirely
+// Once a fallback key is configured, keyless browser calls must NOT be
+// readable cross-origin: unless the operator opts in via `CORS_ALLOW_ORIGIN`,
+// we omit `Access-Control-Allow-Origin` entirely (browsers then block the read
+// by default). Never emit `Allow-Origin: null` — that would wrongly allow
+// opaque origins such as `file://` pages to drain the fallback key's quota.
 // (curl / SDKs are unaffected — they do not send an Origin header).
 function corsAllowOrigin(): string {
   if (CFG.corsAllowOrigin) return CFG.corsAllowOrigin
-  return CFG.apiKey ? 'null' : '*'
+  return CFG.apiKey ? '' : '*'
 }
 
-export const CORS_HEADERS: Record<string, string> = {
-  'Access-Control-Allow-Origin': corsAllowOrigin(),
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': '*',
+function buildCorsHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': '*',
+    'Vary': 'Origin',
+  }
+  const origin = corsAllowOrigin()
+  if (origin) headers['Access-Control-Allow-Origin'] = origin
+  return headers
 }
+
+export const CORS_HEADERS: Record<string, string> = buildCorsHeaders()
 
 export const SSE_HEADERS: Record<string, string> = {
   'Content-Type': 'text/event-stream',
@@ -27,7 +37,9 @@ export const SSE_HEADERS: Record<string, string> = {
 
 export function sendJSON(status: number, data: unknown): Response {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  if ((data as any)?.retry_after !== undefined) {
+  // Only 429 carries a legitimate Retry-After. Never emit it for 5xx (502/500):
+  // SDKs must not backoff-retry a proxy/upstream failure as if it were rate limiting.
+  if (status === 429 && (data as any)?.retry_after !== undefined) {
     headers['Retry-After'] = String((data as any).retry_after)
   }
   return new Response(JSON.stringify(data), { status, headers })
@@ -56,8 +68,10 @@ export class BodyTooLargeError extends Error {
   }
 }
 
-const DRAIN_LIMIT = 32 * 1024 * 1024
-const sharedDecoder = new TextDecoder()
+// Drain cap for over-limit bodies: proportional to MAX_BODY_SIZE so a small
+// CC_MAX_BODY_MB still discards quickly, capped at 32MB for huge limits.
+const DRAIN_LIMIT = Math.min(32 * 1024 * 1024, Math.max(1024 * 1024, Math.floor(MAX_BODY_SIZE / 4)))
+// Per-read stall timeout. Total budget is enforced separately via start+totalTimeoutMs.
 
 /**
  * Read + parse a JSON request body with a single-pass size cap.
@@ -69,13 +83,20 @@ const sharedDecoder = new TextDecoder()
  * previously only inferable from the status code the client received. The
  * access log records the 400/413 but not WHY, so a client stuck in a 413 loop
  * (or a slow-upload attack) had no signature to grep for.
+ *
+ * `timeoutMs` is the per-read stall budget; `totalTimeoutMs` is the whole-body
+ * budget, so a slow drip (each read under the stall limit) still fails.
  */
-export async function readJsonBody(request: Request, timeoutMs: number = 30000): Promise<any> {
-  const startedAt = Date.now()
+export async function readJsonBody(
+  request: Request,
+  timeoutMs: number = 30000,
+  totalTimeoutMs: number = 300000,
+): Promise<any> {
+  const readStartedAt = Date.now()
   const ctx = (extra: Record<string, unknown>) => ({
     method: request.method,
     contentLength: request.headers.get('content-length') ?? '(none)',
-    elapsedMs: Date.now() - startedAt,
+    elapsedMs: Date.now() - readStartedAt,
     ...extra,
   })
 
@@ -97,15 +118,24 @@ export async function readJsonBody(request: Request, timeoutMs: number = 30000):
     throw new Error('Invalid JSON')
   }
 
+  const startedAt = Date.now()
   const chunks: Uint8Array[] = []
   let totalSize = 0
   let tooLarge = false
   let drained = 0
 
   while (true) {
+    // Total budget: orthogonal to the per-read stall timeout below. A slow
+    // drip (each read < timeoutMs) must still fail after totalTimeoutMs.
+    const elapsed = Date.now() - startedAt
+    if (elapsed >= totalTimeoutMs) {
+      try { reader.cancel() } catch {}
+      throw new Error('Request read timeout')
+    }
+    const remaining = Math.min(timeoutMs, totalTimeoutMs - elapsed)
     let result: { done: boolean; value?: Uint8Array }
     try {
-      result = await readWithTimeout(reader.read(), timeoutMs, 'READ_BODY_TIMEOUT')
+      result = await readWithTimeout(reader.read(), remaining, 'READ_BODY_TIMEOUT')
     } catch (e: any) {
       if (e.message === 'READ_BODY_TIMEOUT') {
         try { reader.cancel() } catch {}
@@ -159,7 +189,8 @@ export async function readJsonBody(request: Request, timeoutMs: number = 30000):
     throw new BodyTooLargeError()
   }
 
-  const text = chunks.map((c) => sharedDecoder.decode(c, { stream: true })).join('') + sharedDecoder.decode()
+  const decoder = new TextDecoder()
+  const text = chunks.map((c) => decoder.decode(c, { stream: true })).join('') + decoder.decode()
   try {
     return JSON.parse(text)
   } catch {

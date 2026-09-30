@@ -1,177 +1,87 @@
-// Classification and detection helpers for upstream limits and context pressure.
+// Layer: domain（可依赖 kernel / toolkit，不可被 kernel 依赖）
+// Upstream limit classification: distinguish retryable rate limits from
+// non-retryable usage windows / context overflow / payment / auth failures.
+// Pure functions, no I/O — covered by test/unit.ts.
 
-/** Distinct upstream-limit families. Plain "rate_limit_error" is ambiguous;
- *  callers inspect the original upstream message to distinguish what actually
- *  happened and decide whether a retry is even possible. */
 export type UpstreamLimitKind =
-  | 'rate_limit'                 // 429 "rate limit exceeded" — retry after delay
-  | 'usage_window_5h'            // 429 / usage window 5h (monthly credits paced)
-  | 'usage_window_weekly'        // 429 / usage window weekly
-  | 'usage_window_other'         // 429 usage window with unknown window name
-  | 'payment_required'          // 402 — no credits / pay-as-you-go needed
-  | 'context_overflow'          // 400-ish "prompt too long / context overflow"
-  | 'authed_session_refused'     // 401/403 indicating session/fingerprint rejected
-  | 'unknown'                    // other 429 / 50x we can't classify
-
-/** Heuristic classification of an upstream failure. Works on the HTTP status
- *  and the upstream message, because Command Code encodes a lot of semantics
- *  into the message text (usage-window names, "prompt too long", etc.). */
-export function classifyUpstreamLimit(status: number, message: string): UpstreamLimitKind {
-  const m = message.trim()
-
-  // 402 is a separate family and is not a "rate limit" at all.
-  if (status === 402) return 'payment_required'
-  if (status !== 429 && status !== 400 && status !== 403 && status !== 401) return 'unknown'
-
-  // 401/403 read as an auth/session rejection regardless of wording — the
-  // upstream encodes fingerprint/session refusals here. Not retryable.
-  if (status === 401 || status === 403) {
-    return 'authed_session_refused'
-  }
-
-  // 400 family: context overflow patterns from Command Code docs.
-  if (status === 400) {
-    if (likelyContextOverflow(m)) return 'context_overflow'
-    return 'unknown'
-  }
-
-  // 429 family.
-  if (status === 429) {
-    if (containsUsageWindow(m, '5-hour')) return 'usage_window_5h'
-    if (containsUsageWindow(m, 'weekly') || containsUsageWindow(m, '7-day') || containsUsageWindow(m, '7 day')) return 'usage_window_weekly'
-    if (isUsageWindow(m)) return 'usage_window_other'
-    if (isRateLimit(m)) return 'rate_limit'
-    return 'rate_limit'
-  }
-
-  return 'unknown'
-}
+  | 'rate_limit'
+  | 'usage_window_5h'
+  | 'usage_window_weekly'
+  | 'context_overflow'
+  | 'payment_required'
+  | 'authed_session_refused'
+  | 'model_not_in_plan'
+  | 'unknown'
 
 export interface LimitMeta {
   kind: UpstreamLimitKind
   retryable: boolean
   retryAfterMs: number | null
-  resetHint: string | null
-  category: string
 }
 
-/** Classify and produce retry guidance. `retryAfterFromHeader` is parsed from
- *  the `Retry-After` response header (seconds or HTTP-date), not from the
- *  upstream error message (which may be text only). */
+const USAGE_5H_PATTERN = /5-hour|5 hour|five hour/i
+const USAGE_WEEKLY_PATTERN = /week/i
+const PAYMENT_MESSAGE_PATTERN =
+  /insufficient\s+credits?|out\s+of\s+credits?|no\s+credits?|payment\s+required|billing|past\s+due|balance\s+(exhausted|insufficient)|insufficient\s+balance|premium[_ ]+credits?[_ ]+exhausted/i
+// 官方 CLI 的终局标记之一（`premium_credits_exhausted` / `model_not_in_plan` /
+// `insufficient credits` 命中即判不可重试）。model_not_in_plan 是订阅/授权类，
+// 重试永远不会成功，必须与真实 429 区分开。
+const MODEL_NOT_IN_PLAN_PATTERN = /model[_ ]?not[_ ]?in[_ ]?(the[_ ]?)?plan/i
+// Local overflow whitelist. Duplicated from errors.ts (CONTEXT_WINDOW_EXCEEDED_PATTERN)
+// on purpose to avoid an errors<->limit import cycle; keep the two in sync.
+const CONTEXT_OVERFLOW_PATTERN =
+  /context_window_exceeded|prompt\s+(is\s+)?too\s+(long|large)|prompt\s+exceeds?.*tokens?|input\s+(is\s+)?too\s+(long|large)|input\s+tokens?.*exceed|context\s+length\s+exceeded|context\s+(window\s+)?exceeded|context\s+too\s+(long|large)|context\s+limit.*exceed|too\s+many\s+tokens|maximum\s+context|message\s+(is\s+)?too\s+long/i
+
+function isOverflowMessage(message: string): boolean {
+  return CONTEXT_OVERFLOW_PATTERN.test(message || '')
+}
+
+export function classifyUpstreamLimit(status: number, message: string): UpstreamLimitKind {
+  const msg = message || ''
+  // Usage windows first: they arrive as 429 but must NOT be retried.
+  if (status === 429 && USAGE_5H_PATTERN.test(msg)) return 'usage_window_5h'
+  if (status === 429 && USAGE_WEEKLY_PATTERN.test(msg)) return 'usage_window_weekly'
+  // Plan/entitlement wall: terminal regardless of the status the server used.
+  if (MODEL_NOT_IN_PLAN_PATTERN.test(msg)) return 'model_not_in_plan'
+  // Payment wording wins even when upstream mislabels the status (e.g. 429
+  // with "insufficient credits"): retrying burns money, never retry.
+  if (PAYMENT_MESSAGE_PATTERN.test(msg)) return 'payment_required'
+  if (status === 402) return 'payment_required'
+  if (status === 401 || status === 403) return 'authed_session_refused'
+  // Overflow downgrade only for 4xx excluding 429: a true 429 rate limit must
+  // stay rate_limit instead of being demoted to 400 by an overbroad keyword.
+  if (status !== 429 && status >= 400 && status < 500 && isOverflowMessage(msg)) {
+    return 'context_overflow'
+  }
+  if (status === 429) return 'rate_limit'
+  return 'unknown'
+}
+
+/** Retry guidance for a classified limit. `retryAfter` is the upstream
+ *  Retry-After header value in seconds (number) or null when absent. */
 export function limitMeta(
   status: number,
   message: string,
-  retryAfterFromHeader: number | null,
+  retryAfter: number | string | null | undefined,
 ): LimitMeta {
   const kind = classifyUpstreamLimit(status, message)
-  switch (kind) {
-    case 'payment_required':
-      return noRetry('payment_required', message, 0)
-    case 'usage_window_5h':
-    case 'usage_window_weekly':
-    case 'usage_window_other':
-      // Windows resolve on a schedule. Retrying only wastes credit; user/SDK
-      // should wait for reset or buy extra credits (which bypass the window).
-      return noRetry(kind, message + ' (usage window — wait for reset or use extra credits)', null)
-    case 'context_overflow':
-      return noRetry('context_overflow', message, 0)
-    case 'authed_session_refused':
-      return noRetry('authed_session_refused', message, 0)
-    case 'rate_limit': {
-      // 30s default matches the previous proxy contract (Retry-After: 30).
-      // The in-proxy retry loop uses its own backoff (retry.ts), so this only
-      // affects what the client sees / SDK-level retry delays.
-      const base = retryAfterFromHeader && retryAfterFromHeader > 0
-        ? retryAfterFromHeader * 1000
-        : 30_000
-      return {
-        kind,
-        retryable: true,
-        retryAfterMs: Math.max(1000, base),
-        resetHint: null,
-        category: 'rate_limit',
-      }
+  if (kind !== 'rate_limit') {
+    // 官方 CLI 的可重试集合是 408 / 429 / 5xx（isRetryableStatus），5xx 属
+    // 「瞬时上游故障」，HTTP 层同样应重试（此前只重试 429，生产里一次网关
+    // 502 就直接透传给客户端）。业务终局类（usage window / payment / auth /
+    // plan / overflow）已被 classify 归到各自 kind，不会落到 unknown。
+    const transientStatus = status === 408 || (status >= 500 && status <= 599)
+    if (kind === 'unknown' && transientStatus) {
+      return { kind, retryable: true, retryAfterMs: null }
     }
-    default: {
-      // Unclassified failures are only worth a retry when the outcome can
-      // actually change (server-side trouble / request timeout); a 404 or
-      // 422 fails identically on every attempt.
-      const base = retryAfterFromHeader && retryAfterFromHeader > 0
-        ? retryAfterFromHeader * 1000
-        : 4000
-      return {
-        kind,
-        retryable: status >= 500 || status === 408,
-        retryAfterMs: Math.max(500, base),
-        resetHint: null,
-        category: 'unknown',
-      }
-    }
+    return { kind, retryable: false, retryAfterMs: null }
   }
-}
-
-function noRetry(kind: UpstreamLimitKind, message: string, fallbackMs: number | null): LimitMeta {
-  return {
-    kind,
-    retryable: false,
-    retryAfterMs: fallbackMs,
-    resetHint: null,
-    category: kind,
+  let retryAfterMs: number | null = null
+  if (typeof retryAfter === 'number' && Number.isFinite(retryAfter) && retryAfter > 0) {
+    retryAfterMs = retryAfter * 1000
+  } else if (typeof retryAfter === 'string' && retryAfter !== '') {
+    const secs = Number(retryAfter)
+    if (Number.isFinite(secs) && secs > 0) retryAfterMs = secs * 1000
   }
-}
-
-// Helpers for text classification. Case-insensitive; tolerate punctuation.
-
-const USAGE_WINDOW_PATTERNS: Array<[RegExp, UpstreamLimitKind]> = [
-  [/5[- ]?hour/i, 'usage_window_5h' as UpstreamLimitKind],
-  [/weekly|7[- ]?day/i, 'usage_window_weekly' as UpstreamLimitKind],
-]
-
-function isUsageWindow(message: string): boolean {
-  const lower = message.toLowerCase()
-  // Must NOT be a pure rate-limit phrase ("limit" alone is too broad — a
-  // "rate limit exceeded" message would match `limit`).
-  if (lower.includes('rate limit') || lower.includes('too many requests') || lower.includes('request rate')) return false
-  return hasLimitVerb(lower)
-}
-
-function containsUsageWindow(message: string, marker: string): boolean {
-  const lower = message.toLowerCase()
-  return isUsageWindow(message) && lower.includes(marker.toLowerCase())
-}
-
-/** True when the text reads like a usage/credit window: it names a cap/window
- *  CONTEXT, not merely the word "limit". */
-function hasLimitVerb(lower: string): boolean {
-  return (
-    lower.includes('usage limit') ||
-    lower.includes('usage window') ||
-    lower.includes('spend limit') ||
-    lower.includes('spend cap') ||
-    lower.includes('credit limit') ||
-    lower.includes('weekly') ||
-    lower.includes('monthly') ||
-    lower.includes('cap on') ||
-    lower.includes('reached your') ||
-    lower.includes('resets in') ||
-    lower.includes('resets at')
-  )
-}
-
-function isRateLimit(message: string): boolean {
-  const lower = message.toLowerCase()
-  return lower.includes('rate limit') || lower.includes('too many requests') || lower.includes('request rate')
-}
-
-function likelyContextOverflow(message: string): boolean {
-  const lower = message.toLowerCase()
-  return (
-    lower.includes('prompt too long') ||
-    lower.includes('prompt is too long') ||
-    lower.includes('too long') ||
-    (lower.includes('context') && (lower.includes('exceed') || lower.includes('overflow') || lower.includes('too large') || lower.includes('too long'))) ||
-    (lower.includes('max ') && (lower.includes('tokens') || lower.includes('length'))) ||
-    lower.includes('exceeded the context') ||
-    lower.includes('context window')
-  )
+  return { kind, retryable: true, retryAfterMs }
 }
