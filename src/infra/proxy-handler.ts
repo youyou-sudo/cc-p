@@ -73,6 +73,28 @@ export interface UpstreamCallArgs<T> {
   label: string
   /** Map a non-2xx upstream status into this protocol's error Response. */
   onCcError: (mapped: MappedError) => T
+  /**
+   * Wall-clock instant (epoch ms) after which retrying is pointless because the
+   * caller has already given up. Optional: plain `callUpstream` does not retry
+   * at all, so it ignores this. `callUpstreamWithSlots` uses it to cap its
+   * backoff — sleeping past the client's deadline would only produce a second
+   * attempt nobody is waiting for, and for a non-idempotent endpoint that is a
+   * second generation charged to the user.
+   *
+   * Derive it from a client-supplied header (e.g. a request timeout) rather
+   * than inventing a value: guessing could cut retries that would have
+   * succeeded.
+   */
+  clientDeadlineAt?: number
+}
+
+/** Read a client-declared deadline from headers, if it exposes one. */
+export function clientDeadlineFrom(headers: Record<string, string | undefined>): number | undefined {
+  const raw = headers['x-request-timeout-ms'] ?? headers['x-timeout-ms']
+  if (!raw) return undefined
+  const ms = Number(raw)
+  if (!Number.isFinite(ms) || ms <= 0) return undefined
+  return Date.now() + ms
 }
 
 /** ensureInitialized → POST /alpha/generate → map non-2xx (protocol-specific). */
