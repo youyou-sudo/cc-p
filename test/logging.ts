@@ -81,6 +81,50 @@ clear(); await (await get('/teapot')).text(); await settle()
 check('access log: 4xx -> warn', find('Request rejected').length === 1
   && find('Request rejected')[0]?.data?.status === 418, lines)
 
+// The 413 sentinel: a plain Error carrying status=413, thrown from the parse
+// phase, which Elysia reports as code 'UNKNOWN' and renders with no Response.
+// The onError stash in plugins/access.ts exists solely for this, and e2e only
+// asserts the status the CLIENT sees, not that the log agrees.
+//
+// The throw must come from a hook, not the handler: a handler that returns
+// normally never reaches onError, so the stash stays empty.
+const sentinel = new Elysia()
+  .use(accessLogPlugin)
+  .onTransform({ as: 'scoped' }, () => {
+    const err: any = new Error('body too large')
+    err.status = 413
+    throw err
+  })
+  .post('/sentinel', () => new Response('ok'))
+sentinel.listen({ port: 4384, hostname: '127.0.0.1' })
+await Bun.sleep(200)
+
+clear()
+await fetch('http://127.0.0.1:4384/sentinel', { method: 'POST', body: '{}' }).then((r) => r.text()).catch(() => {})
+await settle()
+// 413 is a 4xx, so it lands on 'Request rejected' (warn). The assertion is
+// about the recovered STATUS, not the level: before the onError stash this
+// outcome had no Response and no numeric set.status, so it fell through to the
+// 500 default and was logged as a server error for a client-side problem.
+check('access log: error-carrying 413 is recovered, not logged as 500',
+  find('Request rejected').length === 1
+  && find('Request rejected')[0]?.data?.status === 413
+  && find('Request failed').length === 0, lines)
+
+// 499 (client gone) is the status both handlers return on cancellation. It
+// must be recorded rather than dropped, and must not be mistaken for success.
+clear()
+const goneApp = new Elysia()
+  .use(accessLogPlugin)
+  .get('/gone', () => new Response(null, { status: 499 }))
+goneApp.listen({ port: 4383, hostname: '127.0.0.1' })
+await Bun.sleep(200)
+const goneRes = await fetch('http://127.0.0.1:4383/gone')
+await settle()
+check('access log: 499 is recorded as a rejection', goneRes.status === 499
+  && find('Request rejected').length === 1, { status: goneRes.status, lines })
+check('access log: 499 is never recorded as success', find('Request completed').length === 0, lines)
+
 clear()
 await Promise.all([get('/ok').then((r) => r.text()), get('/ok').then((r) => r.text()), get('/ok').then((r) => r.text())])
 await settle()
@@ -109,6 +153,24 @@ check('sse: keepalive/ping still counted (proves we were writing to a dead socke
 p.close('test-close')
 check('sse: close failure is counted', p.snapshot().closeErrorCount === 1, p.snapshot())
 check('sse: closeReason recorded', p.snapshot().closeReason === 'test-close', p.snapshot())
+
+// terminateWith is only ever called from the client-abort paths, so it must
+// not label a disconnect as a normal close. It did before this was fixed:
+// close()'s default reason won because the pump's later close('pump-finished')
+// returns early once `closed` is set.
+const pTerm = new SsePipeline(true)
+pTerm.start()
+pTerm.terminateWith(['data: [DONE]\n\n'])
+check('sse: terminateWith records a client-abort close, not normal',
+  pTerm.snapshot().closeReason === 'client-abort', pTerm.snapshot())
+const pTerm2 = new SsePipeline(true)
+pTerm2.start()
+pTerm2.terminateWith(['data: [DONE]\n\n'], 'custom-reason')
+check('sse: terminateWith accepts an explicit reason',
+  pTerm2.snapshot().closeReason === 'custom-reason', pTerm2.snapshot())
+check('sse: a second close() after terminateWith does not overwrite the reason',
+  (pTerm2.close('pump-finished'), pTerm2.snapshot().closeReason === 'custom-reason'),
+  pTerm2.snapshot())
 
 // heartbeat must not throw out of setInterval
 const p2 = new SsePipeline(true)

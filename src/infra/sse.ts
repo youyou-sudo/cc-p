@@ -175,14 +175,18 @@ export class SsePipeline {
     this.terminalResolve?.()
   }
 
-  terminateWith(events: string[]): void {
+  /** Flush trailing events and close. Both call sites are client-abort paths
+   *  (chat and messages `onClientAbort`), so the reason is fixed rather than
+   *  left to close()'s 'normal' default — otherwise a disconnect was recorded
+   *  as a normal close, which is the opposite of what it is. */
+  terminateWith(events: string[], reason: string = 'client-abort'): void {
     if (this.closed) return
     this.started = true
     for (const event of this.buffered) this.enqueue(event)
     this.buffered = []
     for (const event of events) this.enqueue(event)
     this.firstOutputResolve?.()
-    this.close()
+    this.close(reason)
   }
 }
 
