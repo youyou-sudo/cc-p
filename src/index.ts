@@ -9,7 +9,23 @@ export function startServer() {
   startVersionRefresh()
   startSessionCleanup()
 
-  const app = createApp().listen({ port: CFG.port, hostname: CFG.host })
+  // idleTimeout: Elysia's Bun adapter hardcodes 30s (its dist/adapter/bun
+  // serve options) and .listen() only overrides it if asked. That 30s ceiling
+  // is TIGHTER than this proxy's own budgets (stream 30s / non-stream 90s /
+  // thinking 120s), so the latter two can never be reached — and it sits below
+  // 0, so a request is cut mid-flight with a generic socket error rather than
+  // the intended 429 + guidance.
+  //
+  // 0 disables the transport-level ceiling so shared/runtime.ts is the single
+  // authority for timeouts. It only bit bodyless slow requests in practice
+  // (Bun refreshes the idle timer when a request body is read, which is why
+  // POST generation survived), so this is a guard against a future bodyless
+  // slow route rather than a fix for an active bug.
+  //
+  // 0 also means nothing here bounds a stalled response, so pin an operational
+  // ceiling at the proxy in front of this service (nginx/ALB/cloud LB) if you
+  // need one. See doc/modules/02a-plugins-access.md for the measured behaviour.
+  const app = createApp().listen({ port: CFG.port, hostname: CFG.host, idleTimeout: 0 })
 
   log('info', 'CC Proxy started', {
     url: `http://${CFG.host}:${CFG.port}`,
