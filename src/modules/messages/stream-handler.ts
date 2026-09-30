@@ -61,6 +61,7 @@ export async function handleMessagesStream(deps: MessagesStreamDeps): Promise<Re
       inputTokens: ctx.inputTokens,
       outputTokens: ctx.outputTokens,
       cachedInputTokens: ctx.cachedInputTokens,
+      ...pipeline.snapshot(),
     })
     // 流中 abort → 静默 close（见 handler 门面 499 语义注释），不再伪造零 usage 成功帧。
     pipeline.cancel()
@@ -118,6 +119,19 @@ export async function handleMessagesStream(deps: MessagesStreamDeps): Promise<Re
           try { abortController.abort() } catch {}
         } else {
           pipeline.start()
+          // 成功也记一行：只有失败路径有日志时，无法回答「这条流到底成没成」。
+          // 附上 SSE 计数器，区分「正常完成」和「客户端中途消失（写了 N 帧后
+          // 全部 enqueue 失败）」—— 后者上游看起来是成功的。
+          log('info', 'Anthropic stream finish', {
+            path: '/v1/messages',
+            model,
+            messageId: messageIdHolder.current,
+            elapsedMs: Date.now() - startTime,
+            inputTokens: ctx.inputTokens,
+            outputTokens: ctx.outputTokens,
+            cachedInputTokens: ctx.cachedInputTokens,
+            ...pipeline.snapshot(),
+          })
         }
       }
     } catch (e: any) {

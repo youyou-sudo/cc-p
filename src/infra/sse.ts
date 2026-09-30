@@ -50,13 +50,57 @@ export class SsePipeline {
   keepaliveCount = 0
   pingCount = 0
   lastSentAt = Date.now()
+  /** 成功投递给客户端的帧数。 */
+  emittedCount = 0
+  /** 未能投递给客户端的帧数：下游已断开时 controller.enqueue 抛错。 */
+  enqueueErrorCount = 0
+  /** keepalive/ping 写入失败次数（心跳写进死 socket 是客户端断开的次级信号）。 */
+  heartbeatErrorCount = 0
+  heartbeatErrorLast: string | null = null
+  closeErrorCount = 0
+  /** 客户端在流中途断开（Bun 取消 response body）时为 true。 */
+  clientCancelled = false
+  clientCancelReason: string | null = null
+  closeReason: string | null = null
 
   constructor(private readonly autoStart: boolean) {
     this.firstOutput = new Promise((r) => { this.firstOutputResolve = r })
     this.terminal = new Promise((r) => { this.terminalResolve = r })
     this.stream = new ReadableStream({
       start: (controller) => { this.controller = controller },
+      // 客户端中途离开时 Bun 会取消 response body。之前无人观察：pump 会一直
+      // 跑到上游读超时，于是一次断连在日志里看起来像上游卡死。记录下来，
+      // terminal 日志才能区分「客户端走了」和「客户端慢」。
+      cancel: (reason) => {
+        this.clientCancelled = true
+        this.clientCancelReason = String(reason ?? '(none)')
+      },
     })
+  }
+
+  /** 计数器快照，供 terminal 日志使用。 */
+  snapshot(): {
+    keepaliveCount: number
+    pingCount: number
+    enqueueErrorCount: number
+    emitted: number
+    clientCancelled: boolean
+    closeReason: string | null
+    closeErrorCount: number
+    heartbeatErrorCount: number
+    heartbeatErrorLast: string | null
+  } {
+    return {
+      keepaliveCount: this.keepaliveCount,
+      pingCount: this.pingCount,
+      enqueueErrorCount: this.enqueueErrorCount,
+      emitted: this.emittedCount,
+      clientCancelled: this.clientCancelled,
+      closeReason: this.closeReason,
+      closeErrorCount: this.closeErrorCount,
+      heartbeatErrorCount: this.heartbeatErrorCount,
+      heartbeatErrorLast: this.heartbeatErrorLast,
+    }
   }
 
   /** 登记上游 reader，供 cancel() 调用。Handler 在 pump 内 getReader() 后应立即登记。 */
@@ -80,9 +124,13 @@ export class SsePipeline {
     try {
       this.controller?.enqueue(this.encoder.encode(text))
       this.lastSentAt = Date.now()
+      this.emittedCount++
     } catch (e: any) {
       // 背压/下游已断开：队列满抛错时直接关闭，避免异常上浮杀死 pump；
       // buffered 已在 close() 中清空，不会无限涨。
+      // enqueueErrorCount 计入终端日志：心跳会继续往死 socket 里写 keepalive，
+      // 没有这个计数就看不出「客户端已经走了」。
+      this.enqueueErrorCount++
       log('warn', 'SSE enqueue failed, closing pipeline', { message: e?.message ?? String(e) })
       try { this.close() } catch {}
     }
@@ -137,8 +185,10 @@ export class SsePipeline {
 
   emitKeepalive(): void {
     if (!this.started || this.closed) return
-    this.enqueue(SSE_KEEPALIVE_COMMENT)
     this.keepaliveCount++
+    const before = this.enqueueErrorCount
+    this.enqueue(SSE_KEEPALIVE_COMMENT)
+    if (this.enqueueErrorCount > before) this.heartbeatErrorCount++
   }
 
   /** Idle heartbeat ping. Defaults to the Anthropic-native `ping` event
@@ -148,8 +198,13 @@ export class SsePipeline {
    *  `{"type":"ping"}` as a chunk. */
   sendPing(event: string = SSE_PING_EVENT): void {
     if (!this.started || this.closed) return
-    this.enqueue(event)
     this.pingCount++
+    const before = this.enqueueErrorCount
+    this.enqueue(event)
+    if (this.enqueueErrorCount > before) {
+      this.heartbeatErrorCount++
+      this.heartbeatErrorLast = `ping #${this.pingCount} failed`
+    }
   }
 
   writeNow(event: string): void {
@@ -165,9 +220,13 @@ export class SsePipeline {
     this.firstOutputResolve?.()
   }
 
-  close(): void {
+  /** `reason` 仅用于诊断：记录这条流为什么结束（正常 / client-abort /
+   *  上游出错…）。第一次调用生效，后续 close() 不会覆盖 —— 客户端断连后 pump
+   *  还会再调一次 close('pump-finished')，若让后者赢，一次断连就会被记成正常结束。 */
+  close(reason?: string): void {
     if (this.closed) return
     this.closed = true
+    if (reason) this.closeReason = reason
     // 静默关闭：清空 buffered 并只 resolve terminal，不碰 firstOutput。
     // 刻意让「未 start 即 close」（流前 abort）的 race 落到 terminal 分支，
     // 若此处也 resolve firstOutput，race 会误判为 started（已返回 200）。
@@ -175,7 +234,11 @@ export class SsePipeline {
     this.bufferedBytes = 0
     try {
       this.controller?.close()
-    } catch {}
+    } catch {
+      // 不覆盖 closeReason：调用方给的 reason 才是「为什么结束」的答案，
+      // close() 自身的异常只是附加信息（并入计数）。
+      this.closeErrorCount++
+    }
     this.terminalResolve?.()
   }
 }

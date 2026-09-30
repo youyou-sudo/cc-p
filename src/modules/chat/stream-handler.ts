@@ -100,6 +100,11 @@ export async function handleChatStream(deps: ChatStreamDeps): Promise<Response> 
       inputTokens: translator.inputTokens,
       outputTokens: translator.outputTokens,
       cachedInputTokens: translator.cachedInputTokens,
+      // 客户端断开后心跳仍会往死 socket 里写，enqueueErrorCount > 0 才能证明
+      // 「写不进去」而不是「写得慢」—— 二者的处置完全不同。
+      enqueueErrorCount: pipeline.enqueueErrorCount,
+      closeErrorCount: pipeline.closeErrorCount,
+      heartbeatErrorCount: pipeline.heartbeatErrorCount,
     })
     // 流中 abort → 静默 close（见 handler 文件头 499 语义注释），不再伪造 zeroUsageChunk 成功帧。
     pipeline.cancel()
@@ -166,6 +171,19 @@ export async function handleChatStream(deps: ChatStreamDeps): Promise<Response> 
         } else {
           recordTimeoutSuccess(apiKey, sessionId)
           pipeline.emit([translator.getDoneEvent()])
+          // 成功也记一行：只有失败路径有日志时，无法回答「这条流到底成没成」。
+          // 附上 SSE 计数器，区分「正常完成」和「客户端中途消失（写了 N 帧后
+          // 全部 enqueue 失败）」—— 后者在上游看起来是成功的。
+          log('info', 'Chat stream finish', {
+            path: '/v1/chat/completions',
+            model,
+            completionId,
+            streaming: true,
+            elapsedMs: Date.now() - startTime,
+            inputTokens: translator.inputTokens,
+            outputTokens: translator.outputTokens,
+            ...pipeline.snapshot(),
+          })
         }
       }
     } catch (e: any) {

@@ -12,6 +12,7 @@
 
 export { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, THINKING_IDLE_TIMEOUT_MS } from './config'
 import { NONSTREAM_IDLE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, THINKING_IDLE_TIMEOUT_MS } from './config'
+import { log } from './logger'
 export const TIMEOUT_REDUCE_CONTEXT_THRESHOLD = 3
 /** Only suggest reducing context when we actually know input is large. */
 export const TIMEOUT_LARGE_CONTEXT_TOKENS = 80_000
@@ -88,24 +89,49 @@ function entryFor(scopedKey: string, now: number): TimeoutEntry {
   return entry
 }
 
-/** A request for this key hit the idle timeout: bump its scoped counter. */
+/** A request for this key hit the idle timeout: bump its scoped counter.
+ *  Logged because this counter is the source of the `consecutive_timeouts`
+ *  field in timeoutMessage(). Without a line here, a client stuck in a
+ *  timeout loop leaves no trace of when the counter crossed the
+ *  reduce-context threshold or which session bucket accumulated it. */
 export function recordTimeout(apiKey: string, sessionId?: string): void {
   const now = Date.now()
   if (timeoutStates.size > 0) pruneStale(now)
-  const entry = entryFor(scopeKey(apiKey, sessionId), now)
+  const key = scopeKey(apiKey, sessionId)
+  const entry = entryFor(key, now)
   entry.consecutiveTimeouts++
   entry.lastUpdatedAt = now
   if (timeoutStates.size > MAX_TIMEOUT_STATES) evictOldestTimeoutStates()
+  log('info', 'Timeout recorded', {
+    keyPrefix: apiKey.slice(0, 8),
+    session: sessionId ?? '(none)',
+    consecutiveTimeouts: entry.consecutiveTimeouts,
+    threshold: TIMEOUT_REDUCE_CONTEXT_THRESHOLD,
+    willSuggestReduceContext: entry.consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD,
+    trackedBuckets: timeoutStates.size,
+  })
 }
 
-/** A request for this key completed successfully: clear its scoped counter. */
+/** A request for this key completed successfully: clear its scoped counter.
+ *  Logged only when a counter actually existed, so the common case (no prior
+ *  timeout) does not add a line per successful request. */
 export function recordTimeoutSuccess(apiKey: string, sessionId?: string): void {
   const now = Date.now()
   if (timeoutStates.size > 0) pruneStale(now)
-  timeoutStates.delete(scopeKey(apiKey, sessionId))
+  const key = scopeKey(apiKey, sessionId)
+  const had = timeoutStates.delete(key)
+  let hadLegacy = false
   if (sessionId === undefined) {
     // Drop legacy bare-key entry left by pre-scope versions.
-    timeoutStates.delete(legacyKey(apiKey))
+    hadLegacy = timeoutStates.delete(legacyKey(apiKey))
+  }
+  if (had || hadLegacy) {
+    log('info', 'Timeout counter cleared', {
+      keyPrefix: apiKey.slice(0, 8),
+      session: sessionId ?? '(none)',
+      clearedLegacy: hadLegacy,
+      trackedBuckets: timeoutStates.size,
+    })
   }
 }
 

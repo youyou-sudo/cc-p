@@ -1,5 +1,6 @@
 // Layer: kernel（底层，可被所有人依赖，自己只依赖 kernel）
 import { CFG, MAX_BODY_SIZE } from './config'
+import { log } from './logger'
 
 // Default CORS policy. `*` (any web page may call the proxy) is fine when no
 // `CC_API_KEY` fallback is set — every request must still present its own key.
@@ -72,18 +73,50 @@ export class BodyTooLargeError extends Error {
 const DRAIN_LIMIT = Math.min(32 * 1024 * 1024, Math.max(1024 * 1024, Math.floor(MAX_BODY_SIZE / 4)))
 // Per-read stall timeout. Total budget is enforced separately via start+totalTimeoutMs.
 
+/**
+ * Read + parse a JSON request body with a single-pass size cap.
+ *
+ * Every rejection path here is logged. That is deliberate: this function is
+ * the choke point for body reads on BOTH entry paths (plugins/body.ts onParse
+ * and proxy-handler readRequestJson), and each of these outcomes is a
+ * candidate slow-loris / oversized-payload / malformed-client signal that was
+ * previously only inferable from the status code the client received. The
+ * access log records the 400/413 but not WHY, so a client stuck in a 413 loop
+ * (or a slow-upload attack) had no signature to grep for.
+ *
+ * `timeoutMs` is the per-read stall budget; `totalTimeoutMs` is the whole-body
+ * budget, so a slow drip (each read under the stall limit) still fails.
+ */
 export async function readJsonBody(
   request: Request,
   timeoutMs: number = 30000,
   totalTimeoutMs: number = 300000,
 ): Promise<any> {
+  const readStartedAt = Date.now()
+  const ctx = (extra: Record<string, unknown>) => ({
+    method: request.method,
+    contentLength: request.headers.get('content-length') ?? '(none)',
+    elapsedMs: Date.now() - readStartedAt,
+    ...extra,
+  })
+
   const contentLength = Number(request.headers.get('content-length') ?? '')
   if (Number.isFinite(contentLength) && contentLength > MAX_BODY_SIZE) {
+    // Rejected on the declared length alone: the body is never read, so this
+    // is cheap and cannot be used to make the proxy buffer anything.
+    log('warn', 'Request body rejected on content-length', ctx({
+      declaredBytes: contentLength,
+      limitBytes: MAX_BODY_SIZE,
+      rejectedEarly: true,
+    }))
     throw new BodyTooLargeError()
   }
 
   const reader = request.body?.getReader()
-  if (!reader) throw new Error('Invalid JSON')
+  if (!reader) {
+    log('warn', 'Request body is not a readable stream', ctx({}))
+    throw new Error('Invalid JSON')
+  }
 
   const startedAt = Date.now()
   const chunks: Uint8Array[] = []
@@ -106,6 +139,13 @@ export async function readJsonBody(
     } catch (e: any) {
       if (e.message === 'READ_BODY_TIMEOUT') {
         try { reader.cancel() } catch {}
+        log('warn', 'Request body read timeout', ctx({
+          timeoutMs,
+          bytesSoFar: totalSize,
+          // A single read() exceeding the budget is the slow-loris shape:
+          // the client opened the body then trickled or stalled.
+          stalledMidBody: totalSize > 0,
+        }))
         throw new Error('Request read timeout')
       }
       throw e
@@ -116,6 +156,15 @@ export async function readJsonBody(
       drained += value.byteLength
       if (drained > DRAIN_LIMIT) {
         try { reader.cancel() } catch {}
+        // We already know the body is oversized; we drain a bounded amount so
+        // the client sees a clean 413 instead of a reset connection, then
+        // stop reading. Stopping early here is what keeps an oversized upload
+        // from pinning memory/CPU, so it is worth recording.
+        log('warn', 'Oversized body drain aborted', ctx({
+          bytesAtAbort: totalSize,
+          drainedBytes: drained,
+          drainLimitBytes: DRAIN_LIMIT,
+        }))
         break
       }
       continue
@@ -128,13 +177,24 @@ export async function readJsonBody(
     }
     chunks.push(value)
   }
-  if (tooLarge) throw new BodyTooLargeError()
+  if (tooLarge) {
+    // Undeclared length (chunked transfer-encoding) that exceeded the cap
+    // only became visible while streaming, so this is the case a
+    // content-length pre-check cannot catch.
+    log('warn', 'Request body exceeded size limit while streaming', ctx({
+      bytesAtAbort: totalSize,
+      limitBytes: MAX_BODY_SIZE,
+      rejectedEarly: false,
+    }))
+    throw new BodyTooLargeError()
+  }
 
   const decoder = new TextDecoder()
   const text = chunks.map((c) => decoder.decode(c, { stream: true })).join('') + decoder.decode()
   try {
     return JSON.parse(text)
   } catch {
+    log('warn', 'Request body is not valid JSON', ctx({ bytes: totalSize }))
     throw new Error('Invalid JSON')
   }
 }

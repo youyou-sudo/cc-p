@@ -48,7 +48,9 @@ export function startServer() {
     zdr: CFG.zdr
       ? 'enabled (x-cmd-zdr: 1 on generation/init requests)'
       : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
-    emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on' : 'off',
+    emptySystemPlaceholder: CFG.emptySystemPlaceholder
+      ? 'on (single-space system placeholder keeps prompt_tokens minimal)'
+      : 'off (real upstream default system prompt applies)',
     logFile: CFG.logFile || '(console only)',
   })
 
