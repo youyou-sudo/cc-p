@@ -1,9 +1,10 @@
 # Command Code Proxy 项目文档
 
-> 生成时间：2026-09-29 · 基于工作区全量扫描（`src/` 48 个源文件、`test/` 7 个测试，共约 6 402 行 TypeScript）
+> 生成时间：2026-09-29 · 基于工作区全量扫描（`src/` 48 个源文件、`test/` 7 个测试，共约 6 620 行 TypeScript）
 >
-> 其中 `src/infra/proxy-slot.ts`、`src/shared/context.ts`、`src/shared/model-windows.ts` 三个文件
-> **已实现但未接线**（无任何 import 方），详见 §5.1；其余 45 个文件均在线运行路径上。
+> 其中 `src/infra/proxy-slot.ts` 与 `src/shared/context.ts` 两个文件**已实现但未接线**
+> （无任何 import 方），详见 §5.1；`src/shared/model-windows.ts` 现已被线上
+> `catalog.ts` 引用（上下文窗口唯一权威表），不再属于未接线；其余 46 个文件均在线运行路径上。
 
 ## 1. 项目简介
 
@@ -60,14 +61,13 @@
 ├──────────────────────────────────────────────────────────────────────┤
 │  已实现未接线 ⚠ src/infra/proxy-slot.ts   密钥池 + 并发闸门 + 限流 + 退避     │
 │             src/shared/context.ts       上下文 token 估算                   │
-│             src/shared/model-windows.ts  按模型的上下文窗口表                │
 │             （另：src/shared/api-keys.ts  src/shared/concurrency.ts          │
 │               src/shared/limit.ts 仅被未接线的 proxy-slot 引用）             │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
 > ⚠ **未接线说明**：`proxy-slot` 提供多 API Key 轮询、每 Key 并发上限、排队超时与指数退避；
-> `context` / `model-windows` 提供请求体 token 粗估与窗口检查。当前
+> `context` 提供请求体 token 粗估与窗口检查（其依赖的 `model-windows` 已是线上 唯一权威表，接入即自动与客户端看到的窗口一致）。当前
 > `chat/handler.ts` 与 `messages/handler.ts` 均直接调用 `infra/proxy-handler.ts` 的
 > `createUpstreamFlow` / `callUpstream`，**绕过 proxy-slot**，故上述能力两端都未生效。
 > 接入点：把 handler 的上游调用换成 `proxy-slot` 导出的封装，并按需调用
@@ -130,7 +130,7 @@ createApp                     (src/app.ts)
 
 | # | 报告 | 源文件 | 行数 | 层级 |
 |---|---|---|---|---|
-| 01 | [01-index.md](modules/01-index.md) | `src/index.ts` | 80 | 入口层 |
+| 01 | [01-index.md](modules/01-index.md) | `src/index.ts` | 96 | 入口层 |
 | 02 | [02-app.md](modules/02-app.md) | `src/app.ts` | 26 | 入口层 |
 | 02a | [02a-plugins-access.md](modules/02a-plugins-access.md) | `src/plugins/access.ts` | 99 | 插件层 |
 | 03 | [03-plugins-cors.md](modules/03-plugins-cors.md) | `src/plugins/cors.ts` | 16 | 插件层 |
@@ -169,16 +169,16 @@ createApp                     (src/app.ts)
 | 36 | [36-models-index.md](modules/36-models-index.md) | `src/modules/models/index.ts` | 13 | 协议层 |
 | 37 | [37-models-model.md](modules/37-models-model.md) | `src/modules/models/model.ts` | 33 | 协议层 |
 | 38 | [38-models-service.md](modules/38-models-service.md) | `src/modules/models/service.ts` | 15 | 协议层 |
-| 39 | [39-models-catalog.md](modules/39-models-catalog.md) | `src/modules/models/catalog.ts` | 139 | 协议层 |
+| 39 | [39-models-catalog.md](modules/39-models-catalog.md) | `src/modules/models/catalog.ts` | 159 | 协议层 |
 | 40 | [40-health.md](modules/40-health.md) | `src/modules/health/index.ts` | 12 | 协议层 |
 | 41 | [41-test-e2e.md](modules/41-test-e2e.md) | `test/e2e.ts` | 486 | 测试 |
 | 42 | [42-test-heartbeat.md](modules/42-test-heartbeat.md) | `test/heartbeat.ts` | 89 | 测试 |
 | 43 | [43-test-idle-timeout-env.md](modules/43-test-idle-timeout-env.md) | `test/idle-timeout-env.ts` | 111 | 测试 |
 | 44 | [44-test-timeouts.md](modules/44-test-timeouts.md) | `test/timeouts.ts` | 92 | 测试 |
-| 45 | [45-proxy-slot.md](modules/45-proxy-slot.md) | `src/infra/proxy-slot.ts` | 164 | ⚠ 未接线 |
+| 45 | [45-proxy-slot.md](modules/45-proxy-slot.md) | `src/infra/proxy-slot.ts` | 219 | ⚠ 未接线 |
 | 46 | [46-context.md](modules/46-context.md) | `src/shared/context.ts` | 124 | ⚠ 未接线 |
-| 47 | [47-model-windows.md](modules/47-model-windows.md) | `src/shared/model-windows.ts` | 37 | ⚠ 未接线 |
-| 48 | [48-test-logging.md](modules/48-test-logging.md) | `test/logging.ts` | 399 | 测试 |
+| 47 | [47-model-windows.md](modules/47-model-windows.md) | `src/shared/model-windows.ts` | 69 | 基础设施层（**已接线**） |
+| 48 | [48-test-logging.md](modules/48-test-logging.md) | `test/logging.ts` | 472 | 测试 |
 | 49 | [49-test-logging-child.md](modules/49-test-logging-child.md) | `test/_logging-writefail-child.ts` | 21 | 测试 |
 | — | （无独立报告） | `src/shared/api-keys.ts` | 75 | 基础设施层 |
 | — | （无独立报告） | `src/shared/concurrency.ts` | 220 | 基础设施层 |
@@ -190,14 +190,33 @@ createApp                     (src/app.ts)
 
 | 文件 | 行数 | 提供的能力 | 为何未生效 | 接入点 |
 |---|---|---|---|---|
-| `src/infra/proxy-slot.ts` | 164 | 多 Key 轮询/亲和选择、每 Key 并发闸门与排队超时、`limitMeta` 限流元数据、指数退避重试 | 无任何 import 方 | `modules/chat/handler.ts:62` 与 `modules/messages/handler.ts:74` 的 `createUpstreamFlow` 调用处，改为走 proxy-slot |
-| `src/shared/context.ts` | 124 | 请求体 token 粗估（4 字符/token + 每消息 4 token）、按模型窗口检查 | 无任何 import 方 | handler 入口处做 `context_window_exceeded` 预判 |
-| `src/shared/model-windows.ts` | 37 | 模型名 → 上下文窗口映射表 | 仅被 `shared/context.ts` 引用 | 随 `context.ts` 一同接入 |
+| `src/infra/proxy-slot.ts` | 219 | 多 Key 轮询/亲和选择、每 Key 并发闸门与排队超时、`limitMeta` 限流元数据、指数退避重试 | 无任何 import 方 | `modules/chat/handler.ts:62` 与 `modules/messages/handler.ts:74` 的 `createUpstreamFlow` 调用处，改为走 proxy-slot |
+| `src/shared/context.ts` | 124 | 请求体 token 粗估（4 字符/token + 每消息 4 token）、按模型窗口检查 | 无任何 import 方 | handler 入口处做 `context_window_exceeded` 预判。**其依赖的 `model-windows` 已是线上唯一权威表，接入即自动与客户端看到的窗口一致** |
+
+`src/shared/model-windows.ts` 曾是未接线文件，现已被 `catalog.ts` 引用（见 §5.1 后的说明），
+不再是死代码 —— 合并前它与 catalog 各自维护一份窗口数值，且 12 个共有 id **全部冲突**
+（如 `claude-sonnet-4-6`：200000 vs 1000000）。这意味着基于它的护栏永远不会触发：
+客户端被告知 200K，代理却按 1M 判定。现数值只存在于 `model-windows.ts` 一处，
+**对外输出逐字未变**。
 
 连带未接入但本身有引用的文件：`src/shared/api-keys.ts`、`src/shared/concurrency.ts`、
 `src/shared/limit.ts`、`src/shared/retry.ts` —— 四者**仅**被 `infra/proxy-slot.ts` 引用，
 因此随 proxy-slot 一同处于未接线状态。`test/unit.ts` 覆盖了其中
 `api-keys` / `concurrency` / `limit` / `retry` 的行为（41 项断言全绿），但生产路径未使用。
+
+### 5.2 接入 proxy-slot 前必须先解决的两件事
+
+1. **重试幂等性**（已加护栏，见 `isSafeToRetry`）：`/alpha/generate` 非幂等，重试会
+   重发整个会话。现只重试可证明「未被接受」的失败（429 / 401 / 402），**5xx 不再重试**
+   —— 上游可能已计费。若将来上游对某状态码明确保证幂等，只需改这一处。
+2. **客户端 deadline**：退避时长会被 `x-request-timeout-ms` 剩余时间截断，避免
+   重试活得比请求方更久。**该 header 不设即不启用截断**，不猜测默认值。
+
+此外需注意 `cfg.json` 中 7 项（`maxConcurrencyPerKey` / `maxQueuePerKey` /
+`queueTimeoutMs` / `keySelectionStrategy` / `retryMax` / `retryBaseMs` /
+`retryCapMs`）**目前只在 `shared/config.ts` 有内置默认值，config.json 并未声明**，
+因此只能经 `Object.assign(config, fileConfig)` 被文件注入；运维自行添加也不会
+在接入前生效。
 
 ### 总报告
 
@@ -228,6 +247,7 @@ createApp                     (src/app.ts)
 | SSE 心跳 interval | 5 s | `src/infra/sse.ts:8` |
 | SSE 心跳 idle | 15 s | `src/infra/sse.ts:9` |
 | 监听端口/地址 | 3050 / 0.0.0.0 | `src/shared/config.ts:98-99` |
+| 传输层空闲超时 | 关闭（`idleTimeout: 0`），超时治理统一由 `shared/runtime.ts` 负责 | `src/index.ts:28` |
 
 ## 7. 长会话 / 上下文管理（客户端止血习惯）
 

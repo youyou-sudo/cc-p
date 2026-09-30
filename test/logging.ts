@@ -434,7 +434,7 @@ check('models: unknown id -> null (never a guessed default)', contextWindowFor('
 check('models: table covers every catalog id',
   MODELS.every((m) => m.id in MODEL_CONTEXT_WINDOWS))
 
-// ── 6. log file writer ────────────────────────────────────────────────
+// ── 7. log file writer ────────────────────────────────────────────────
 const logFile = process.env.LOG_FILE!
 const written = await Bun.file(logFile).text()
 check('logfile: lines are actually written to the configured file',

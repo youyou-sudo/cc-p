@@ -1,6 +1,6 @@
 # 完整代码段映射报告（Code Map）
 
-> 扫描范围：`src/` 48 个源文件（`shared/` 15、`infra/` 7、`modules/` 19、`plugins/` 5，外加 `app.ts` + `index.ts`）+ `test/` 7 个测试；共 55 个 TS 文件、约 5 032 行源码 + 1 370 行测试。
+> 扫描范围：`src/` 48 个源文件（`shared/` 15、`infra/` 7、`modules/` 19、`plugins/` 5，外加 `app.ts` + `index.ts`）+ `test/` 7 个测试；共 55 个 TS 文件、约 5 177 行源码 + 1 443 行测试。
 > 行号基于当前工作区文件内容；「可见性」中 `E`=export、`P`=模块私有。
 > 分层：入口（index/app）→ 插件（plugins）→ 协议模块（modules）→ 共享管道/上游对接（infra）/ 基础设施（shared）。
 > ⚠ **未接线标注**：`infra/proxy-slot.ts`、`shared/context.ts`、`shared/model-windows.ts`
@@ -10,22 +10,23 @@
 
 ---
 
-## src/index.ts（80 行 · 入口层）
+## src/index.ts（96 行 · 入口层）
 
 服务启动入口：拉起后台任务、创建并监听 Elysia app、提供 `healthcheck` CLI 与 `unhandledRejection` 兜底。**本文件不注册任何路由**，HTTP 层全部来自 `createApp()`。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
 | 1-6 | — | import | — | `./shared/config`(CFG) `./shared/logger`(log) `./modules/models/catalog`(MODELS) `./infra/session`(startSessionCleanup) `./shared/version`(startVersionRefresh) `./app`(createApp) |
-| 8-38 | `startServer` | 函数 | E | 启动 `startVersionRefresh`/`startSessionCleanup`，`createApp().listen()`，打印启动日志与无 Key 告警 |
+| 8-54 | `startServer` | 函数 | E | 启动 `startVersionRefresh`/`startSessionCleanup`，`createApp().listen()`，打印启动日志与无 Key 告警 |
 | 9 | └ `startVersionRefresh()` | 逻辑 | P | CC 版本刷新后台任务 |
 | 10 | └ `startSessionCleanup()` | 逻辑 | P | 会话清理后台任务 |
-| 12 | └ `createApp().listen()` | 逻辑 | P | 监听 `{port: CFG.port, hostname: CFG.host}`；CORS/错误/体限流/鉴权/4 路由由 `src/app.ts` 装配 |
-| 14-31 | └ 启动日志 | 逻辑 | P | url/api/models/CORS 三态/session/ZDR/emptySystemPlaceholder/logFile |
-| 33-35 | └ 无兜底 Key 告警 | 逻辑 | P | `CFG.apiKey` 为空时提示须带 `Authorization: Bearer` 或 `x-api-key` |
-| 40-62 | `healthcheck` | 异步函数 | E | GET `127.0.0.1:{PORT\|CFG.port}/health`，5s 超时，要求 `body.ok===true`；成功 `exit(0)` 否则 `exit(1)` |
-| 64-73 | unhandledRejection 监听 | 逻辑 | P | `AbortError`/`ABORT_ERR` 记 info，其余记 error |
-| 75-80 | CLI 分派 | 逻辑 | P | `argv[2]==='healthcheck'` → `healthcheck()`，否则 `startServer()` |
+| 12-26 | └ `idleTimeout` 注释 | 逻辑 | — | 为何传 0：Elysia Bun adapter 硬编码 30s，比本代理自身预算（30/90/120s）更紧，会让后两档不可达并以通用 socket 错误取代 429 + 降级提示。仅影响**无 body** 的慢请求（读 body 会刷新 Bun 空闲计时器） |
+| 28 | └ `createApp().listen()` | 逻辑 | P | 监听 `{port, hostname, idleTimeout: 0}`；CORS/错误/体限流/鉴权/4 路由 + 访问日志由 `src/app.ts` 装配 |
+| 30-47 | └ 启动日志 | 逻辑 | P | url/api/models/CORS 三态/session/ZDR/emptySystemPlaceholder/logFile |
+| 49-52 | └ 无兜底 Key 告警 | 逻辑 | P | `CFG.apiKey` 为空时提示须带 `Authorization: Bearer` 或 `x-api-key` |
+| 56-78 | `healthcheck` | 异步函数 | E | GET `127.0.0.1:{PORT\|CFG.port}/health`，5s 超时，要求 `body.ok===true`；成功 `exit(0)` 否则 `exit(1)` |
+| 80-89 | unhandledRejection 监听 | 逻辑 | P | `AbortError`/`ABORT_ERR` 记 info，其余记 error |
+| 91-96 | CLI 分派 | 逻辑 | P | `argv[2]==='healthcheck'` → `healthcheck()`，否则 `startServer()` |
 
 依赖：`./shared/config` `./shared/logger` `./modules/models/catalog` `./infra/session` `./shared/version` `./app`
 
@@ -425,7 +426,7 @@ OpenAI 中间格式 → CC 请求体构建（含 cache_control 白名单），�
 
 ---
 
-## src/infra/proxy-handler.ts（97 行 · 共享管道层）
+## src/infra/proxy-handler.ts（119 行 · 共享管道层）
 
 两个协议处理器共享的请求体解析、客户端断连级联取消与上游调用前置。
 
@@ -436,8 +437,9 @@ OpenAI 中间格式 → CC 请求体构建（含 cache_control 白名单），�
 | 15-29 | `readRequestJson` | 异步函数 | E | 包 readJsonBody，按错误种类回调 buildError |
 | 31-46 | `UpstreamFlow` | interface | E | signal/controller/aborted/setGracefulClose/abort |
 | 48-64 | `createUpstreamFlow` | 函数 | E | once abort：置 aborted → gracefulClose → controller.abort() |
-| 66-76 | `UpstreamCallArgs` | interface | E | apiKey/headers/ccBody/signal/promptCacheKey/label/onCcError |
-| 78-97 | `callUpstream` | 异步函数 | E | ensureInitialized → forwardToCC → 非 2xx 映射日志与错误体 |
+| 66-89 | `UpstreamCallArgs` | interface | E | apiKey/headers/ccBody/signal/promptCacheKey/label/onCcError + **clientDeadlineAt?**（可选，仅未接线的 proxy-slot 消费；`callUpstream` 不重试故忽略） |
+| 92-98 | `clientDeadlineFrom` | 函数 | E | 从 `x-request-timeout-ms` 读客户端 deadline（epoch ms）；缺失/非数字/非正数返回 `undefined`。**不猜测默认值** |
+| 101-119 | `callUpstream` | 异步函数 | E | ensureInitialized → forwardToCC → 非 2xx 映射日志与错误体 |
 
 依赖：`./cc` `../shared/errors` `./fingerprint` `../shared/http` `../shared/logger`
 
@@ -839,28 +841,32 @@ Strangler 服务门面，动态 import 委托 catalog，避免单例分裂。
 
 ---
 
-## src/modules/models/catalog.ts（139 行 · 协议层）
+## src/modules/models/catalog.ts（159 行 · 协议层）
 
 内置模型清单 + Provider API 动态拉取（TTL 缓存，失败回退）。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 1-6 | — | import | — | `../../shared/config`/`logger`/`version`/`auth`/`util`/`http` |
-| 8-13 | `ModelEntry` | interface | E | `{ id, name, context_window?, max_output_tokens? }` |
-| 15-43 | `MODELS` | 常量 | E | 内置模型 26 项（Claude/GPT/DeepSeek/Kimi/GLM/MiniMax/Qwen/Step/MiMo/Gemini） |
-| 45-49 | `toOptionalNumber` | 函数 | P | 非法值归一为 `undefined` |
-| 51-53 | `pickContextWindow` | 函数 | P | `context_window`/`context_length`/`max_context_tokens` 归一 |
-| 55-57 | `pickMaxOutputTokens` | 函数 | P | `max_output_tokens`/`max_tokens` 归一 |
-| 59-61 | `STATIC_WINDOW_BY_ID` | 常量 | P | `MODELS` 中已声明窗口项的 `Map<id, number>` |
-| 63-64 | `dynamicModels` / `modelsLastFetch` | 字段 | P | 模块级缓存与拉取时间戳 |
-| 66-108 | `fetchModels` | 异步函数 | E | TTL 缓存 → 上游 GET（10s 超时）→ 映射写缓存；失败回退 `MODELS` |
-| 67-70 | └ 缓存判定 | 逻辑 | P | 未过期直接返回缓存 |
-| 72-73 | └ 禁用守卫 | 逻辑 | P | 无 key 或 `!CFG.useProviderModels` 抛错回退 |
-| 75-82 | └ 上游请求 | 逻辑 | P | GET `${apiBase}/provider/v1/models`，Bearer + CC 头，`AbortSignal.timeout(10000)` |
-| 87-95 | └ 条目映射 | 逻辑 | P | `id`/`name` 取 `m.id`；窗口上游优先否则静态；`max_output_tokens` 有值才写 |
-| 96-99 | └ 写缓存 | 逻辑 | P | 更新 `dynamicModels`/`modelsLastFetch` 并 log info |
-| 102-107 | └ 失败回退 | 逻辑 | P | log warn 并返回 `MODELS` |
-| 110-123 | `handleModels` | 异步函数 | E | getApiKey → fetchModels → OpenAI list 形状 `sendJSON(200, ...)` |
+| 1-7 | — | import | — | `../../shared/config`/`logger`/`version`/`auth`/`util`/`http`/**`model-windows`(contextWindowFor)** |
+| 9-14 | `ModelEntry` | interface | E | `{ id, name, context_window?, max_output_tokens? }` |
+| 20-25 | `EXPOSED_WINDOW_IDS` | 常量 | P | 哪些 id 的窗口够确认、可对外暴露（12 个）。**只管暴露与否，数值在 `shared/model-windows.ts`** |
+| 27-51 | `MODELS_BASE` | 常量 | E | 内置模型 26 项（不含窗口）：Claude/GPT/DeepSeek/Kimi/GLM/MiniMax/Qwen/Step/MiMo/Gemini |
+| 55-63 | `MODELS` | 常量 | E | `MODELS_BASE` 映射：为暴露集中的 id 从 `contextWindowFor()` 挂上窗口。**id 与顺序不变，对外输出逐字一致** |
+| 65-69 | `toOptionalNumber` | 函数 | P | 非法值归一为 `undefined` |
+| 71-73 | `pickContextWindow` | 函数 | P | `context_window`/`context_length`/`max_context_tokens` 归一 |
+| 75-77 | `pickMaxOutputTokens` | 函数 | P | `max_output_tokens`/`max_tokens` 归一 |
+| 79-81 | `STATIC_WINDOW_BY_ID` | 常量 | P | `MODELS` 中已声明窗口项的 `Map<id, number>`（即 12 个暴露项的快照） |
+| 83-84 | `dynamicModels` / `modelsLastFetch` | 字段 | P | 模块级缓存与拉取时间戳 |
+| 86-128 | `fetchModels` | 异步函数 | E | TTL 缓存 → 上游 GET（10s 超时）→ 映射写缓存；失败回退 `MODELS` |
+| 87-90 | └ 缓存判定 | 逻辑 | P | 未过期直接返回缓存 |
+| 92-93 | └ 禁用守卫 | 逻辑 | P | 无 key 或 `!CFG.useProviderModels` 抛错回退 |
+| 95-102 | └ 上游请求 | 逻辑 | P | GET `${apiBase}/provider/v1/models`，Bearer + CC 头，`AbortSignal.timeout(10000)`（也是本端点不受传输层 idleTimeout 影响的原因） |
+| 107-115 | └ 条目映射 | 逻辑 | P | `id`/`name` 取 `m.id`；窗口上游优先否则静态；`max_output_tokens` 有值才写 |
+| 116-119 | └ 写缓存 | 逻辑 | P | 更新 `dynamicModels`/`modelsLastFetch` + log info |
+| 122-127 | └ 失败回退 | 逻辑 | P | log warn 并返回 `MODELS` |
+| 130-159 | `handleModels` | 异步函数 | E | getApiKey → 判定来源（provider/cache/fallback）→ fetchModels → log info → OpenAI list 形状 `sendJSON(200, ...)` |
+| 136-138 | └ 来源判定 | 逻辑 | P | **必须在 await 前**取 `hadCache`：fallback 返回的就是 `MODELS` 本身，事后引用比较会把「首次 fallback」误判为 cache |
+| 142-147 | └ 落日志 | 逻辑 | P | `cacheAgeMs` 用 `Date.now()` 而非 `nowUnix()`（后者返回整秒，混用会得负值） |
 
 依赖：`../../shared/config` `../../shared/logger` `../../shared/version` `../../shared/auth` `../../shared/util` `../../shared/http`
 
@@ -1008,7 +1014,7 @@ SSE 心跳单元测试：验证 `startSseHeartbeat` 的四种状态闸门与两�
 
 ---
 
-## src/infra/proxy-slot.ts（164 行 · 共享管道层 · ⚠ 未接线）
+## src/infra/proxy-slot.ts（219 行 · 共享管道层 · ⚠ 未接线）
 
 多 Key 池化 + 并发闸门 + 限流退避的上游调用封装。**无任何 import 方**，不在运行时路径上。
 
@@ -1020,11 +1026,15 @@ SSE 心跳单元测试：验证 `startSseHeartbeat` 的四种状态闸门与两�
 | 29-33 | `upstreamKeyFor` | 函数 | **E** | 客户端 Key → 上游 Key 映射（`resolveUpstreamKey`） |
 | 35-37 | `upstreamPoolInfo` | 函数 | **E** | `{keys, strategy}`，供启动日志/探针观测 |
 | 39-76 | `concurrencyErrorToMapped` | 函数 | P | `ConcurrencyRoomFull`/`ConcurrencyTimeout` → `MappedError`（`queue_full`/`timeout`） |
-| 78-163 | `callUpstreamWithSlots<T>` | 异步函数 | **E** | 取 Key → 抢位 → `ensureInitialized` → `forwardToCC` → 非 2xx 走 `mapCcError`+`limitMeta`+退避重试 |
-| 108 | — | 逻辑 | P | 实际转发（比 `proxy-handler` 多一个 `upstreamKey` 参数） |
-| 114-115 | — | 逻辑 | P | 读 `Retry-After` 头交给 `mapCcError` |
-| 119-137 | — | 逻辑 | P | 取 `error.category` 喂 `limitMeta` 判定限流语义 |
-| 138-142 | — | 逻辑 | P | `parseRetryAfter` 优先，其次 `backoffDelay`，取较大等待 |
+| 78-108 | `isSafeToRetry` | 函数 | P | **重试幂等性护栏**：`/alpha/generate` 非幂等，重试=重发整个会话。只重试可证明「未被接受」的失败（429/401/402）；**5xx 一律不重试**。收窄而非替换 `limitMeta` |
+| 109-111 | `isSafeToRetryForTest` | 常量 | **E** | 测试用再导出，使决策表无需拉起上游链路即可断言 |
+| 113-218 | `callUpstreamWithSlots<T>` | 异步函数 | **E** | 取 Key → 抢位 → `ensureInitialized` → `forwardToCC` → 非 2xx 走 `mapCcError`+`limitMeta`+退避重试（受幂等性护栏约束） |
+| 143 | — | 逻辑 | P | 实际转发（比 `proxy-handler` 多一个 `upstreamKey` 参数） |
+| 149-150 | — | 逻辑 | P | 读 `Retry-After` 头交 `mapCcError` |
+| 154-159 | — | 逻辑 | P | `error.category` 交 `limitMeta` 判定限流语义 |
+| 160-169 | — | 逻辑 | P | 日志同时给出 `retryable`（是否瞬时）与 `safeToRetry`（是否可重复），二者语义不同 |
+| 175-177 | — | 逻辑 | P | 决策点：不可安全重试 / 超 `retryMax` / 已 abort → 直接返回错误 |
+| 179-196 | — | 逻辑 | P | 退避时长：`parseRetryAfter` 优先、其次 `backoffDelay`，再被 `clientDeadlineAt` 剩余时间截断；deadline 已过则不重试 |
 
 依赖：`../shared/config` `../shared/concurrency` `../shared/api-keys` `../shared/limit` `../shared/retry` `./cc` `../shared/errors` `./fingerprint` `../shared/logger` `./proxy-handler`
 
@@ -1062,16 +1072,24 @@ SSE 心跳单元测试：验证 `startSseHeartbeat` 的四种状态闸门与两�
 
 ---
 
-## src/shared/model-windows.ts（37 行 · 基础设施层 · ⚠ 未接线）
+## src/shared/model-windows.ts（69 行 · 基础设施层 · 数据表，已被 catalog.ts 引用）
 
-模型 ID → 上下文窗口静态映射。**仅被 `context.ts:6` 引用，而 context 亦未接线**。
+模型 ID → 上下文窗口的**唯一权威表**。`catalog.ts` 从此导入（线上），`context.ts` 查表（未接线）。
+
+此前它与 `catalog.ts` 各自维护一份数值，**12 个共有 id 全部冲突**（如 `claude-sonnet-4-6`：200000 vs 1000000）。这不是美观问题：`/v1/models` 把 catalog 的值告诉客户端，而基于本表的护栏会拿大 5 倍的窗口算利用率 —— `checkContextWindow` 永远不会触发。现数值只存在于此表，两条消费路径不可能再矛盾。
+
+对外输出逐字未变：12 个暴露项的值原样保留（客户端已拿到），`EXPOSED_WINDOW_IDS` 只决定暴露与否。
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 6-33 | `MODEL_CONTEXT_WINDOWS` | 常量 | **E** | `Record<string, number \| null>`；`null` = 窗口未知，不判定 |
-| 35-37 | `contextWindowFor` | 函数 | **E** | 查表，未命中返回 `null`（退化为不告警而非误杀） |
+| 1-28 | — | 逻辑 | — | 注释：为何唯一表、被合并前的具体冲突、数值政策、1M 声明未经核实 |
+| 30-62 | `MODEL_CONTEXT_WINDOWS` | 常量 | **E** | `Record<string, number \| null>`。① 12 个已暴露 id（数值原样保留）② 14 个此前未暴露 id。`null` = 窗口未知，调用方放行而非报错 |
+| 64-65 | — | 逻辑 | — | 切勿添加臆测值：过大的窗口会静默关闭护栏，比未知更糟 |
+| 67-69 | `contextWindowFor` | 函数 | **E** | 查表，未命中返回 `null`（退化为不告警而非误杀） |
 
 依赖：无
+
+**导入方**：`src/modules/models/catalog.ts`（**线上**，`/v1/models` 静态兜底）、`src/shared/context.ts`（未接线）
 
 ---
 
@@ -1175,7 +1193,7 @@ SSE 心跳单元测试：验证 `startSseHeartbeat` 的四种状态闸门与两�
 
 ---
 
-## test/logging.ts（399 行 · 测试）
+## test/logging.ts（472 行 · 测试）
 
 为「日志产出」本身提供回归保护。62 项断言分 6 组：访问日志状态取值、SsePipeline 失败计数、runtime 计数跃迁、readJsonBody 拒绝路径、auth pre-check 401、日志文件写入失败。
 
@@ -1183,17 +1201,19 @@ SSE 心跳单元测试：验证 `startSseHeartbeat` 的四种状态闸门与两�
 
 | 行号 | 符号/段落 | 类别 | 说明 |
 |---|---|---|---|
-| 1-23 | env 预设 + 动态 import | 基建 | `CFG` 在加载时快照，故 src 模块一律 `await import()`；`CC_MAX_BODY_MB=1` 以便触达超限 |
-| 25-43 | 日志捕获 | 工具 | 劫持 `console.log` 并解析，走真实 `log()` 路径（含级别过滤） |
-| 45-131 | 访问日志 | 用例组 | 200/201/4xx 级别、未注册 404、抛错 500、Error 自带 413 恢复、499、3 并发 |
-| 133-192 | SsePipeline 失败计数 | 用例组 | enqueue/close/心跳异常计数、`terminateWith` 记 client-abort、close 抛错时 terminal 仍 resolve |
-| 194-220 | runtime 计数跃迁 | 用例组 | 自增记录、session 桶隔离、清空记录、无计数时静默 |
-| 222-314 | readJsonBody 拒绝路径 | 用例组 | 五条拒绝路径 + `rejectedEarly`/`stalledMidBody` 区分两类超限与 slow-loris |
-| 316-362 | auth pre-check | 用例组 | 经真实插件组合验证 401 记录；格式错误与缺失 Key 原因可区分 |
-| 364-397 | 日志文件写入 | 用例组 | 落盘、写失败上报、限频不洪泛、console 通道完好、不崩溃 |
-| 399 | 退出 | 输出 | `process.exit(fail > 0 ? 1 : 0)` |
+| 1-33 | env 预设 + 动态 import | 基建 | `CFG` 在加载时快照，故 src 模块一律 `await import()`；`CC_MAX_BODY_MB=1` 以便触达超限；fixture 日志写在 OS 临时目录并自建（不依赖已 gitignore 的 `.hb/`） |
+| 35-53 | 日志捕获 | 工具 | 劫持 `console.log` 并解析，走真实 `log()` 路径（含级别过滤） |
+| 55-141 | 访问日志 | 用例组 | 200/201/4xx 级别、未注册 404、抛错 500、Error 自带 413 恢复、499、三并发 |
+| 143-202 | SsePipeline 失败计数 | 用例组 | enqueue/close/心跳异常计数、`terminateWith` 记 client-abort、close 抛错时 terminal 仍 resolve |
+| 204-230 | runtime 计数跃迁 | 用例组 | 自增记录、session 桶隔离、清空记录、无计数时静默 |
+| 232-324 | readJsonBody 拒绝路径 | 用例组 | 五条拒绝路径 + `rejectedEarly`/`stalledMidBody` 区分两类超限与 slow-loris |
+| 326-372 | auth pre-check | 用例组 | 经真实插件组合验证 401 记录；格式错误与缺失 Key 原因可区分 |
+| 374-398 | **重试安全** | 用例组 | **5xx 即便判为瞬时也不重试**（非幂等端点）；429/401/402 可重试；deadline 仅取自 `x-request-timeout-ms`，缺失/非法即不启用 |
+| 400-435 | **上下文窗口一致性** | 用例组 | 26 条目 / 12 暴露 / **对外数值逐字未变** / **对外值与护栏表相等** / 顺序未变 / 未知 id 为 null |
+| 437-470 | 日志文件写入 | 用例组 | 落盘、写失败上报、限频不洪泛、console 通道完好、不崩溃 |
+| 472 | 退出 | 输出 | `process.exit(fail > 0 ? 1 : 0)` |
 
-依赖：`elysia`；动态 import `../src/plugins/access` `../src/plugins/auth` `../src/modules/chat/index` `../src/infra/sse` `../src/shared/runtime` `../src/shared/http` `../src/shared/logger` `../src/shared/config`；子进程 `test/_logging-writefail-child.ts`
+依赖：`elysia`；动态 import `../src/plugins/access` `../src/plugins/auth` `../src/modules/chat/index` `../src/infra/sse` `../src/infra/proxy-slot` `../src/infra/proxy-handler` `../src/modules/models/catalog` `../src/shared/runtime` `../src/shared/http` `../src/shared/model-windows` `../src/shared/logger` `../src/shared/config`；子进程 `test/_logging-writefail-child.ts`
 
 ---
 
@@ -1280,15 +1300,17 @@ infra/proxy-slot.ts ──┬─► shared/api-keys.ts
                      ├─► shared/logger.ts        （已接线，此处为额外引用）
                      ├─► infra/cc.ts             （已接线）
                      ├─► infra/fingerprint.ts    （已接线）
-                     └─► infra/proxy-handler.ts  （已接线）
-shared/context.ts ─────► shared/model-windows.ts
+                     └─► infra/proxy-handler.ts  （已接线，UpstreamCallArgs 类型 + clientDeadlineAt）
+shared/context.ts ─────► shared/model-windows.ts ──► ⚡ 已接线：catalog.ts
 ```
 
-- **零引用方**：`infra/proxy-slot.ts`、`shared/context.ts`、`shared/model-windows.ts`
+- **零引用方**：`infra/proxy-slot.ts`、`shared/context.ts`
+- ⚡ **不再是死代码**：`shared/model-windows.ts` 现被线上 `catalog.ts` 引用（上下文窗口唯一权威表）。此前它与 catalog 各自维护数值且 12 个共有 id 全部冲突，现已合并
 - **仅被未接线方引用**：`shared/api-keys.ts`、`shared/concurrency.ts`、`shared/limit.ts`、`shared/retry.ts`
 - **生产未生效的能力**：多 Key 轮询/亲和、每 Key 并发上限与排队、上游限流退避重试、上下文窗口事前预判、工具输出截断
-- **仍然生效的部分**：`shared/config.ts` 等被上表虚线标注的文件同时在已接线路径上被引用，其配置项（`maxConcurrencyPerKey`/`retryMax`/`maxQueuePerKey` 等）虽可配置但**无消费方**
+- **仍然生效的部分**：`shared/config.ts` 等被上表标注的文件同时在已接线路径上被引用，其配置项（`maxConcurrencyPerKey`/`retryMax`/`maxQueuePerKey` 等）虽可配置但**无消费方**；注意 `config.json` 本身**并未声明**这 7 项，只有 `shared/config.ts` 的内置默认值
 - **测试覆盖**：`test/unit.ts` 41 项断言全绿，但覆盖的是这批未接线模块 —— **测试通过 ≠ 线上生效**
+- **接入前的前置条件（均已落地）**：① `isSafeToRetry` 重试幂等性护栏（5xx 不再重试）；② `clientDeadlineAt` 退避截断。详见 [45-proxy-slot.md](modules/45-proxy-slot.md)
 
 
 ### 观察要点
