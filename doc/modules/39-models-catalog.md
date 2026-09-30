@@ -3,7 +3,7 @@
 | 属性 | 值 |
 |---|---|
 | 路径 | `src/modules/models/catalog.ts` |
-| 行数 | 124 |
+| 行数 | 139 |
 | 层级 | 协议层 |
 | 依赖 | `../../shared/config`、`../../shared/logger`、`../../shared/version`、`../../shared/auth`、`../../shared/util`、`../../shared/http` |
 | 被依赖 | `src/modules/models/service.ts`、`src/index.ts` |
@@ -35,7 +35,9 @@
 | 96-99 |   └ 写缓存 | 逻辑 | P | 写入 `dynamicModels`/`modelsLastFetch` 并 `log('info', ...)` |
 | 102-105 | └ 失败回退 | 逻辑 | P | 非 ok 或异常 → `log('warn', ...)`，落入返回内置列表 |
 | 107 | └ 返回值 | 逻辑 | P | 回退返回 `MODELS` |
-| 110-123 | `handleModels` | 异步函数 | E | `getApiKey(headers)` → `await fetchModels(apiKey)` → `sendJSON(200, ...)` |
+| 110-139 | `handleModels` | 异步函数 | E | `getApiKey(headers)` → 判定来源 → `await fetchModels(apiKey)` → `sendJSON(200, ...)` |
+| 113 | └ 来源判定 | 逻辑 | P | 在 await **之前** 记 `hadCache`；`models === MODELS` → `'fallback'`，否则 `hadCache` → `'cache'`，否则 `'provider'` |
+| 118-127 | └ 落日志 | 逻辑 | P | `log('info', 'Models list served', { source, count, keyPrefix, cacheAgeMs })` |
 
 ## 关键行为
 
@@ -43,5 +45,8 @@
 - 上游请求使用 `AbortSignal.timeout(10000)`（81 行），10s 超时即回退。
 - 上游字段别名兼容：`context_length`/`max_context_tokens`（52 行）、`max_tokens`（56 行）会被归一。
 - 映射时静态窗口只作兜底：上游有值优先，否则查 `STATIC_WINDOW_BY_ID`；仍无值则删除字段（90、93 行）。
-- `handleModels` 响应形状（114-123）：`{ object: 'list', data: [{ id, object: 'model', created: nowUnix(), owned_by: 'command-code', ...(context_window 有值时带) }] }`。
+- **来源可观测**（113-127）：此前缓存命中直接 return 无日志，唯一的信号是 `fetchModels` 内部两条 warn —— 而缓存命中会跳过它们。客户端报「我的模型不见了」时，无法区分是缓存过期还是真没有。现每次服务都记 `provider`/`cache`/`fallback` 与 `cacheAgeMs`。
+  - 判定必须在 await 前取 `hadCache`：fallback 路径返回的就是 `MODELS` 本身，事后做引用比较会把「首次 fallback」误判为 cache（这是实现时踩到的坑）
+  - `cacheAgeMs` 用 `Date.now()` 而非 `nowUnix()`：后者返回整秒，混用单位会得到负值
+- `handleModels` 响应形状（129-138）：`{ object: 'list', data: [{ id, object: 'model', created: nowUnix(), owned_by: 'command-code', ...(context_window 有值时带) }] }`。
 - 该端点不强制鉴权：未带 key 时 `fetchModels` 抛错回退内置列表，仍返回 200，供客户端发现模型。

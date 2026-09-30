@@ -3,7 +3,7 @@
 | 属性 | 值 |
 |---|---|
 | 路径 | `src/infra/sse.ts` |
-| 行数 | 138 |
+| 行数 | 217 |
 | 层级 | 共享管道层 |
 | 依赖 | 无（本文件不 import 任何模块） |
 | 被依赖 | `src/modules/chat/handler.ts`、`src/modules/messages/handler.ts`、`test/heartbeat.ts` |
@@ -23,7 +23,7 @@
 | 9 | `SSE_HEARTBEAT_IDLE_MS` | 常量 | E | `15_000`，静默超过 15s 才发 ping |
 | 10 | `SSE_PING_EVENT` | 常量 | E | `event: ping\ndata: {"type":"ping"}\n\n`，Anthropic 原生 ping |
 | 11 | `SSE_KEEPALIVE_COMMENT` | 常量 | E | `: keepalive\n\n`，OpenAI 路径使用的 SSE 注释心跳 |
-| 13-118 | `SsePipeline` | class | E | 可控 SSE 发送管道 |
+| 13-195 | `SsePipeline` | class | E | 可控 SSE 发送管道 |
 | 14 | └ `encoder` | 字段 | P | `TextEncoder` 实例 |
 | 15 | └ `controller` | 字段 | P | `ReadableStreamDefaultController<Uint8Array>`，`start` 时注入 |
 | 16 | └ `buffered` | 字段 | P | 开播前的事件缓冲 |
@@ -36,18 +36,18 @@
 | 24 | └ `closed` | 字段 | P | 是否已关闭 |
 | 25 | └ `keepaliveCount` | 字段 | P | keepalive 注释帧计数 |
 | 26 | └ `pingCount` | 字段 | P | ping 帧计数 |
-| 27 | └ `lastSentAt` | 字段 | P | 最近写出时间戳，心跳据此判断空闲 |
-| 29-35 | └ `constructor(autoStart)` | 方法 | P | 建立两个 Promise 与 ReadableStream（`start` 注入 controller） |
-| 37-42 | └ `enqueue(text)` | 方法 | P | 编码入队并更新 `lastSentAt`；controller 关闭时静默吞异常 |
-| 44-51 | └ `emit(events)` | 方法 | P | 已开播则即时入队，否则压入 `buffered`；`autoStart` 时自动 `start()` |
-| 53-69 | └ `emitAnthropic(events)` | 方法 | P | Anthropic 早冲刷：`message_start` 等保持缓冲以保留零输出重试能力；仅当事件以 `event: content_block_` 开头才 `start()`（注释见 53-58） |
-| 71-75 | └ `emitKeepalive()` | 方法 | P | 仅在已开播且未关闭时发送 `SSE_KEEPALIVE_COMMENT` 并计数 |
-| 77-86 | └ `sendPing(event=SSE_PING_EVENT)` | 方法 | P | 空闲心跳 ping，计数；注释说明 OpenAI 路径会覆盖为注释帧（77-81） |
-| 88-90 | └ `writeNow(event)` | 方法 | P | 绕过缓冲直接 `enqueue`（错误帧等场景） |
-| 92-98 | └ `start()` | 方法 | P | 置 `started`，冲刷 `buffered`，resolve `firstOutput`；已开播/已关闭则直接返回 |
-| 100-107 | └ `close()` | 方法 | P | 置 `closed`，关 controller，resolve `terminal` |
-| 109-117 | └ `terminateWith(events)` | 方法 | P | 置 `started` → 冲刷缓冲 → 写出终止事件 → resolve `firstOutput` → `close()`（客户端断连优雅收尾） |
-| 120-138 | `startSseHeartbeat(pipeline, opts?)` | 函数 | E | 定时器：已关闭/未开播则跳过，`Date.now()-lastSentAt > idleMs` 时 `sendPing(pingEvent)`；间隔/空闲/ping 事件可被 `opts` 覆盖 |
+| 27-34 | └ 新增失败计数与 `closeReason` 字段 | | 字段 | P | 最近写出时间戳，心跳据此判断空闲 |
+| 35-64 | └ `constructor(autoStart)` | | 方法 | P | 建立两个 Promise 与 ReadableStream（`start` 注入 controller） |
+| 66-73 | └ `enqueue(text)` | | 方法 | P | 编码入队并更新 `lastSentAt`；controller 关闭时静默吞异常 |
+| 106-115 | └ `emit(events)` | | 方法 | P | 已开播则即时入队，否则压入 `buffered`；`autoStart` 时自动 `start()` |
+| 117-134 | └ `emitAnthropic(events)` | | 方法 | P | Anthropic 早冲刷：`message_start` 等保持缓冲以保留零输出重试能力；仅当事件以 `event: content_block_` 开头才 `start()`（注释见 53-58） |
+| 133-137 | └ `emitKeepalive()` | | 方法 | P | 仅在已开播且未关闭时发送 `SSE_KEEPALIVE_COMMENT` 并计数 |
+| 142-148 | └ `sendPing(event=SSE_PING_EVENT)` | | 方法 | P | 空闲心跳 ping，计数；注释说明 OpenAI 路径会覆盖为注释帧（77-81） |
+| 150-152 | └ `writeNow(event)` | | 方法 | P | 绕过缓冲直接 `enqueue`（错误帧等场景） |
+| 154-160 | └ `start()` | | 方法 | P | 置 `started`，冲刷 `buffered`，resolve `firstOutput`；已开播/已关闭则直接返回 |
+| 162-176 | └ `close(reason?)` | | 方法 | P | 置 `closed`，关 controller，resolve `terminal` |
+| 182-191 | └ `terminateWith(events, reason=client-abort)` | | 方法 | P | 置 `started` → 冲刷缓冲 → 写出终止事件 → resolve `firstOutput` → `close()`（客户端断连优雅收尾） |
+| 197-217 | `startSseHeartbeat(pipeline, opts?)` | | 函数 | E | 定时器：已关闭/未开播则跳过，`Date.now()-lastSentAt > idleMs` 时 `sendPing(pingEvent)`；间隔/空闲/ping 事件可被 `opts` 覆盖 |
 
 ## 关键行为
 
@@ -55,3 +55,23 @@
 - `emitAnthropic` 与 `emit` 的差别仅在自动开播条件：前者只在 `content_block_*` 事件时开播（66），保证空响应 error 事件不误开流。
 - `startSseHeartbeat` 只在已开播后才可能发 ping（133-134），且在管线关闭后停止（133）。
 - 调用方负责在 `finally` 中 `clearInterval` 该定时器。
+
+## 下游失败可观测性
+
+三处此前是裸 `catch {}`，吞掉的正是「客户端已断开」这一最直接的信号：
+
+| 计数器 | 触发条件 | 含义 |
+|---|---|---|
+| `enqueueErrorCount` | `controller.enqueue()` 抛错 | 下游连接已消失。心跳会继续累加 `keepaliveCount`/`pingCount` 往死连接里写 —— 计数器反而在**证明连接健康**，这是修复前的具体病症 |
+| `closeErrorCount` | `controller.close()` 抛错 | 客户端已放弃该流 |
+| `heartbeatErrorCount` | 心跳 interval 内抛错 | 同上，发生在定时器层 |
+| `clientCancelled` | `ReadableStream` 的 `cancel` 钩子 | Bun 在客户端断开时触发。已实测经 `new Response(pipeline.stream)` 返回的响应确实会触发 |
+| `closeReason` | — | `close()` 的入参，默认 `'normal'`；`terminateWith` 默认 `'client-abort'` |
+
+计数经 `snapshot()` 交两个 handler 在 pump 的 `finally` 输出，**仅在实际写入失败时输出**，所以健康流不会翻倍日志量。这使「客户端中途消失」与「客户端只是慢」在日志中可区分 —— 此前两者完全相同。
+
+`terminateWith` 的 reason 默认值是修复项：它只被两处 `onClientAbort` 调用，但经无参 `close()` 会取 `'normal'`，而 pump 后续的 `close('pump-finished')` 因 `closed` 已置位而提前返回，无从纠正 —— 每次客户端断开都被记成正常关闭，与事实相反。
+
+## 覆盖测试
+
+`test/logging.ts` 第 2 组（`sse:` 前缀，15 项断言）与第 1 组的 499 用例。

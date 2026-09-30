@@ -1,9 +1,9 @@
 # Command Code Proxy 项目文档
 
-> 生成时间：2026-09-29 · 基于工作区全量扫描（`src/` 47 个源文件、`test/` 5 个测试，共约 4 569 行 TypeScript）
+> 生成时间：2026-09-29 · 基于工作区全量扫描（`src/` 48 个源文件、`test/` 7 个测试，共约 6 402 行 TypeScript）
 >
 > 其中 `src/infra/proxy-slot.ts`、`src/shared/context.ts`、`src/shared/model-windows.ts` 三个文件
-> **已实现但未接线**（无任何 import 方），详见 §5.1；其余 44 个文件均在线运行路径上。
+> **已实现但未接线**（无任何 import 方），详见 §5.1；其余 45 个文件均在线运行路径上。
 
 ## 1. 项目简介
 
@@ -34,7 +34,8 @@
 │             src/app.ts          Elysia 组装：use cors/errors/body/auth 插件    │
 │                                 + 4 个 controller                          │
 ├──────────────────────────────────────────────────────────────────────┤
-│  插件层      src/plugins/cors.ts     onRequest 打 CORS 头 / OPTIONS 204     │
+│  插件层      src/plugins/access.ts   onAfterResponse 访问日志（每请求一行）      │
+│             src/plugins/cors.ts     onRequest 打 CORS 头 / OPTIONS 204     │
 │             src/plugins/errors.ts   onError：404/413/PARSE/VALIDATION→双协议 │
 │             src/plugins/body.ts     onParse 单次限流 JSON 解析 + 413 哨兵    │
 │             src/plugins/auth.ts     getApiKey decorate / requireAuth macro  │
@@ -78,6 +79,7 @@
 
 ```
 createApp                     (src/app.ts)
+  → accessLogPlugin.onRequest (src/plugins/access.ts，记起点，覆盖读体/鉴权/校验全程)
   → corsPlugin.onRequest       (src/plugins/cors.ts，打 CORS 头 / OPTIONS 204)
   → bodyLimitPlugin.onParse    (src/plugins/body.ts，readJsonBody 单次限流解析)
       └ 超限 → onTransform 抛普通 Error(status=413) 哨兵
@@ -85,6 +87,7 @@ createApp                     (src/app.ts)
   → messagesController / chatController
                               (src/modules/*/index.ts)
       └ onTransform: createAuthPreCheck(isAnthropic)  ← auth 前置，无 key 时短路 validation
+        （401 就在此处产生并记录；handler 从不运行，故 401 原因记在此处而非 handler）
   → body schema 校验           (body: 'messages.body' / 'chat.body')
       └ 失败 → validation 400
   → MessagesService.handleBody / ChatService.handleBody
@@ -128,23 +131,24 @@ createApp                     (src/app.ts)
 | # | 报告 | 源文件 | 行数 | 层级 |
 |---|---|---|---|---|
 | 01 | [01-index.md](modules/01-index.md) | `src/index.ts` | 80 | 入口层 |
-| 02 | [02-app.md](modules/02-app.md) | `src/app.ts` | 21 | 入口层 |
+| 02 | [02-app.md](modules/02-app.md) | `src/app.ts` | 26 | 入口层 |
+| 02a | [02a-plugins-access.md](modules/02a-plugins-access.md) | `src/plugins/access.ts` | 99 | 插件层 |
 | 03 | [03-plugins-cors.md](modules/03-plugins-cors.md) | `src/plugins/cors.ts` | 16 | 插件层 |
 | 04 | [04-plugins-errors.md](modules/04-plugins-errors.md) | `src/plugins/errors.ts` | 60 | 插件层 |
-| 05 | [05-plugins-body.md](modules/05-plugins-body.md) | `src/plugins/body.ts` | 77 | 插件层 |
-| 06 | [06-plugins-auth.md](modules/06-plugins-auth.md) | `src/plugins/auth.ts` | 70 | 插件层 |
+| 05 | [05-plugins-body.md](modules/05-plugins-body.md) | `src/plugins/body.ts` | 88 | 插件层 |
+| 06 | [06-plugins-auth.md](modules/06-plugins-auth.md) | `src/plugins/auth.ts` | 86 | 插件层 |
 | 07 | [07-config.md](modules/07-config.md) | `src/shared/config.ts` | 168 | 基础设施层 |
-| 08 | [08-logger.md](modules/08-logger.md) | `src/shared/logger.ts` | 16 | 基础设施层 |
+| 08 | [08-logger.md](modules/08-logger.md) | `src/shared/logger.ts` | 60 | 基础设施层 |
 | 09 | [09-util.md](modules/09-util.md) | `src/shared/util.ts` | 75 | 基础设施层 |
-| 10 | [10-runtime.md](modules/10-runtime.md) | `src/shared/runtime.ts` | 139 | 基础设施层 |
-| 11 | [11-http.md](modules/11-http.md) | `src/shared/http.ts` | 126 | 基础设施层 |
+| 10 | [10-runtime.md](modules/10-runtime.md) | `src/shared/runtime.ts` | 165 | 基础设施层 |
+| 11 | [11-http.md](modules/11-http.md) | `src/shared/http.ts` | 183 | 基础设施层 |
 | 12 | [12-auth.md](modules/12-auth.md) | `src/shared/auth.ts` | 43 | 基础设施层 |
 | 13 | [13-cc-types.md](modules/13-cc-types.md) | `src/shared/cc-types.ts` | 39 | 基础设施层 |
 | 14 | [14-errors.md](modules/14-errors.md) | `src/shared/errors.ts` | 109 | 基础设施层 |
 | 15 | [15-version.md](modules/15-version.md) | `src/shared/version.ts` | 25 | 基础设施层 |
 | 16 | [16-cc-events.md](modules/16-cc-events.md) | `src/infra/cc-events.ts` | 101 | 共享管道层 |
 | 17 | [17-cc.md](modules/17-cc.md) | `src/infra/cc.ts` | 216 | 上游对接层 |
-| 18 | [18-sse.md](modules/18-sse.md) | `src/infra/sse.ts` | 138 | 共享管道层 |
+| 18 | [18-sse.md](modules/18-sse.md) | `src/infra/sse.ts` | 217 | 共享管道层 |
 | 19 | [19-proxy-handler.md](modules/19-proxy-handler.md) | `src/infra/proxy-handler.ts` | 97 | 共享管道层 |
 | 20 | [20-session.md](modules/20-session.md) | `src/infra/session.ts` | 60 | 上游对接层 |
 | 21 | [21-fingerprint.md](modules/21-fingerprint.md) | `src/infra/fingerprint.ts` | 190 | 上游对接层 |
@@ -152,20 +156,20 @@ createApp                     (src/app.ts)
 | 23 | [23-chat-model.md](modules/23-chat-model.md) | `src/modules/chat/model.ts` | 35 | 协议层 |
 | 24 | [24-chat-service.md](modules/24-chat-service.md) | `src/modules/chat/service.ts` | 17 | 协议层 |
 | 25 | [25-chat-protocol.md](modules/25-chat-protocol.md) | `src/modules/chat/protocol.ts` | 5 | 协议层 |
-| 26 | [26-chat-handler.md](modules/26-chat-handler.md) | `src/modules/chat/handler.ts` | 374 | 协议层 |
+| 26 | [26-chat-handler.md](modules/26-chat-handler.md) | `src/modules/chat/handler.ts` | 425 | 协议层 |
 | 27 | [27-chat-translator.md](modules/27-chat-translator.md) | `src/modules/chat/translator.ts` | 170 | 协议层 |
 | 28 | [28-chat-aggregator.md](modules/28-chat-aggregator.md) | `src/modules/chat/aggregator.ts` | 110 | 协议层 |
 | 29 | [29-messages-index.md](modules/29-messages-index.md) | `src/modules/messages/index.ts` | 18 | 协议层 |
 | 30 | [30-messages-model.md](modules/30-messages-model.md) | `src/modules/messages/model.ts` | 33 | 协议层 |
 | 31 | [31-messages-service.md](modules/31-messages-service.md) | `src/modules/messages/service.ts` | 27 | 协议层 |
 | 32 | [32-messages-protocol.md](modules/32-messages-protocol.md) | `src/modules/messages/protocol.ts` | 5 | 协议层 |
-| 33 | [33-messages-handler.md](modules/33-messages-handler.md) | `src/modules/messages/handler.ts` | 414 | 协议层 |
+| 33 | [33-messages-handler.md](modules/33-messages-handler.md) | `src/modules/messages/handler.ts` | 474 | 协议层 |
 | 34 | [34-messages-translator.md](modules/34-messages-translator.md) | `src/modules/messages/translator.ts` | 333 | 协议层 |
 | 35 | [35-messages-aggregator.md](modules/35-messages-aggregator.md) | `src/modules/messages/aggregator.ts` | 117 | 协议层 |
 | 36 | [36-models-index.md](modules/36-models-index.md) | `src/modules/models/index.ts` | 13 | 协议层 |
 | 37 | [37-models-model.md](modules/37-models-model.md) | `src/modules/models/model.ts` | 33 | 协议层 |
 | 38 | [38-models-service.md](modules/38-models-service.md) | `src/modules/models/service.ts` | 15 | 协议层 |
-| 39 | [39-models-catalog.md](modules/39-models-catalog.md) | `src/modules/models/catalog.ts` | 124 | 协议层 |
+| 39 | [39-models-catalog.md](modules/39-models-catalog.md) | `src/modules/models/catalog.ts` | 139 | 协议层 |
 | 40 | [40-health.md](modules/40-health.md) | `src/modules/health/index.ts` | 12 | 协议层 |
 | 41 | [41-test-e2e.md](modules/41-test-e2e.md) | `test/e2e.ts` | 486 | 测试 |
 | 42 | [42-test-heartbeat.md](modules/42-test-heartbeat.md) | `test/heartbeat.ts` | 89 | 测试 |
@@ -174,6 +178,8 @@ createApp                     (src/app.ts)
 | 45 | [45-proxy-slot.md](modules/45-proxy-slot.md) | `src/infra/proxy-slot.ts` | 164 | ⚠ 未接线 |
 | 46 | [46-context.md](modules/46-context.md) | `src/shared/context.ts` | 124 | ⚠ 未接线 |
 | 47 | [47-model-windows.md](modules/47-model-windows.md) | `src/shared/model-windows.ts` | 37 | ⚠ 未接线 |
+| 48 | [48-test-logging.md](modules/48-test-logging.md) | `test/logging.ts` | 399 | 测试 |
+| 49 | [49-test-logging-child.md](modules/49-test-logging-child.md) | `test/_logging-writefail-child.ts` | 21 | 测试 |
 | — | （无独立报告） | `src/shared/api-keys.ts` | 75 | 基础设施层 |
 | — | （无独立报告） | `src/shared/concurrency.ts` | 220 | 基础设施层 |
 | — | （无独立报告） | `src/shared/limit.ts` | 177 | 基础设施层 |
@@ -184,7 +190,7 @@ createApp                     (src/app.ts)
 
 | 文件 | 行数 | 提供的能力 | 为何未生效 | 接入点 |
 |---|---|---|---|---|
-| `src/infra/proxy-slot.ts` | 164 | 多 Key 轮询/亲和选择、每 Key 并发闸门与排队超时、`limitMeta` 限流元数据、指数退避重试 | 无任何 import 方 | `modules/chat/handler.ts:51` 与 `modules/messages/handler.ts:64` 的 `createUpstreamFlow` 调用处，改为走 proxy-slot |
+| `src/infra/proxy-slot.ts` | 164 | 多 Key 轮询/亲和选择、每 Key 并发闸门与排队超时、`limitMeta` 限流元数据、指数退避重试 | 无任何 import 方 | `modules/chat/handler.ts:62` 与 `modules/messages/handler.ts:74` 的 `createUpstreamFlow` 调用处，改为走 proxy-slot |
 | `src/shared/context.ts` | 124 | 请求体 token 粗估（4 字符/token + 每消息 4 token）、按模型窗口检查 | 无任何 import 方 | handler 入口处做 `context_window_exceeded` 预判 |
 | `src/shared/model-windows.ts` | 37 | 模型名 → 上下文窗口映射表 | 仅被 `shared/context.ts` 引用 | 随 `context.ts` 一同接入 |
 
@@ -197,7 +203,7 @@ createApp                     (src/app.ts)
 
 | 文档 | 内容 |
 |---|---|
-| [code-map.md](code-map.md) | 全部 47 个文件（src 47 + test 5，含 4 个无独立报告的 shared 文件）符号级映射 + 依赖矩阵 |
+| [code-map.md](code-map.md) | 全部 55 个文件（src 48 + test 7，含 4 个无独立报告的 shared 文件）符号级映射 + 依赖矩阵 |
 
 ## 6. 关键运行参数（速查）
 
@@ -207,10 +213,10 @@ createApp                     (src/app.ts)
 | 非流式空闲超时 `NONSTREAM_IDLE_TIMEOUT_MS` | 90 000 ms（`CC_NONSTREAM_IDLE_MS` 可覆盖，默认不变） | `src/shared/config.ts:160-163` |
 | thinking 空闲宽限 `THINKING_IDLE_TIMEOUT_MS` | 120 000 ms（`CC_THINKING_IDLE_MS` 可覆盖，默认不变） | `src/shared/config.ts:165-168` |
 | 上述超时常量重导出 | — | `src/shared/runtime.ts:9` |
-| 连续超时降级阈值 `TIMEOUT_REDUCE_CONTEXT_THRESHOLD` | 3 次 → 提示缩减上下文 | `src/shared/runtime.ts:11` |
-| 大上下文阈值 `TIMEOUT_LARGE_CONTEXT_TOKENS` | 80 000 tokens | `src/shared/runtime.ts:13` |
-| 超时状态 TTL `TIMEOUT_STATE_TTL_MS` | 30 min | `src/shared/runtime.ts:16` |
-| 空闲预算选择 `idleTimeoutFor` | thinking→120s；否则 streaming?30s:90s | `src/shared/runtime.ts:136` |
+| 连续超时降级阈值 `TIMEOUT_REDUCE_CONTEXT_THRESHOLD` | 3 次 → 提示缩减上下文 | `src/shared/runtime.ts:12` |
+| 大上下文阈值 `TIMEOUT_LARGE_CONTEXT_TOKENS` | 80 000 tokens | `src/shared/runtime.ts:14` |
+| 超时状态 TTL `TIMEOUT_STATE_TTL_MS` | 30 min | `src/shared/runtime.ts:17` |
+| 空闲预算选择 `idleTimeoutFor` | thinking→120s；否则 streaming?30s:90s | `src/shared/runtime.ts:162` |
 | 超时计数分桶键 `scopeKey` | `${apiKey}::${sessionId ?? 'default'}` | `src/shared/runtime.ts` |
 | 会话有效期 | 12 h + ≤1 h 抖动，按 API key | `src/infra/session.ts:5-6` |
 | 指纹/生命周期刷新 | 8 h + ≤2 h 抖动，按 API key | `src/infra/fingerprint.ts:115-116` |
@@ -218,7 +224,7 @@ createApp                     (src/app.ts)
 | 模型列表刷新 | 300 000 ms（`CC_MODEL_REFRESH_INTERVAL_MS` 可配） | `src/shared/config.ts:106` |
 | 空 system 占位符 `emptySystemPlaceholder` | 默认 `true`（`CC_EMPTY_SYSTEM_PLACEHOLDER` 可关） | `src/shared/config.ts:115,144` |
 | 请求体上限 `MAX_BODY_SIZE` | 100 MB（`CC_MAX_BODY_MB` 可配） | `src/shared/config.ts:151-154` |
-| 超限排水上限 `DRAIN_LIMIT` | 32 MB（防慢速攻击） | `src/shared/http.ts:58` |
+| 超限排水上限 `DRAIN_LIMIT` | 32 MB（防慢速攻击） | `src/shared/http.ts:59` |
 | SSE 心跳 interval | 5 s | `src/infra/sse.ts:8` |
 | SSE 心跳 idle | 15 s | `src/infra/sse.ts:9` |
 | 监听端口/地址 | 3050 / 0.0.0.0 | `src/shared/config.ts:98-99` |

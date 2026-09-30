@@ -30,7 +30,7 @@
 
 ## 未接线原因
 
-`modules/chat/handler.ts:51` 与 `modules/messages/handler.ts:64` 直接调用
+`modules/chat/handler.ts:62` 与 `modules/messages/handler.ts:74` 直接调用
 `infra/proxy-handler.ts` 的 `createUpstreamFlow` / `callUpstream`，
 **绕过本模块**。因此以下能力在生产路径上全部未生效：
 
