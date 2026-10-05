@@ -22,8 +22,9 @@
 | 8-15 | re-export | 导出 | E | `buildAnthropicResponse`、`convertAnthropicToOpenAI`、`createAnthropicSseTranslator`、`fakeThinkingSignature`、`handleMessages`、`handleMessagesBody` ← `./protocol` |
 | 16 | `AnthropicStreamContext` | 类型 | E | 从 `./protocol` 作 type-only re-export |
 | 18-27 | `MessagesService` | 类 | E | `abstract`，仅含静态方法 |
-| 19-22 | `MessagesService.handle` | 方法 | E | 动态 import `./protocol` 后调 `handleMessages(request, headers)` |
-| 23-26 | `MessagesService.handleBody` | 方法 | E | 动态 import `./protocol` 后调 `handleMessagesBody(body, headers, signal)` |
+| 18 | └ 类声明 | 类 | E | `export abstract class MessagesService` |
+| 19-22 | └ `MessagesService.handle` | 方法 | E | 动态 import `./protocol` 后调 `handleMessages(request, headers)` |
+| 23-26 | └ `MessagesService.handleBody` | 方法 | E | 动态 import `./protocol` 后调 `handleMessagesBody(body, headers, signal)` |
 
 ## 关键行为
 

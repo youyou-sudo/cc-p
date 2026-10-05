@@ -30,6 +30,6 @@
 
 ## 关键行为
 
-- `model` 必填（7）但 handler.ts:55 仍以 `anthropicReq.model || 'claude-sonnet-4-6'` 兜底，二者不冲突：validation 已挡缺失，兜底只防绕过路由的直调。
+- `model` 必填（7）但 handler.ts:65 仍以 `anthropicReq.model || 'claude-sonnet-4-6'` 兜底，二者不冲突：validation 已挡缺失，兜底只防绕过路由的直调。
 - `messages` 的 `minItems:1`（13）让空数组体在 validation 阶段被拒（400）。
 - `additionalProperties:true`（11、26）是「绝不误杀未知透传字段」的实现核心，勿收紧为显式严格对象；`thinking`/`tools`/`tool_choice` 等联合类型统一用 `t.Any()`（18-20）同理。

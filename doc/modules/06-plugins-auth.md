@@ -3,7 +3,7 @@
 | 属性 | 值 |
 |---|---|
 | 路径 | `src/plugins/auth.ts` |
-| 行数 | 70 |
+| 行数 | 86 |
 | 层级 | 插件层 |
 | 依赖 | `elysia`(Elysia) `../shared/auth`(authErrorMessage, getApiKey) |
 | 被依赖 | `src/app.ts`、`src/modules/chat/index.ts`、`src/modules/messages/index.ts` |
@@ -18,25 +18,31 @@
 
 | 行号 | 符号 | 类别 | 可见性 | 说明 |
 |---|---|---|---|---|
-| 1-2 | — | import | — | `elysia`(Elysia) `../shared/auth`(authErrorMessage, getApiKey) |
-| 4-14 | — | 逻辑 | — | 注释：shim 背景、双协议说明、resolve 失败用 `status(401,…)` 而非 `new Response` |
-| 15-23 | `authErrorBody` | 函数 | E | 合并形状：`{ error:{message,type:'auth_error'}, type:'error' }`，401 同时携带 OpenAI 与 Anthropic 形状 |
-| 25-35 | `authPlugin` | 常量/插件 | E | `new Elysia({ name: 'auth' })` |
-| 26 | └ `.decorate('getApiKey', getApiKey)` | 方法 | P | 将 `getApiKey` 注册为 decorator |
-| 27-34 | └ `.macro({ requireAuth })` | 宏 | P | opt-in 鉴权宏，未 opt-in 的路由不受影响 |
-| 29-33 | └ `resolve` | 方法 | P | 取 `getApiKey(headers)`；为空则 `throw status(401, authErrorBody(headers))`，否则返回 `{ apiKey }` |
-| 37-39 | — | 逻辑 | — | 注释：per-protocol 401 字面量与旧 handler 逐字节一致，`authErrorBody` 不可在此复用 |
-| 40 | `openAI401Body` | 函数 | E | `(msg) => ({ error: { message: msg, type: 'auth_error' } })` |
-| 41-44 | `anthropic401Body` | 函数 | E | `(msg) => ({ type:'error', error:{ type:'authentication_error', message: msg } })` |
-| 46-54 | — | 逻辑 | — | 注释：为何用 `return status` 而非 throw、为何 per-isAnthropic 字面量、为何不用 onParse/new Response/普通 Error |
-| 55-69 | `createAuthPreCheck` | 函数 | E | 接收 `isAnthropic`，返回 `onTransform`/`derive` 用回调 |
-| 56-69 | └ 返回回调 | 函数 | P | `({request,headers,status}) => …` |
-| 65-68 | └ 判定逻辑 | 逻辑 | P | `getApiKey(h)` 存在则 `undefined`；否则 `status(401, isAnthropic ? anthropic401Body(msg) : openAI401Body(msg))` |
+| 1-4 | — | import | — | `elysia`(Elysia) `../shared/auth`(authErrorMessage, getApiKey) `../shared/config`(CFG) `../shared/logger`(log) |
+| 5-15 | — | 逻辑 | — | 注释：shim 背景、双协议说明、resolve 失败用 `status(401,…)` 而非 `new Response` |
+| 17-25 | `authErrorBody` | 函数 | E | 合并形状：`{ error:{message,type:'auth_error'}, type:'error' }`，401 同时携带 OpenAI 与 Anthropic 形状 |
+| 27-37 | `authPlugin` | 常量/插件 | E | `new Elysia({ name: 'auth' })` |
+| 28 | └ `.decorate('getApiKey', getApiKey)` | 方法 | P | 将 `getApiKey` 注册为 decorator |
+| 29-36 | └ `.macro({ requireAuth })` | 宏 | P | opt-in 鉴权宏，未 opt-in 的路由不受影响 |
+| 31-35 | └ `resolve` | 方法 | P | 取 `getApiKey(headers)`；为空则 `throw status(401, authErrorBody(headers))`，否则返回 `{ apiKey }` |
+| 39-41 | — | 逻辑 | — | 注释：per-protocol 401 字面量与旧 handler 逐字节一致，`authErrorBody` 不可在此复用 |
+| 42 | `openAI401Body` | | 函数 | E | `(msg) => ({ error: { message: msg, type: 'auth_error' } })` |
+| 43-46 | `anthropic401Body` | 函数 | E | `(msg) => ({ type:'error', error:{ type:'authentication_error', message: msg } })` |
+| 50-56 | — | 逻辑 | — | 注释：为何用 `return status` 而非 throw、为何 per-isAnthropic 字面量、为何不用 onParse/new Response/普通 Error |
+| 57-86 | `createAuthPreCheck` | 函数 | E | 接收 `isAnthropic`，返回 `onTransform`/`derive` 用回调 |
+| 58-85 | └ 返回回调 | 函数 | P | `({request,headers,status}) => …` |
+| 66 | └ 快速通过 | 逻辑 | P | `getApiKey(h)` 存在 → 返回 `undefined`，继续后续校验 |
+| 68-81 | └ 记日志并短路 | 逻辑 | P | 记 `Authentication failed (pre-check)`（path/protocol/reason/呈现了哪个凭据/是否配置兜底 Key），再 `status(401, isAnthropic ? anthropic401Body(msg) : openAI401Body(msg))` |
 
 ## 关键行为
 
-- **默认不强制**（L25-27）：仅 decorate `getApiKey` 与声明 `requireAuth` macro，路由须显式 opt-in。
-- **宏失败用抛出 `status(401,…)`**（L31）：`resolve` 抛出映射为短路响应，禁用 `new Response`。
-- **合并形状 `authErrorBody` 只给 macro 用**（L15-23、L38-39）：`openAI401Body`/`anthropic401Body` 逐字节复刻旧 handler 字面量，二者不可互换。
-- **预检返回而非抛出 `status`**（L46-54、L68）：Elysia 1.4.30 AoT 顺序为 parse → transform/derive → validation → beforeHandle/resolve；`onTransform`/`derive` 返回 `status(401,…)` 能抢在 validation 前短路，规避“无 key + 非法 schema”导致的 401→400 回归。
-- **不引入 onParse/new Response/普通 Error**（L53-54）：`onParse` 返回值会变成 `c.body`，抛出的 `Error` 会被框架包成 `PARSE`。
+- **默认不强制**（L27-29）：仅 decorate `getApiKey` 与声明 `requireAuth` macro，路由须显式 opt-in。
+- **宏失败用抛出 `status(401,…)`**（L33）：`resolve` 抛出映射为短路响应，禁用 `new Response`。
+- **合并形状 `authErrorBody` 只给 macro 用**（L17-25、L39-41）：`openAI401Body`/`anthropic401Body` 逐字节复刻旧 handler 字面量，二者不可互换。
+- **预检返回而非抛出 `status`**（L50-56、L82）：Elysia 1.4.30 AoT 顺序为 parse → transform/derive → validation → beforeHandle/resolve；`onTransform`/`derive` 返回 `status(401,…)` 能抢在 validation 前短路，规避“无 key + 非法 schema”导致的 401→400 回归。
+- **pre-check 才是客户端真正收到的 401**（L68-81）：它在 onTransform 阶段短路，handler 根本不运行 —— 因此两个 handler 内的 `Authentication failed` 日志在路由路径上不可达，只有直接调用 `handleXxxBody` 的调用方才会触发。若不在此处记录，401 风暴（部署了错误的 Key、SDK 发错 header）只会看到一个状态码、永远没有原因。
+- **不引入 onParse/new Response/普通 Error**（L55-56）：`onParse` 返回值会变成 `c.body`，抛出的 `Error` 会被框架包成 `PARSE`。
+
+## 覆盖测试
+
+`test/logging.ts` 第 5 组（`auth:` 前缀，8 项断言），经真实的 `authPlugin` + `chatController` 组合验证，含格式错误 Key 与缺失 Key 产生可区分原因。

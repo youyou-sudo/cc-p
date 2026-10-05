@@ -1,5 +1,7 @@
 import { Elysia } from 'elysia'
 import { authErrorMessage, getApiKey } from '../shared/auth'
+import { CFG } from '../shared/config'
+import { log } from '../shared/logger'
 
 // Shim over the legacy pure auth helpers (src/shared/auth.ts).
 // Enforcement is via createAuthPreCheck below (onTransform/derive).
@@ -42,6 +44,20 @@ export function createAuthPreCheck(isAnthropic: boolean) {
     const h = headers as unknown as Record<string, string | undefined>
     if (getApiKey(h)) return undefined
     const msg = authErrorMessage(h)
+    // This is the 401 that actually reaches clients: it short-circuits
+    // before the handler runs, so the handler's own 'Authentication failed'
+    // log in chat/handler.ts and messages/handler.ts is unreachable via the
+    // routed path and only fires for direct handleXxxBody callers. Without a
+    // log here, a 401 storm (wrong key deployed, SDK sending the wrong
+    // header) showed only a status code in the access log, never a reason.
+    log('warn', 'Authentication failed (pre-check)', {
+      path: new URL(request.url).pathname,
+      protocol: isAnthropic ? 'anthropic' : 'openai',
+      reason: msg,
+      hasAuthorization: !!h['authorization'] || !!h['Authorization'],
+      hasXApiKey: !!h['x-api-key'] || !!h['X-Api-Key'],
+      fallbackKeyConfigured: !!CFG.apiKey,
+    })
     return status(401, isAnthropic ? anthropic401Body(msg) : openAI401Body(msg))
   }
 }

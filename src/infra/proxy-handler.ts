@@ -67,6 +67,28 @@ export interface UpstreamCallArgs<T> {
   label: string
   /** Map a non-2xx upstream status into this protocol's error Response. */
   onCcError: (mapped: MappedError) => T
+  /**
+   * Wall-clock instant (epoch ms) after which retrying is pointless because the
+   * caller has already given up. Optional: plain `callUpstream` does not retry
+   * at all, so it ignores this. `callUpstreamWithSlots` uses it to cap its
+   * backoff — sleeping past the client's deadline would only produce a second
+   * attempt nobody is waiting for, and for a non-idempotent endpoint that is a
+   * second generation charged to the user.
+   *
+   * Derive it from a client-supplied header (e.g. a request timeout) rather
+   * than inventing a value: guessing could cut retries that would have
+   * succeeded.
+   */
+  clientDeadlineAt?: number
+}
+
+/** Read a client-declared deadline from headers, if it exposes one. */
+export function clientDeadlineFrom(headers: Record<string, string | undefined>): number | undefined {
+  const raw = headers['x-request-timeout-ms'] ?? headers['x-timeout-ms']
+  if (!raw) return undefined
+  const ms = Number(raw)
+  if (!Number.isFinite(ms) || ms <= 0) return undefined
+  return Date.now() + ms
 }
 
 /** Process-wide gate: one in-flight/queue bucket per effective upstream key
@@ -336,8 +358,11 @@ function rebuildHeadStream(peek: HeadPeek): ReadableStream<Uint8Array> {
 
 /** 输出前流错误是否值得重试：对齐官方 CLI 的可重试状态（408 / 5xx）。
  *  业务终局类（usage window / payment / auth / plan / overflow）已被
- *  mapCcEventError 映射成 4xx，天然不会命中这里。 */
-function isRetryablePreOutputError(mapped: MappedError): boolean {
+ *  mapCcEventError 映射成 4xx，天然不会命中这里。
+ *  exported for test/logging.ts: 重试策略是「要不要为同一次请求付两次钱」的
+ *  决定，改它必须是显式动作，不该只靠读循环体发现。
+ *  参数只要求 status —— 判定确实只看这一个字段。 */
+export function isRetryablePreOutputError(mapped: { status: number }): boolean {
   return mapped.status === 408 || (mapped.status >= 500 && mapped.status <= 599)
 }
 
