@@ -14,6 +14,8 @@ import { buildCcRequest } from '../../infra/cc'
 import { sendJSON } from '../../shared/http'
 import { log } from '../../shared/logger'
 import { callUpstream, createUpstreamFlow } from '../../infra/proxy-handler'
+import { wrapUpstreamWithToolLoop } from '../../infra/tool-loop'
+import { executeWebSearch } from '../../infra/web-tools'
 import { getSessionId } from '../../infra/session'
 import { nowUnix, uuid } from '../../shared/util'
 import { convertResponsesToOpenAI } from './translator'
@@ -74,9 +76,28 @@ export async function handleResponsesBody(responsesReq: any, headers: Record<str
       onCcError: (mapped) => sendJSON(mapped.status, mapped.body),
     })
     if (!upstream.ok) return upstream.value
-    const ccResponse = upstream.response
+    const ccResponseRaw = upstream.response
     const upstreamRelease = (upstream as unknown as { release?: () => void })?.release
     releaseUpstream = () => { try { upstreamRelease?.() } catch {} }
+
+    // ── 代理侧代执行 ──────────────────────────────────────────────────
+    // 客户端声明 Responses 内置 `web_search` 时，由代理替它执行：客户端自己不实现
+    // 这个 provider-executed 工具，CC 也没有 provider 内置执行，但 CC 有服务路由
+    // /alpha/web-search（见 infra/web-tools.ts）。包一层 NDJSON tool-loop，下游
+    // translator / 两个 handler 都不感知。
+    const builtinToolNames: Record<string, string> = (openaiReq as any)._builtinToolNames || {}
+    const wantsWebSearch = Object.values(builtinToolNames).some((t) => t === 'web_search' || t === 'web_search_preview')
+    const ccResponse = wantsWebSearch
+      ? wrapUpstreamWithToolLoop(ccResponseRaw, {
+          apiKey,
+          incomingHeaders: headers,
+          ccBody,
+          signal: flow.signal,
+          promptCacheKey: openaiReq.prompt_cache_key,
+          executors: { web_search: executeWebSearch },
+          path: '/v1/responses',
+        })
+      : ccResponseRaw
 
     // ── 3/4. 分发：流式 → stream-handler，非流 → non-stream-handler ─────
     const deps = {

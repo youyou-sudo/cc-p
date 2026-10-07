@@ -607,6 +607,36 @@ export function buildCcRequest(openaiReq: any): any {
   return body
 }
 
+/** CLI 形请求头（官方 1.62.1 实测）。/alpha/generate 与 CC 的其它 /alpha 路由
+ *  （如 /alpha/web-search）共用同一套指纹头，代理侧代执行 web 工具时必须照发，
+ *  否则会被风控 / Cloudflare 1010 拦掉。 */
+export function buildCliHeaders(
+  apiKey: string,
+  sessionId: string,
+  incomingHeaders: Record<string, string | undefined>,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    // 官方 CLI 固定发 User-Agent: cli（bundle buildCommandAuthHeaders）；缺失会被
+    // Cloudflare 以 403 Error 1010 拦截，本地此前完全没有这个头。
+    'User-Agent': 'cli',
+    'Authorization': `Bearer ${apiKey}`,
+    'x-cli-environment': 'production',
+    'x-command-code-version': CC_VERSION,
+    'x-session-id': sessionId,
+    // x-co-flag 已从官方 1.62.1 移除（bundle 内 0 命中，仅旧版本存在）；继续发送
+    // 反而是可识别的旧版指纹，故删除。
+    'x-taste-learning': 'false',
+    'x-project-slug': fakeProjectSlug(sessionId),
+    'traceparent': generateTraceparent(),
+  }
+  // generate 侧统一 ZDR：CFG.zdr || 请求头 x-cmd-zdr==='1'（大小写不敏感）。
+  if (CFG.zdr || getHeader(incomingHeaders, 'x-cmd-zdr') === '1') {
+    headers['x-cmd-zdr'] = '1'
+  }
+  return headers
+}
+
 export async function forwardToCC(
   body: any,
   apiKey: string,
@@ -623,30 +653,11 @@ export async function forwardToCC(
   }
   const { sessionId, threadId } = getSessionContext(normalizedForSession, apiKey, promptCacheKey)
 
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    // 官方 CLI 固定发 User-Agent: cli（bundle buildCommandAuthHeaders）；缺失会被
-    // Cloudflare 以 403 Error 1010 拦截，本地此前完全没有这个头。
-    'User-Agent': 'cli',
-    'Authorization': `Bearer ${apiKey}`,
-    'x-cli-environment': 'production',
-    'x-command-code-version': CC_VERSION,
-    'x-session-id': sessionId,
-    // x-co-flag 已从官方 1.62.1 移除（bundle 内 0 命中，仅旧版本存在）；继续发送
-    // 反而是可识别的旧版指纹，故删除。
-    'x-taste-learning': 'false',
-    'x-project-slug': fakeProjectSlug(sessionId),
-    'traceparent': generateTraceparent(),
-  }
+  const headers = buildCliHeaders(apiKey, sessionId, incomingHeaders)
 
   // 官方 body 顶层带 threadId（合法 UUID）；非 UUID 官方会省略，本地用派生的
   // 稳定 UUID 恒定发送（同一 session 恒同一 thread）。
   body.threadId = threadId
-
-  // generate 侧统一 ZDR：CFG.zdr || 请求头 x-cmd-zdr==='1'（大小写不敏感）。
-  if (CFG.zdr || getHeader(incomingHeaders, 'x-cmd-zdr') === '1') {
-    headers['x-cmd-zdr'] = '1'
-  }
 
   // 总超时 300s，与调用方 signal 级联：任一 abort 即取消 fetch。
   const timeoutSignal = AbortSignal.timeout(300_000)

@@ -11,8 +11,11 @@ const stats = {
   fingerprint: 0,
   lifecycle: 0,
   billing: 0,
+  webSearch: 0,
   lastGenerateHeaders: {} as Record<string, string>,
   lastGenerateBody: null as any,
+  lastWebSearchHeaders: {} as Record<string, string>,
+  lastWebSearchBody: null as any,
 }
 let gatewayRetryCount = 0
 let http502RetryCount = 0
@@ -65,6 +68,18 @@ Bun.serve({
     if (url.pathname === '/provider/v1/models') {
       return Response.json({ data: [{ id: 'mock-model-a', context_window: 128000, max_output_tokens: 4096 }, { id: 'mock-model-b', context_length: 64000 }, { id: 'claude-sonnet-4-6' }] })
     }
+    if (url.pathname === '/alpha/web-search') {
+      // 代理侧代执行 web_search 的目标路由（CLI 同款：POST {query,numResults,…}）。
+      stats.webSearch++
+      stats.lastWebSearchHeaders = headers
+      stats.lastWebSearchBody = await req.json()
+      return Response.json({
+        results: [
+          { title: 'cc-p proxy', url: 'https://example.com/cc-p', description: 'reverse proxy for CC' },
+          { title: 'blocked host', url: 'https://evil.example.net/x', description: 'should be filtable' },
+        ],
+      })
+    }
     if (url.pathname === '/alpha/generate') {
       stats.generate++
       stats.lastGenerateHeaders = headers
@@ -98,6 +113,27 @@ Bun.serve({
             { type: 'error', error: { message: '<429> slow down' } },
             { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0 } },
           ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        case 'mock/websearch-loop': {
+          // 第一轮：模型要求 web_search（provider-executed 内置工具，客户端未实现）；
+          // 第二轮（消息里已出现工具结果）：给出最终答案。
+          const msgs: any[] = body.params.messages || []
+          const sawResult = msgs.some((m: any) => m?.role === 'tool' && JSON.stringify(m).includes('cc-p proxy'))
+          if (sawResult) {
+            return new Response(ndjson([
+              { type: 'start' },
+              { type: 'text-delta', text: 'final: found the proxy' },
+              { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 30, outputTokens: 8, cachedInputTokens: 0 } },
+            ]), { headers: { 'content-type': 'application/x-ndjson' } })
+          }
+          return new Response(ndjson([
+            { type: 'start' },
+            { type: 'text-delta', text: 'Let me search. ' },
+            { type: 'tool-input-start', toolCallId: 'call_ws_1', toolName: 'web_search' },
+            { type: 'tool-input-delta', toolCallId: 'call_ws_1', delta: '{"query":"cc-p proxy","numResults":3}' },
+            { type: 'tool-input-end', toolCallId: 'call_ws_1' },
+            { type: 'finish', finishReason: 'tool-calls', totalUsage: { inputTokens: 10, outputTokens: 5, cachedInputTokens: 0 } },
+          ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        }
         case 'mock/params':
           return new Response(ndjson([
             { type: 'start' },
@@ -1042,6 +1078,34 @@ console.log('--- responses reasoning history replay (must not be dropped) ---')
     withText?.content?.[0]?.text === 'thought-text' && withText?.content?.[1]?.text === 'done', withText)
   check('encrypted-only reasoning item adds no empty reasoning part',
     !msgs.some((m: any) => Array.isArray(m.content) && m.content.some((p: any) => p.type === 'reasoning' && !p.text)), msgs)
+}
+
+console.log('--- proxy-executed web_search (Responses built-in, client has no impl) ---')
+{
+  const before = await statsFetch()
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({
+      model: 'mock/websearch-loop',
+      stream: true,
+      input: 'find the proxy',
+      tools: [{ type: 'web_search' }],
+    }),
+  })
+  const text = await r.text()
+  check('proxy web_search: provider tool call never reaches client', !text.includes('"name":"web_search"') && !text.includes('function_call'), text.slice(0, 500))
+  check('proxy web_search: narration + final answer spliced', text.includes('Let me search.') && text.includes('final: found the proxy'), text.slice(-500))
+  check('proxy web_search: single completed (no incomplete/truncated)', (text.match(/event: response\.completed/g) || []).length === 1 && !text.includes('response.incomplete'), text.slice(-200))
+  const s = await statsFetch()
+  check('proxy web_search: called CC /alpha/web-search', s.webSearch === before.webSearch + 1, { before: before.webSearch, after: s.webSearch })
+  check('proxy web_search: request body matches CLI shape', s.lastWebSearchBody?.query === 'cc-p proxy' && s.lastWebSearchBody?.numResults === 3, s.lastWebSearchBody)
+  check('proxy web_search: sends CLI fingerprint headers', s.lastWebSearchHeaders?.['user-agent'] === 'cli' && !!s.lastWebSearchHeaders?.['x-command-code-version'] && !!s.lastWebSearchHeaders?.['x-session-id'], s.lastWebSearchHeaders)
+  check('proxy web_search: upstream generate ran twice (tool round + final)', s.generate === before.generate + 2, { before: before.generate, after: s.generate })
+  const msgs: any[] = s.lastGenerateBody?.params?.messages || []
+  const asstCall = msgs.find((m: any) => m?.role === 'assistant' && Array.isArray(m.content) && m.content.some((p: any) => p.type === 'tool-call'))
+  const toolRes = msgs.find((m: any) => m?.role === 'tool')
+  check('proxy web_search: tool result fed back upstream',
+    !!asstCall && !!toolRes && JSON.stringify(toolRes).includes('cc-p proxy'), { asstCall, toolRes })
 }
 
 console.log('--- responses stream ---')

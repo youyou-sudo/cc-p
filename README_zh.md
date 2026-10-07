@@ -151,7 +151,7 @@ response.output_text.delta / response.function_call_arguments.delta / … / resp
 （无 `[DONE]`，SDK 以 `response.completed` 终止）。推理内容以
 `{type:"reasoning",summary:[…]}` item + `response.reasoning_summary_text.delta` 事件下发。
 `finishReason: length` 映射为 `status: "incomplete"` + `incomplete_details.reason: "max_output_tokens"`。
-内置（非 function）工具有 CC 对应就映射过去：`web_search` / `web_search_preview` → `web_search`，`local_shell` / `shell` → `shell_command`，`file_search` → `grep` + `glob`（降级为本地仓库检索——CC 没有向量库）。CC 的 web / shell / 检索工具本身就是**客户端执行的普通 function tool**，不是 provider 内置执行，所以能直接落。`web_search.filters.allowed_domains` 会落进 schema（`items.enum` + 描述），绝不静默放宽。被映射工具的调用按**客户端声明的内置类型名**回发（`shell_command` → `local_shell`、`grep`/`glob` → `file_search`），客户端匹配到的始终是自己声明过的名字。其余在 CC 侧没有对应，丢弃并 warn：`computer_use_preview`、`code_interpreter`、`image_generation`、`mcp`、`tool_search`、`programmatic_tool_calling`、`custom`。
+内置（非 function）工具有 CC 对应就映射过去：`web_search` / `web_search_preview` → `web_search`，`local_shell` / `shell` → `shell_command`，`file_search` → `grep` + `glob`（降级为本地仓库检索——CC 没有向量库）。`web_search` 不只是「声明」——它由**代理代执行**：客户端声明 Responses 内置 `web_search` 后，代理截住模型的调用，用与 CLI 同一套指纹头请求 CC 的 `/alpha/web-search` 服务路由，把结果回填上游并继续生成。客户端全程看不到这次工具调用（它声明的是自己跑不了的 provider-executed 工具），所以 opencode / codex 无需任何客户端实现就能拿到真实 web 搜索。最多拼接 4 轮生成为一条连续响应（有上限，避免搜索循环打不住）。`web_search.filters.allowed_domains` 会落进 schema（`items.enum` + 描述），绝不静默放宽。被映射工具的调用按**客户端声明的内置类型名**回发（`shell_command` → `local_shell`、`grep`/`glob` → `file_search`），客户端匹配到的始终是自己声明过的名字。其余在 CC 侧没有对应，丢弃并 warn：`computer_use_preview`、`code_interpreter`、`image_generation`、`mcp`、`tool_search`、`programmatic_tool_calling`、`custom`。
 
 ### `GET /v1/models`
 
