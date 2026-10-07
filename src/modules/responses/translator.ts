@@ -18,7 +18,7 @@
 // 429 JSON（与 messages 侧 message_start 缓冲语义一致）。
 
 import { isTruncatedStream, mapCcEventError, mapFinishReason, normalizeUsage, TRUNCATED_STREAM_MESSAGE } from '../../shared/errors'
-import { ccToolCallId, ccToolName, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../../shared/cc-types'
+import { ccToolArgsToString, ccToolCallId, ccToolName, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
@@ -390,13 +390,21 @@ export function convertResponsesToOpenAI(responsesReq: any): any {
       if (type === 'function_call') {
         const callId = item.call_id || item.id || `call_${uuid().slice(0, 8)}`
         const name = resolveCallName(item, namespaces)
-        if (name === 'unknown_tool') {
-          // 非空兜底只为满足上游校验（"`name` must be non-empty"）；记下形态便于定位。
-          log('warn', 'responses function_call name fallback', {
-            callId,
-            namespace: item.namespace || '',
-            hadName: !!item.name,
-          })
+        if (name === UNKNOWN_TOOL_NAME) {
+          // 区分两种情况，否则整段历史每轮刷屏 warn：
+          //  - 客户端回放的调用本来就叫 unknown_tool（上一轮真的丢过名字）→ debug；
+          //  - 本次确实没给名字 → warn，便于定位上游丢名事件。
+          const providedName = String(item.name ?? item.function?.name ?? item.tool_name ?? '').trim()
+          if (providedName) {
+            log('debug', 'responses function_call replayed as unknown_tool', { callId })
+          } else {
+            // 非空兜底只为满足上游校验（"`name` must be non-empty"）；记下形态便于定位。
+            log('warn', 'responses function_call name fallback', {
+              callId,
+              namespace: item.namespace || '',
+              hadName: false,
+            })
+          }
         }
         const toolCall = {
           id: callId,
@@ -651,6 +659,9 @@ export function createResponsesSseTranslator(
       log('debug', 'cc duplicate tool-call id suppressed (stream)', { toolCallId: callId })
       return []
     }
+    // 无参数调用必须发 '{}'：空串不是合法 JSON，客户端解析失败会丢掉这次调用，
+    // 写进历史后再回放就变成 arguments:""（见 cc-types.ccToolArgsToString）。
+    args = ccToolArgsToString(args)
     // 上游按扁平 function 返回；若该名字来自命名空间展平，回放时剥掉可能的
     // `<ns>.` 前缀并还原 namespace 字段（codex-rs 按 (namespace, name) 路由）。
     const name = normalizeNamespacedName(rawName || '', toolNamespaces)

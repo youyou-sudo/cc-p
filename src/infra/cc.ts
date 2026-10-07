@@ -373,18 +373,24 @@ export function buildCcRequest(openaiReq: any): any {
           const rawArgs = tc.function?.arguments
           let input: any
           if (typeof rawArgs === 'string') {
-            const parsed = tryParseJSONStrict(rawArgs)
-            if (isJSONParseFailure(parsed)) {
-              // 上游 tool-call.input 只接受对象（cmdcode2api 实测：标量/尾随内容被拒），
-              // 透传裸字符串会被判 Param Incorrect 并 400 掉整轮。回退空对象保活，
-              // 原始片段留在日志里便于定位（原先 passthrough raw 就是 400 的来源之一）。
-              log('warn', 'cc tool arguments parse failed, using empty object', { raw: rawArgs.slice(0, 200), message: parsed.message })
-              input = {}
-            } else if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-              log('warn', 'cc tool arguments not an object, using empty object', { type: Array.isArray(parsed) ? 'array' : typeof parsed })
+            if (rawArgs.trim() === '') {
+              // 无参数调用：空串不是合法 JSON，但语义就是 {}。按正常路径落地，
+              // 不报 parse 失败（生产日志：历史回放里的 arguments:"" 会成片刷屏）。
               input = {}
             } else {
-              input = parsed
+              const parsed = tryParseJSONStrict(rawArgs)
+              if (isJSONParseFailure(parsed)) {
+                // 上游 tool-call.input 只接受对象（cmdcode2api 实测：标量/尾随内容被拒），
+                // 透传裸字符串会被判 Param Incorrect 并 400 掉整轮。回退空对象保活，
+                // 原始片段留在日志里便于定位（原先 passthrough raw 就是 400 的来源之一）。
+                log('warn', 'cc tool arguments parse failed, using empty object', { raw: rawArgs.slice(0, 200), message: parsed.message })
+                input = {}
+              } else if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                log('warn', 'cc tool arguments not an object, using empty object', { type: Array.isArray(parsed) ? 'array' : typeof parsed })
+                input = {}
+              } else {
+                input = parsed
+              }
             }
           } else if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
             input = rawArgs

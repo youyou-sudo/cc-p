@@ -1,7 +1,7 @@
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
 import { isTruncatedStream, mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage, truncatedStreamError } from '../../shared/errors'
-import { ccToolCallId, ccToolName, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../../shared/cc-types'
+import { ccToolArgsToString, ccToolCallId, ccToolName, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { uuid } from '../../shared/util'
 import { EMPTY_THINKING_SIGNATURE } from './translator'
@@ -142,6 +142,7 @@ export function createMessagesAggregator(opts?: { onEventError?: (event: any, ma
       log('debug', 'cc duplicate tool-call id suppressed (aggregate)', { toolCallId: id })
       return
     }
+    argsStr = ccToolArgsToString(argsStr)
     toolCalls = toolCalls || []
     toolCalls.push({
       id: id || ('call_' + uuid().slice(0, 8)),

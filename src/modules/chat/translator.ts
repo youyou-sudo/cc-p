@@ -2,7 +2,7 @@
 // Pure streaming translation, no I/O.
 
 import { isTruncatedStream, mapCcEventError, mapFinishReason, normalizeUsage } from '../../shared/errors'
-import { ccToolCallId, ccToolName, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../../shared/cc-types'
+import { ccToolArgsToString, ccToolCallId, ccToolName, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
@@ -96,6 +96,9 @@ export function createSseTranslator(model: string, completionId: string, created
       log('debug', 'cc duplicate tool-call id suppressed (stream)', { toolCallId: id })
       return ''
     }
+    // 无参数调用必须发 '{}'：空串不是合法 JSON，客户端解析失败会丢掉这次调用，
+    // 写进历史后再回放就变成 arguments:""（见 cc-types.ccToolArgsToString）。
+    argsStr = ccToolArgsToString(argsStr)
     hasToolCall = true
     const finalId = id || `call_${Date.now()}_${toolCallIndex}`
     // OpenAI 契约要求 function.name 非空；opencode 的 ToolStream.appendOrStart 对

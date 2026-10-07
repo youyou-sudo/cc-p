@@ -13,7 +13,7 @@ import { classifyUpstreamLimit, limitMeta } from '../src/shared/limit'
 import { parseRetryAfter, backoffDelay } from '../src/shared/retry'
 import { ConcurrencyGate, ConcurrencyAborted, ConcurrencyRoomFull, ConcurrencyTimeout } from '../src/shared/concurrency'
 import { mapCcError, mapCcEventError, toRetryAfterSeconds } from '../src/shared/errors'
-import { normalizeCcUsage, ccToolName, ccToolCallId, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../src/shared/cc-types'
+import { normalizeCcUsage, ccToolName, ccToolCallId, ccToolArgsToString, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../src/shared/cc-types'
 import { generateSessionId, uuidFromSeed } from '../src/shared/util'
 
 let passed = 0
@@ -113,7 +113,16 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('ccToolCallId reads toolUseId', ccToolCallId({ toolUseId: 'call_1' }) === 'call_1')
   check('ccToolCallId prefers toolCallId', ccToolCallId({ toolCallId: 'a', id: 'b' }) === 'a')
   check('ccToolCallId empty-safe', ccToolCallId({ id: '' }) === '' && ccToolCallId(undefined) === '')
+  check('ccToolCallId reads call_id / callId', ccToolCallId({ call_id: 'call_1' }) === 'call_1' && ccToolCallId({ callId: 'call_2' }) === 'call_2')
+  check('ccToolName reads tool_name (snake_case)', ccToolName({ tool_name: 'bash' }) === 'bash')
   check('UNKNOWN_TOOL_NAME non-empty', UNKNOWN_TOOL_NAME === 'unknown_tool')
+
+  // 空参数工具调用必须序列化成合法 JSON：空串不是合法 JSON，客户端解析失败会丢掉
+  // 这次调用，写进历史回放后变成 arguments:""（生产日志 cc tool arguments parse failed）。
+  check('ccToolArgsToString empty/blank → {}', ccToolArgsToString('') === '{}' && ccToolArgsToString('   ') === '{}')
+  check('ccToolArgsToString keeps json string', ccToolArgsToString('{"a":1}') === '{"a":1}')
+  check('ccToolArgsToString object → json', ccToolArgsToString({ a: 1 }) === '{"a":1}')
+  check('ccToolArgsToString null/undefined → {}', ccToolArgsToString(null) === '{}' && ccToolArgsToString(undefined) === '{}')
 }
 
 // inline data-URL redaction (the screenshot-causes-compaction fix)
@@ -437,6 +446,36 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('responses sse finish → not truncated', trOk.truncated === false)
   const finOk = trOk.finishEvents()
   check('responses sse completed after finish, no [DONE]', finOk.at(-1)?.startsWith('event: response.completed') === true && !finOk.join('').includes('[DONE]'), finOk)
+}
+
+// 无参数 tool call：三协议都必须发合法 JSON '{}'，绝不能发空串
+// （空串会让客户端解析失败丢调用，历史回放变成 arguments:""）。
+{
+  const enc = new TextEncoder()
+  const bytes = enc.encode([
+    { type: 'start' },
+    { type: 'tool-input-start', toolCallId: 'call_z', toolName: 'noargs' },
+    { type: 'tool-input-end', toolCallId: 'call_z' },
+    { type: 'finish', finishReason: 'tool-calls', totalUsage: { inputTokens: 1, outputTokens: 1 } },
+  ].map((e) => JSON.stringify(e)).join('\n') + '\n')
+
+  const { createSseTranslator } = await import('../src/modules/chat/translator')
+  const chatOut = [...createSseTranslator('m', 'cmp', 1).parseChunk(bytes)]
+  const chatTr = createSseTranslator('m', 'cmp2', 1)
+  const chatAll = [...chatTr.parseChunk(bytes), ...chatTr.flush()].join('')
+  check('chat no-arg tool call → {}', chatOut.join('').includes('"arguments":"{}"') && !chatAll.includes('"arguments":""'), chatOut.join('').slice(0, 200))
+
+  const { createAnthropicSseTranslator } = await import('../src/modules/messages/translator')
+  const ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, upstreamError: null }
+  const anth = createAnthropicSseTranslator('m', 'msg_s', ctx)
+  const anthAll = [...anth.startEvents(), ...anth.parseChunk(bytes), ...anth.flush()].join('')
+  check('anthropic no-arg tool call → {}', anthAll.includes('"partial_json":"{}"'), anthAll.slice(0, 300))
+
+  const { createResponsesSseTranslator } = await import('../src/modules/responses/translator')
+  const resp = createResponsesSseTranslator('m', 'resp_s', 1)
+  const respOut = [...resp.startEvents(), ...resp.parseChunk(bytes), ...resp.flush()]
+  const respDone = respOut.find((e) => e.startsWith('event: response.function_call_arguments.done'))
+  check('responses no-arg tool call → {}', !!respDone && respDone.includes('"arguments":"{}"'), respDone)
 }
 
 // billing: upstream credits payload → OpenAI credit_summary (pure)

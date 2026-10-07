@@ -3,7 +3,7 @@
 // 多步 finish 优先级、tool-input-* 增量缓冲），仅出口对象换成 Responses 形。
 
 import { isTruncatedStream, mapCcEventError, mapFinishReason, normalizeUsage, truncatedStreamError } from '../../shared/errors'
-import { ccToolCallId, ccToolName, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../../shared/cc-types'
+import { ccToolArgsToString, ccToolCallId, ccToolName, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
@@ -95,6 +95,7 @@ export function createResponsesAggregator(opts?: { onEventError?: (event: any, m
       log('debug', 'cc duplicate tool-call id suppressed (aggregate)', { toolCallId: id })
       return
     }
+    argsStr = ccToolArgsToString(argsStr)
     toolCalls = toolCalls || []
     toolCalls.push({
       id: id || ('call_' + uuid().slice(0, 8)),

@@ -75,15 +75,32 @@ export function createToolCallIdGuard(): (id: string) => boolean {
  *  "OpenAI Chat tool call delta is missing id or name"，整条流失败。
  *  统一提取，永远是去掉首尾空白的字符串（可能为空，由发射端兜底）。 */
 export function ccToolName(event: any): string {
-  const v = event?.toolName ?? event?.name ?? event?.tool?.name
+  const v = event?.toolName ?? event?.tool_name ?? event?.name ?? event?.tool?.name ?? event?.tool?.toolName ?? event?.function?.name
   return typeof v === 'string' ? v.trim() : ''
 }
 
-/** 上游工具调用 id 可能落在 `toolCallId` / `toolUseId` / `id`（tool-input-start
- *  用 `id`）。同样统一提取，避免流式路径漏读后下发空 id。 */
+/** 上游工具调用 id 可能落在 `toolCallId` / `tool_call_id` / `call_id` / `callId` /
+ *  `toolUseId` / `id`（tool-input-start 用 `id`）。同样统一提取，避免流式路径
+ *  漏读后下发空 id。 */
 export function ccToolCallId(event: any): string {
-  const v = event?.toolCallId ?? event?.id ?? event?.toolUseId
+  const v = event?.toolCallId ?? event?.tool_call_id ?? event?.call_id ?? event?.callId ?? event?.id ?? event?.toolUseId
   return typeof v === 'string' ? v.trim() : ''
+}
+
+/** 工具入参 → 合法 JSON 字符串。
+ *
+ *  空串 / 纯空白**不是**合法 JSON：`JSON.parse('')` 抛错，AI SDK / opencode 会把
+ *  这次 tool call 当成坏调用丢掉；更糟的是它随后被写进会话历史，回放时变成
+ *  `arguments:""`（生产日志：`cc tool arguments parse failed {"raw":""}` 成片刷屏）。
+ *  无参数调用必须落成 `'{}'`，对象/字符串照旧序列化。 */
+export function ccToolArgsToString(input: any): string {
+  if (typeof input === 'string') return input.trim() ? input : '{}'
+  if (input == null) return '{}'
+  try {
+    return JSON.stringify(input) ?? '{}'
+  } catch {
+    return '{}'
+  }
 }
 
 /** 下游契约要求工具名非空；上游确实完全没给名字时的统一占位符

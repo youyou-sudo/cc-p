@@ -41,9 +41,10 @@
 | 32-37 | `CcStreamEvent` | type（联合） | E | 上述 17 个事件接口的判别联合 |
 | 39 | `CcEventType` | type | E | `CcStreamEvent['type']` 事件名字面量联合 |
 | 54-70 | `createToolCallIdGuard` | 函数 | E | 按 tool-call id 去重（空 id 一律放行），防重复 id 回传上游 400 |
-| 72-81 | `ccToolName` | 函数 | E | 统一提取工具名 `toolName ?? name ?? tool.name`，trim 后返回（可能空串） |
-| 83-87 | `ccToolCallId` | 函数 | E | 统一提取调用 id `toolCallId ?? id ?? toolUseId`，trim 后返回 |
-| 89-91 | `UNKNOWN_TOOL_NAME` | 常量 | E | `'unknown_tool'`：上游完全没给名字时的非空占位名 |
+| 77-80 | `ccToolName` | 函数 | E | 统一提取工具名 `toolName ?? tool_name ?? name ?? tool.name ?? tool.toolName ?? function.name`，trim 后返回（可能空串） |
+| 85-87 | `ccToolCallId` | 函数 | E | 统一提取调用 id `toolCallId ?? tool_call_id ?? call_id ?? callId ?? id ?? toolUseId`，trim 后返回 |
+| 95-103 | `ccToolArgsToString` | 函数 | E | 工具入参 → 合法 JSON 字符串；空串/纯空白 → `'{}'`（空串不是合法 JSON） |
+| 106-107 | `UNKNOWN_TOOL_NAME` | 常量 | E | `'unknown_tool'`：上游完全没给名字时的非空占位名 |
 
 ## 关键行为
 
@@ -51,5 +52,6 @@
 - 事件类型命名与上游 NDJSON 的 `type` 字段一一对应；协议层仅对关心的事件注册钩子，未知事件由解析器吞掉/告警。
 - `CcErrorEvent.message` 可能带 `<NNN>` 状态码前缀（上游把 HTTP 状态编进流内），由 `src/shared/errors.ts` 的 `mapCcEventError` 解析（见 `14-errors.md`）。
 - `CcFinishEvent` 同时携带 `totalUsage` 与 `usage`，聚合端需择一或累加，避免重复计数。
-- `ccToolName` / `ccToolCallId` 供流式与非流式的六个 tool 钩子统一读身份字段：上游把工具名/调用 id 放在不同拼写（`toolName`/`name`/`tool.name`、`toolCallId`/`id`/`toolUseId`），各写一遍必漏读，最终向下游发空 `function.name` —— opencode 的 `ToolStream.appendOrStart` 遇到空名直接抛 "OpenAI Chat tool call delta is missing id or name"，整条流失败。
+- `ccToolName` / `ccToolCallId` 供流式与非流式的六个 tool 钩子统一读身份字段：上游把工具名/调用 id 放在不同拼写（`toolName`/`tool_name`/`name`/`tool.name`、`toolCallId`/`tool_call_id`/`call_id`/`callId`/`id`/`toolUseId`），各写一遍必漏读，最终向下游发空 `function.name` —— opencode 的 `ToolStream.appendOrStart` 遇到空名直接抛 "OpenAI Chat tool call delta is missing id or name"，整条流失败。
+- `ccToolArgsToString` 是六个发射点的入参出口：**空串不是合法 JSON**（`JSON.parse('')` 抛错），无参数调用必须落 `'{}'`。发空串会让客户端把这次 tool call 当坏调用丢掉；更糟的是它会被写进会话历史，之后每轮回放都变成 `arguments:""`（生产日志 `cc tool arguments parse failed {"raw":""}` 成片刷屏）。
 - 下游契约要求工具名非空；`UNKNOWN_TOOL_NAME` 是统一兜底，与 request 侧 `resolveCallName` / `cc.ts` 的空名兜底同名，保证一轮自洽（回放解析时不会错位）。
