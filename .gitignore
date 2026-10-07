@@ -44,3 +44,7 @@ package-lock.json
 # binaries
 /server
 server.exe
+
+# local run artifacts (task state written by out-of-tree runner scripts:
+# *.pid / *.status / *.heartbeat / *.task.ps1 — only *.log was covered before)
+/.hb/

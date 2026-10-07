@@ -12,6 +12,7 @@
     "test:unit": "bun run test/unit.ts",
     "test:timeouts": "bun run test/timeouts.ts",
     "test:heartbeat": "bun run test/heartbeat.ts",
+    "test:logging": "bun run test/logging.ts",
     "test:idle-transport": "bun run test/idle-transport.ts"
   },
   "dependencies": {
