@@ -285,7 +285,7 @@ function check(name: string, cond: boolean, extra?: unknown): void {
     ],
     tools: [
       { type: 'function', name: 'f', description: 'd', parameters: { type: 'object' }, strict: true },
-      { type: 'web_search' },
+      { type: 'computer_use_preview' },
     ],
     tool_choice: { type: 'function', name: 'f' },
   })
@@ -294,10 +294,30 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('responses convert function_call', req.messages[2].role === 'assistant' && req.messages[2].tool_calls[0].id === 'call_9' && req.messages[2].tool_calls[0].function.arguments === '{"a":1}', req.messages[2])
   check('responses convert function_call_output', req.messages[3].role === 'tool' && req.messages[3].tool_call_id === 'call_9' && req.messages[3].content === 'ok', req.messages[3])
   check('responses convert empty reasoning item adds no message', req.messages.length === 4, req.messages.length)
-  check('responses convert tools nested + non-function dropped', req.tools?.length === 1 && req.tools[0].function.name === 'f' && req.tools[0].function.strict === true, req.tools)
+  check('responses convert tools nested + unmapped built-in dropped', req.tools?.length === 1 && req.tools[0].function.name === 'f' && req.tools[0].function.strict === true, req.tools)
   check('responses convert tool_choice', req.tool_choice?.type === 'function' && req.tool_choice?.function?.name === 'f', req.tool_choice)
   check('responses convert scalars', req.max_tokens === 321 && req.top_p === 0.8 && req.temperature === 0.2 && req.parallel_tool_calls === false && req.reasoning_effort === 'high' && req.user === 'u_1' && req.prompt_cache_key === 'pk', req)
   check('responses convert ignores stateless fields', req.store === undefined && req.previous_response_id === undefined && req.include === undefined, req)
+
+  // 内置工具映射：CC 的 web/shell 都是普通 function tool（不是 provider 内置执行），
+  // 有对应就授予 CC 同名工具，无对应（computer/code_interpreter…）仍丢弃。
+  const builtins = convertResponsesToOpenAI({
+    input: 'hi',
+    tools: [
+      { type: 'web_search_preview', filters: { allowed_domains: ['a.com', 'b.com'] } },
+      { type: 'web_search' },
+      { type: 'local_shell' },
+      { type: 'shell' },
+      { type: 'computer_use_preview' },
+      { type: 'code_interpreter' },
+    ],
+  })
+  const bt = builtins.tools || []
+  const names = bt.map((t: any) => t.function?.name)
+  check('responses built-in web_search → CC web_search function tool', names[0] === 'web_search' && bt[0].function.parameters.required?.includes('query'), bt)
+  check('responses web_search allowed_domains honored (never silently widened)', JSON.stringify(bt).includes('"enum":["a.com","b.com"]'), bt[0].function.parameters)
+  check('responses local_shell/shell → CC shell_command (deduped)', names.includes('shell_command') && names.filter((n: string) => n === 'shell_command').length === 1, names)
+  check('responses unmapped built-ins dropped (computer/code_interpreter)', names.length === 2 && !names.includes('computer_use_preview') && !names.includes('code_interpreter'), names)
 
   // Reasoning history must replay as assistant.reasoning_content (cc.ts → upstream
   // {type:'reasoning',text}). Dropping it makes reasoning models lose context across

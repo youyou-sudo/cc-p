@@ -193,6 +193,90 @@ function convertContentParts(content: any): any {
   return parts
 }
 
+/** CC 侧普通 function tool 的声明形（name / description / input_schema）。 */
+interface CcBuiltinTool {
+  name: string
+  description: string
+  parameters: any
+}
+
+/** CC 侧普通 function tool 的声明：web_search（CC docs/reference/tools）。
+ *  CC 的 web 工具是**客户端执行的普通 function tool**（走 CC 自己的服务路由），
+ *  不是 provider 内置执行，所以 Responses 的 `web_search` 内置工具可以落到它上面。 */
+const CC_WEB_SEARCH_TOOL: CcBuiltinTool = {
+  name: 'web_search',
+  description: 'Search the web and return ranked results.',
+  parameters: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Search query (>= 2 chars)' },
+      numResults: { type: 'number', description: 'Results (default 5, max 10)' },
+      allowed_domains: { type: 'array', items: { type: 'string' }, description: 'Only these domains' },
+      blocked_domains: { type: 'array', items: { type: 'string' }, description: 'Never these domains' },
+    },
+    required: ['query'],
+  },
+}
+
+/** 同上，shell_command（CC shell 工具；`local_shell` / `shell` 都落到它）。 */
+const CC_SHELL_COMMAND_TOOL: CcBuiltinTool = {
+  name: 'shell_command',
+  description: 'Run a shell command in the foreground or as a tracked background task.',
+  parameters: {
+    type: 'object',
+    properties: {
+      command: { type: 'string', description: 'The command line' },
+      args: { type: 'array', items: { type: 'string' }, description: 'Extra args, auto shell-quoted' },
+      cwd: { type: 'string', description: 'Working directory' },
+      timeout: { type: 'number', description: 'Foreground timeout in ms (default 30000, max 600000)' },
+      run_in_background: { type: 'boolean', description: 'Run detached; returns a task id + log path' },
+      description: { type: 'string', description: 'Short summary' },
+    },
+    required: ['command'],
+  },
+}
+
+/** Responses 内置工具 → CC 同名 function tool（语义直接对应的才收录）。
+ *
+ *  未收录的（`file_search` / `computer_use_preview` / `code_interpreter` /
+ *  `image_generation` / `mcp` / `tool_search` / `programmatic_tool_calling` /
+ *  `custom`）在 CC 侧没有对应能力，仍丢弃并 warn —— 见 README 的映射表。
+ *  注意方向：映射后客户端收到的是 CC 的工具名（`local_shell`/`shell` →
+ *  `shell_command`），客户端需按 CC 形处理。 */
+const BUILTIN_TOOL_MAP: Record<string, CcBuiltinTool> = {
+  web_search: CC_WEB_SEARCH_TOOL,
+  web_search_preview: CC_WEB_SEARCH_TOOL,
+  local_shell: CC_SHELL_COMMAND_TOOL,
+  shell: CC_SHELL_COMMAND_TOOL,
+}
+
+/**
+ * 把 Responses 内置工具声明映射成 CC function tool。
+ *
+ * `web_search` 声明可带 `filters.allowed_domains`（请求期限域）：不能静默丢，
+ * 否则调用方以为已限域、模型却能搜全网 —— 落进 schema 的 `items.enum` 与描述。
+ */
+function mapBuiltinTool(t: any): CcBuiltinTool | undefined {
+  const mapped = BUILTIN_TOOL_MAP[t?.type]
+  if (!mapped) return undefined
+  if (mapped.name !== 'web_search') return mapped
+  const allowed = Array.isArray(t?.filters?.allowed_domains)
+    ? t.filters.allowed_domains.filter((d: any) => typeof d === 'string' && d)
+    : []
+  if (allowed.length === 0) return mapped
+  return {
+    ...mapped,
+    description: `${mapped.description} Restricted to these domains: ${allowed.join(', ')}.`,
+    parameters: {
+      ...mapped.parameters,
+      properties: {
+        ...mapped.parameters.properties,
+        allowed_domains: { type: 'array', items: { type: 'string', enum: allowed }, description: 'Only these domains' },
+      },
+    },
+  }
+}
+
 /**
  * Responses tools (flat {type,name,parameters}) → chat nested function tools.
  *
@@ -203,8 +287,8 @@ function convertContentParts(content: any): any {
  * (which upstream then rejects with "`name` must be non-empty"). `namespaces`
  * records bare-name → namespace so response translation can restore the
  * `namespace` field codex routes on (see createResponsesSseTranslator /
- * buildResponsesObject). Built-in tools with no CC equivalent are still dropped
- * with a warn (never silently).
+ * buildResponsesObject). Built-in tools with a CC counterpart are mapped
+ * (BUILTIN_TOOL_MAP); the rest are dropped with a warn (never silently).
  */
 function convertTools(tools: any, namespaces: Record<string, string>): any[] | undefined {
   if (!Array.isArray(tools) || tools.length === 0) return undefined
@@ -233,6 +317,12 @@ function convertTools(tools: any, namespaces: Record<string, string>): any[] | u
       for (const sub of subTools) {
         const subType = sub?.type || 'function'
         if (subType !== 'function') {
+          const mapped = mapBuiltinTool(sub)
+          if (mapped) {
+            log('debug', 'responses namespace built-in sub-tool mapped', { namespace: ns, toolType: subType, ccTool: mapped.name })
+            pushFunction(mapped.name, mapped.description, mapped.parameters, undefined)
+            continue
+          }
           log('warn', 'responses namespace sub-tool dropped', { namespace: ns, toolType: subType, name: sub?.name || '' })
           continue
         }
@@ -248,7 +338,17 @@ function convertTools(tools: any, namespaces: Record<string, string>): any[] | u
       continue
     }
     if (type !== 'function') {
-      // Built-in tools (web_search/file_search/mcp/...): CC has no equivalent.
+      // Built-in tool with a CC counterpart (web_search / local_shell / shell):
+      // grant it as a CC function tool instead of dropping it. The rest
+      // (file_search / computer / code_interpreter / image_generation / mcp /
+      // tool_search / programmatic_tool_calling / custom) have no CC
+      // counterpart and are dropped with a warn.
+      const mapped = mapBuiltinTool(t)
+      if (mapped) {
+        log('debug', 'responses built-in tool mapped to CC tool', { toolType: type, ccTool: mapped.name })
+        pushFunction(mapped.name, mapped.description, mapped.parameters, undefined)
+        continue
+      }
       log('warn', 'responses non-function tool dropped', { toolType: type, name: t.name || '' })
       continue
     }

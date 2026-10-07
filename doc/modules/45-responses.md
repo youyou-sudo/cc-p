@@ -45,7 +45,8 @@
 | `input[].type: reasoning` | → 紧接着的下一条 assistant 消息的 `reasoning_content`（`summary[]`/`content[]`/`text` 取明文；`encrypted_content` 无明文则跳过），cc.ts 回灌为 `{type:'reasoning'}`——推理模型要求上一轮思考随历史回传 |
 | `input[].type: item_reference` / mcp_* | 忽略 + debug 日志（无 CC 对应） |
 | `input_file` / `refusal` | 文本占位符，不静默丢 |
-| `tools[]` 扁平 `{type,name,description,parameters,strict}` | → 嵌套 `{type:'function',function:{…}}`；非 function 工具（web_search 等）warn + 丢弃 |
+| `tools[]` 扁平 `{type,name,description,parameters,strict}` | → 嵌套 `{type:'function',function:{…}}` |
+| `tools[].type` 内置工具（非 function） | 有 CC 对应则映射为 CC 同名 function tool：`web_search`/`web_search_preview`→`web_search`、`local_shell`/`shell`→`shell_command`（CC 的 web/shell 是**客户端执行的普通 function tool**，非 provider 内置执行）；`web_search.filters.allowed_domains` 落进 schema `items.enum`+描述，绝不静默放宽。无对应者 warn+丢弃：`file_search`/`computer_use_preview`/`code_interpreter`/`image_generation`/`mcp`/`tool_search`/`programmatic_tool_calling`/`custom` |
 | `tool_choice` `auto/none/required` / `{type:'function',name}` | 字符串直传；function 形 → `{type:'function',function:{name}}`；未知对象整体透传 |
 | `reasoning.effort` / 顶层 `reasoning_effort` | → `reasoning_effort` |
 | `max_output_tokens` | → `max_tokens` |
