@@ -10,6 +10,9 @@
 // 在 CC 侧无对应实现，忽略并记 debug 日志（代理不假装支持有状态续接）。
 // reasoning：上游 reasoning-delta → {type:'reasoning',summary:[...]} item +
 // response.reasoning_summary_* 事件；不发 encrypted_content（无签名可发）。
+// 请求侧对称：input 里的 reasoning item → 下一条 assistant 消息的
+// reasoning_content（cc.ts 回灌为 {type:'reasoning',text}）——推理模型要求
+// 上一轮思考随历史回传，丢弃会让模型半途失忆（此前这里整项 ignore）。
 // 零输出不变量：startEvents() 只缓冲（created/in_progress），首个内容事件
 // （output_item.added）才由 stream-handler 显式 start()，保证空回包仍能回落
 // 429 JSON（与 messages 侧 message_start 缓冲语义一致）。
@@ -95,6 +98,23 @@ function extractImageUrl(part: any): string {
   }
   return ''
 }
+/** Responses `reasoning` item → plaintext (summary[] / content[] / bare text).
+ *
+ *  与 messages 侧 `thinking` 块对称：推理模型要求把上一轮 assistant 的 reasoning
+ *  随历史回传，否则模型「忘记自己想过什么」。上游 wire 形是 `{type:'reasoning',
+ *  text}`（见 infra/cc.ts assistant 分支）。`encrypted_content` 无明文（需 provider
+ *  解密），本地绝不伪造，直接跳过。 */
+function reasoningItemText(item: any): string {
+  if (!item || typeof item !== 'object') return ''
+  const collect = (arr: any): string => Array.isArray(arr)
+    ? arr.map((p: any) => (typeof p === 'string' ? p : (typeof p?.text === 'string' ? p.text : ''))).filter((s: string) => s).join('\n')
+    : ''
+  if (typeof item.text === 'string' && item.text) return item.text
+  const summary = collect(item.summary)
+  if (summary) return summary
+  return collect(item.content)
+}
+
 /** function_call_output.output → text (string / content parts / arbitrary object). */
 function outputToText(output: any): string {
   if (output == null) return ''
@@ -342,9 +362,15 @@ export function convertResponsesToOpenAI(responsesReq: any): any {
     // (symmetric with messages/translator.ts grouping an assistant turn's
     // tool_use blocks). Non-call items reset the container.
     let toolCallContainer: any = null
+    // A `reasoning` item precedes the assistant message / function_call it
+    // belongs to, so buffer its text and attach it to the next assistant item
+    // as `reasoning_content` (cc.ts → upstream `{type:'reasoning',text}`).
+    // Anything that ends the assistant turn clears it (never mis-attach).
+    let pendingReasoning = ''
     for (const item of input) {
       if (typeof item === 'string') {
         toolCallContainer = null
+        pendingReasoning = ''
         if (item) messages.push({ role: 'user', content: item })
         continue
       }
@@ -353,6 +379,14 @@ export function convertResponsesToOpenAI(responsesReq: any): any {
         continue
       }
       const type = item.type
+      if (type === 'reasoning') {
+        // 思考历史必须回灌：丢弃会让推理模型「忘记自己的推理」，多轮
+        // tool-loop 表现为重新规划 / 半途停下（与 messages 侧 thinking 对称）。
+        const text = reasoningItemText(item)
+        if (text) pendingReasoning = pendingReasoning ? `${pendingReasoning}\n\n${text}` : text
+        else log('debug', 'responses reasoning item without plaintext (encrypted only) ignored', {})
+        continue
+      }
       if (type === 'function_call') {
         const callId = item.call_id || item.id || `call_${uuid().slice(0, 8)}`
         const name = resolveCallName(item, namespaces)
@@ -373,10 +407,15 @@ export function convertResponsesToOpenAI(responsesReq: any): any {
           toolCallContainer.tool_calls.push(toolCall)
         } else {
           toolCallContainer = { role: 'assistant', content: null, tool_calls: [toolCall] }
+          if (pendingReasoning) {
+            toolCallContainer.reasoning_content = pendingReasoning
+            pendingReasoning = ''
+          }
           messages.push(toolCallContainer)
         }
       } else if (type === 'function_call_output') {
         toolCallContainer = null
+        pendingReasoning = ''
         const callId = item.call_id || item.id || ''
         if (!callId) log('warn', 'responses function_call_output missing call_id', {})
         messages.push({
@@ -387,13 +426,16 @@ export function convertResponsesToOpenAI(responsesReq: any): any {
           ...(item.name ? { name: String(item.name) } : {}),
           content: outputToText(item.output),
         })
-      } else if (type === 'reasoning' || type === 'item_reference' || type === 'computer_call_output' || type === 'mcp_call' || type === 'mcp_approval_response') {
-        // Ignored items (e.g. reasoning between parallel calls) must not break
-        // the tool-call grouping, so the container is intentionally kept.
+      } else if (type === 'item_reference' || type === 'computer_call_output' || type === 'mcp_call' || type === 'mcp_approval_response') {
+        // Ignored items with no CC equivalent must not break the tool-call
+        // grouping, so the container is intentionally kept.
         log('debug', 'responses input item ignored (no CC equivalent)', { itemType: type })
       } else if (item.role) {
         toolCallContainer = null
-        messages.push({ role: item.role, content: convertContentParts(item.content) })
+        const msg: any = { role: item.role, content: convertContentParts(item.content) }
+        if (item.role === 'assistant' && pendingReasoning) msg.reasoning_content = pendingReasoning
+        pendingReasoning = ''
+        messages.push(msg)
       } else {
         log('warn', 'responses input item unknown dropped', { itemType: type || '' })
       }

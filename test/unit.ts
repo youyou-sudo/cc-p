@@ -284,11 +284,33 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('responses convert user parts', req.messages[1].role === 'user' && req.messages[1].content[0].type === 'text' && req.messages[1].content[0].text === 'hi' && req.messages[1].content[1].type === 'image_url' && req.messages[1].content[1].image_url.url === 'https://img/1.png', req.messages[1])
   check('responses convert function_call', req.messages[2].role === 'assistant' && req.messages[2].tool_calls[0].id === 'call_9' && req.messages[2].tool_calls[0].function.arguments === '{"a":1}', req.messages[2])
   check('responses convert function_call_output', req.messages[3].role === 'tool' && req.messages[3].tool_call_id === 'call_9' && req.messages[3].content === 'ok', req.messages[3])
-  check('responses convert drops reasoning item', req.messages.length === 4, req.messages.length)
+  check('responses convert empty reasoning item adds no message', req.messages.length === 4, req.messages.length)
   check('responses convert tools nested + non-function dropped', req.tools?.length === 1 && req.tools[0].function.name === 'f' && req.tools[0].function.strict === true, req.tools)
   check('responses convert tool_choice', req.tool_choice?.type === 'function' && req.tool_choice?.function?.name === 'f', req.tool_choice)
   check('responses convert scalars', req.max_tokens === 321 && req.top_p === 0.8 && req.temperature === 0.2 && req.parallel_tool_calls === false && req.reasoning_effort === 'high' && req.user === 'u_1' && req.prompt_cache_key === 'pk', req)
   check('responses convert ignores stateless fields', req.store === undefined && req.previous_response_id === undefined && req.include === undefined, req)
+
+  // Reasoning history must replay as assistant.reasoning_content (cc.ts → upstream
+  // {type:'reasoning',text}). Dropping it makes reasoning models lose context across
+  // tool-loop turns. An encrypted-only item has no plaintext and must add nothing.
+  const rz = convertResponsesToOpenAI({
+    input: [
+      { role: 'user', content: 'q' },
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: 'r1' }] },
+      { type: 'function_call', call_id: 'c1', name: 'f', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'c1', output: 'ok' },
+      { type: 'reasoning', content: [{ type: 'reasoning_text', text: 'r2' }] },
+      { role: 'assistant', content: [{ type: 'output_text', text: 'done' }] },
+      { type: 'reasoning', encrypted_content: 'no-plaintext' },
+      { role: 'user', content: 'next' },
+    ],
+  })
+  check('responses reasoning → assistant tool_calls reasoning_content',
+    rz.messages[1]?.reasoning_content === 'r1' && rz.messages[1]?.tool_calls?.[0]?.id === 'c1', rz.messages[1])
+  check('responses reasoning → assistant message reasoning_content',
+    rz.messages[3]?.role === 'assistant' && rz.messages[3]?.reasoning_content === 'r2' && rz.messages[3]?.content?.[0]?.text === 'done', rz.messages[3])
+  check('responses encrypted-only reasoning adds no empty reasoning_content',
+    rz.messages.length === 5 && !rz.messages.some((m: any) => 'reasoning_content' in m && !m.reasoning_content), rz.messages)
 
   // Parallel tool calls: consecutive function_call items must collapse into one
   // assistant message so every tool_call_id is immediately followed by its tool

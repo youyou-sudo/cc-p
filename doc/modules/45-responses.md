@@ -42,7 +42,8 @@
 | `input_image` / `image_url` / `image` | → `image_url`（data URL 兼容） |
 | `input[].type: function_call` | → assistant `tool_calls`（`id=call_id`）；连续多个（并行调用）合并进同一条 assistant 消息，保证 tool 结果紧邻 |
 | `input[].type: function_call_output` | → `role:'tool'`（`tool_call_id=call_id`，output 字符串化） |
-| `input[].type: reasoning` / `item_reference` / mcp_* | 忽略 + debug 日志（无 CC 对应） |
+| `input[].type: reasoning` | → 紧接着的下一条 assistant 消息的 `reasoning_content`（`summary[]`/`content[]`/`text` 取明文；`encrypted_content` 无明文则跳过），cc.ts 回灌为 `{type:'reasoning'}`——推理模型要求上一轮思考随历史回传 |
+| `input[].type: item_reference` / mcp_* | 忽略 + debug 日志（无 CC 对应） |
 | `input_file` / `refusal` | 文本占位符，不静默丢 |
 | `tools[]` 扁平 `{type,name,description,parameters,strict}` | → 嵌套 `{type:'function',function:{…}}`；非 function 工具（web_search 等）warn + 丢弃 |
 | `tool_choice` `auto/none/required` / `{type:'function',name}` | 字符串直传；function 形 → `{type:'function',function:{name}}`；未知对象整体透传 |

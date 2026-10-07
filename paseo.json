@@ -1,0 +1,10 @@
+{
+  "worktree": {
+    "setup": "bun install"
+  },
+  "scripts": {
+    "dev": {
+      "command": "bun run dev"
+    }
+  }
+}

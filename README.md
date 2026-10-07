@@ -135,6 +135,7 @@ OpenAI Responses schema with automatic conversion:
 | `input` (string / items) | → `messages`; `input_text` / `input_image` / `output_text` parts pass through |
 | `input[].type: function_call` | → assistant `tool_calls` |
 | `input[].type: function_call_output` | → `role: "tool"` message |
+| `input[].type: reasoning` | → following assistant message's `reasoning_content` (replayed upstream as `{type:"reasoning"}`); `encrypted_content`-only items carry no plaintext and are skipped |
 | `tools[].{name,parameters,strict}` (flat) | → nested `{type:"function",function:{…}}` |
 | `tool_choice: auto / none / required / {function}` | → `auto / none / required / {function}` |
 | `reasoning.effort` | → `reasoning_effort` |

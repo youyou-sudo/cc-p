@@ -1012,6 +1012,38 @@ console.log('--- responses params passthrough ---')
   check('responses stateless fields ignored', b.params.store === undefined && b.params.previous_response_id === undefined && b.params.include === undefined, b.params)
 }
 
+console.log('--- responses reasoning history replay (must not be dropped) ---')
+{
+  // 推理模型要求上一轮 assistant 的 reasoning 随历史回传；Responses 的
+  // reasoning item 曾整项 ignore，导致模型多轮 tool-loop 半途失忆。
+  const r = await fetch(BASE + '/v1/responses', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({
+      model: 'mock/params',
+      input: [
+        { type: 'reasoning', id: 'rs_enc', encrypted_content: 'no-plaintext' },
+        { role: 'user', content: [{ type: 'input_text', text: 'q1' }] },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'thought-tool' }] },
+        { type: 'function_call', call_id: 'call_r1', name: 'get_weather', arguments: '{"city":"SF"}' },
+        { type: 'function_call_output', call_id: 'call_r1', output: 'sunny' },
+        { type: 'reasoning', content: [{ type: 'reasoning_text', text: 'thought-text' }] },
+        { role: 'assistant', content: [{ type: 'output_text', text: 'done' }] },
+        { role: 'user', content: [{ type: 'input_text', text: 'q2' }] },
+      ],
+    }),
+  })
+  check('responses reasoning replay 200', r.status === 200, r.status)
+  const msgs = (await statsFetch()).lastGenerateBody.params.messages
+  const withTool = msgs.find((m: any) => Array.isArray(m.content) && m.content[0]?.type === 'reasoning' && m.content.some((p: any) => p.type === 'tool-call'))
+  check('reasoning item → assistant reasoning part before tool-call',
+    withTool?.content?.[0]?.text === 'thought-tool' && withTool?.content?.[1]?.type === 'tool-call' && withTool?.content?.[1]?.toolName === 'get_weather', withTool)
+  const withText = msgs.find((m: any) => Array.isArray(m.content) && m.content[0]?.type === 'reasoning' && m.content.some((p: any) => p.type === 'text'))
+  check('reasoning item (content[]) → assistant reasoning part before text',
+    withText?.content?.[0]?.text === 'thought-text' && withText?.content?.[1]?.text === 'done', withText)
+  check('encrypted-only reasoning item adds no empty reasoning part',
+    !msgs.some((m: any) => Array.isArray(m.content) && m.content.some((p: any) => p.type === 'reasoning' && !p.text)), msgs)
+}
+
 console.log('--- responses stream ---')
 {
   const r = await fetch(BASE + '/v1/responses', {

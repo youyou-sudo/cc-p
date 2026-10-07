@@ -138,6 +138,7 @@ OpenAI Responses 结构，自动转换：
 | `input`（字符串 / items） | → `messages`；`input_text` / `input_image` / `output_text` 分片透传 |
 | `input[].type: function_call` | → assistant `tool_calls` |
 | `input[].type: function_call_output` | → `role: "tool"` 消息 |
+| `input[].type: reasoning` | → 紧接着的下一条 assistant 消息的 `reasoning_content`（回灌上游为 `{type:"reasoning"}`）；仅 `encrypted_content` 的项无明文，跳过 |
 | `tools[].{name,parameters,strict}`（扁平） | → 嵌套 `{type:"function",function:{…}}` |
 | `tool_choice: auto / none / required / {function}` | → `auto / none / required / {function}` |
 | `reasoning.effort` | → `reasoning_effort` |
