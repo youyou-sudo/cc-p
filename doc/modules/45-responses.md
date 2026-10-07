@@ -46,7 +46,7 @@
 | `input[].type: item_reference` / mcp_* | 忽略 + debug 日志（无 CC 对应） |
 | `input_file` / `refusal` | 文本占位符，不静默丢 |
 | `tools[]` 扁平 `{type,name,description,parameters,strict}` | → 嵌套 `{type:'function',function:{…}}` |
-| `tools[].type` 内置工具（非 function） | 有 CC 对应则映射为 CC 同名 function tool：`web_search`/`web_search_preview`→`web_search`、`local_shell`/`shell`→`shell_command`（CC 的 web/shell 是**客户端执行的普通 function tool**，非 provider 内置执行）；`web_search.filters.allowed_domains` 落进 schema `items.enum`+描述，绝不静默放宽。无对应者 warn+丢弃：`file_search`/`computer_use_preview`/`code_interpreter`/`image_generation`/`mcp`/`tool_search`/`programmatic_tool_calling`/`custom` |
+| `tools[].type` 内置工具（非 function） | 有 CC 对应则映射为 CC function tool：`web_search`/`web_search_preview`→`web_search`、`local_shell`/`shell`→`shell_command`、`file_search`→`grep`+`glob`（降级，CC 无向量库）（CC 的 web/shell/检索是**客户端执行的普通 function tool**，非 provider 内置执行）；`web_search.filters.allowed_domains` 落进 schema `items.enum`+描述，绝不静默放宽。**响应侧反向还原**：调用名按客户端声明的内置类型名回发（`shell_command`→`local_shell`、`grep`/`glob`→`file_search`），见 `_builtinToolNames`。无对应者 warn+丢弃：`computer_use_preview`/`code_interpreter`/`image_generation`/`mcp`/`tool_search`/`programmatic_tool_calling`/`custom` |
 | `tool_choice` `auto/none/required` / `{type:'function',name}` | 字符串直传；function 形 → `{type:'function',function:{name}}`；未知对象整体透传 |
 | `reasoning.effort` / 顶层 `reasoning_effort` | → `reasoning_effort` |
 | `max_output_tokens` | → `max_tokens` |

@@ -44,10 +44,13 @@ export interface ResponsesStreamDeps {
   /** 裸子工具名 → 命名空间（openaiReq._toolNamespaces）；用于回放时还原
    *  `namespace` 字段，codex-rs 按 (namespace, name) 路由。 */
   toolNamespaces?: Record<string, string>
+  /** CC 工具名 → 客户端声明的内置类型名（openaiReq._builtinToolNames）；用于把
+   *  内置工具调用还原成客户端声明的名字。 */
+  builtinToolNames?: Record<string, string>
 }
 
 export async function handleResponsesStream(deps: ResponsesStreamDeps): Promise<Response> {
-  const { ccResponse, apiKey, sessionId, model, responseId, createdAt, estimatedInputTokens, flow, releaseUpstream, toolNamespaces } = deps
+  const { ccResponse, apiKey, sessionId, model, responseId, createdAt, estimatedInputTokens, flow, releaseUpstream, toolNamespaces, builtinToolNames } = deps
 
   const abortController = flow.controller
   const aborted = () => flow.aborted
@@ -55,7 +58,7 @@ export async function handleResponsesStream(deps: ResponsesStreamDeps): Promise<
   let bytesReceived = 0
   let lastCcEvent = ''
 
-  const translator = createResponsesSseTranslator(model, responseId, createdAt, toolNamespaces || {})
+  const translator = createResponsesSseTranslator(model, responseId, createdAt, toolNamespaces || {}, builtinToolNames || {})
   const pipeline = new SsePipeline(false)
   const heartbeat = startSseHeartbeat(pipeline, { pingEvent: SSE_KEEPALIVE_COMMENT })
   const state: TerminalState = { upstreamError: null, timedOut: false, timedOutMs: undefined, zeroOutput: false, errorMsg: '' }

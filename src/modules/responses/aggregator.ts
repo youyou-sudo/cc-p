@@ -213,6 +213,8 @@ export function buildResponsesObject(
   /** 裸子工具名 → 命名空间（来自请求转换 convertTools 的展平）。流式路径
    *  等价实现见 translator.createResponsesSseTranslator。 */
   toolNamespaces: Record<string, string> = {},
+  /** CC 工具名 → 客户端声明的内置类型名（BUILTIN_TOOL_MAP 的反向还原）。 */
+  builtinToolNames: Record<string, string> = {},
 ): any {
   const u = aggregate.usage || {}
   normalizeUsage(u)
@@ -247,12 +249,14 @@ export function buildResponsesObject(
     // (namespace, name) 路由，点分 ns.name 会被判 unsupported call）。
     const nsName = normalizeNamespacedName(tc.function?.name || '', toolNamespaces)
     const namespace = toolNamespaces[nsName] || ''
+    // 内置工具映射的反向还原：按客户端声明的内置类型名回发（同流式路径）。
+    const emittedName = builtinToolNames[nsName] ?? nsName
     output.push({
       id: `fc_${uuid().slice(0, 12)}`,
       type: 'function_call',
       status: 'completed',
       call_id: tc.id,
-      name: nsName || UNKNOWN_TOOL_NAME,
+      name: emittedName || UNKNOWN_TOOL_NAME,
       arguments: toolArgsToString(tc.function?.arguments),
       ...(namespace ? { namespace } : {}),
     })

@@ -308,6 +308,7 @@ function check(name: string, cond: boolean, extra?: unknown): void {
       { type: 'web_search' },
       { type: 'local_shell' },
       { type: 'shell' },
+      { type: 'file_search' },
       { type: 'computer_use_preview' },
       { type: 'code_interpreter' },
     ],
@@ -317,7 +318,18 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('responses built-in web_search → CC web_search function tool', names[0] === 'web_search' && bt[0].function.parameters.required?.includes('query'), bt)
   check('responses web_search allowed_domains honored (never silently widened)', JSON.stringify(bt).includes('"enum":["a.com","b.com"]'), bt[0].function.parameters)
   check('responses local_shell/shell → CC shell_command (deduped)', names.includes('shell_command') && names.filter((n: string) => n === 'shell_command').length === 1, names)
-  check('responses unmapped built-ins dropped (computer/code_interpreter)', names.length === 2 && !names.includes('computer_use_preview') && !names.includes('code_interpreter'), names)
+  check('responses file_search degraded to local grep + glob', names.includes('grep') && names.includes('glob'), names)
+  check('responses unmapped built-ins dropped (computer/code_interpreter)', names.length === 4 && !names.includes('computer_use_preview') && !names.includes('code_interpreter'), names)
+  check('responses builtin reverse map recorded (CC name → declared type)', builtins._builtinToolNames?.shell_command === 'local_shell' && builtins._builtinToolNames?.grep === 'file_search', builtins._builtinToolNames)
+
+  // 反向还原：模型调 CC 工具名（shell_command），客户端收到的必须是它声明过的内置名
+  // （local_shell），否则客户端拿到一个从未声明过的工具名 → 未知工具。
+  const restored = buildResponsesObject('m', 'resp_b', 1, {
+    fullText: '', reasoningContent: '', finishReason: 'tool_calls', usage: null, upstreamError: null, truncated: false,
+    toolCalls: [{ id: 'call_1', type: 'function', function: { name: 'shell_command', arguments: '{"command":"ls"}' } }],
+  } as any, {}, { shell_command: 'local_shell' })
+  const restoredFc = restored.output.find((o: any) => o.type === 'function_call')
+  check('non-stream restores declared built-in name', restoredFc?.name === 'local_shell' && restoredFc?.call_id === 'call_1', restoredFc)
 
   // Reasoning history must replay as assistant.reasoning_content (cc.ts → upstream
   // {type:'reasoning',text}). Dropping it makes reasoning models lose context across
@@ -496,6 +508,15 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   const respOut = [...resp.startEvents(), ...resp.parseChunk(bytes), ...resp.flush()]
   const respDone = respOut.find((e) => e.startsWith('event: response.function_call_arguments.done'))
   check('responses no-arg tool call → {}', !!respDone && respDone.includes('"arguments":"{}"'), respDone)
+
+  // 反向还原（流式）：模型调 CC 工具名，客户端收到它声明过的内置名。
+  const restoreTr = createResponsesSseTranslator('m', 'resp_rs', 2, {}, { shell_command: 'local_shell' })
+  const restoreOut = [
+    ...restoreTr.startEvents(),
+    ...restoreTr.parseChunk(enc.encode(JSON.stringify({ type: 'tool-call', toolCallId: 'call_rs', toolName: 'shell_command', input: { command: 'ls' } }) + '\n')),
+    ...restoreTr.flush(),
+  ].join('')
+  check('stream restores declared built-in name', restoreOut.includes('"name":"local_shell"') && !restoreOut.includes('"name":"shell_command"'), restoreOut.slice(-320))
 }
 
 // billing: upstream credits payload → OpenAI credit_summary (pure)

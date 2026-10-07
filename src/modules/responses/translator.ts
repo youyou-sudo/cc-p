@@ -236,45 +236,78 @@ const CC_SHELL_COMMAND_TOOL: CcBuiltinTool = {
   },
 }
 
-/** Responses 内置工具 → CC 同名 function tool（语义直接对应的才收录）。
+/** CC grep（本地 regex 内容检索）。 */
+const CC_GREP_TOOL: CcBuiltinTool = {
+  name: 'grep',
+  description: 'Search file contents by regex (ripgrep). Local repository search.',
+  parameters: {
+    type: 'object',
+    properties: {
+      pattern: { type: 'string', description: 'Ripgrep regex' },
+      path: { type: 'string', description: 'File or directory to search' },
+      glob: { type: 'string', description: 'Filename filter (e.g. "*.ts")' },
+      output_mode: { type: 'string', enum: ['content', 'files_with_matches', 'count'], description: 'Output mode (default files_with_matches)' },
+      '-i': { type: 'boolean', description: 'Case-insensitive' },
+      head_limit: { type: 'number', description: 'Cap output lines (default 250, 0 = unlimited)' },
+    },
+    required: ['pattern'],
+  },
+}
+
+/** CC glob（按文件名匹配，与 grep 一起承接 `file_search` 的降级）。 */
+const CC_GLOB_TOOL: CcBuiltinTool = {
+  name: 'glob',
+  description: 'Find files by glob pattern, sorted by modification time.',
+  parameters: {
+    type: 'object',
+    properties: {
+      pattern: { type: 'string', description: 'Glob pattern (**, *, ?, {js,ts})' },
+      path: { type: 'string', description: 'Directory to search' },
+      limit: { type: 'number', description: 'Max results (default 100)' },
+    },
+    required: ['pattern'],
+  },
+}
+
+/** Responses 内置工具 → 授予的 CC 工具（语义直接对应、或降级可接受才收录）。
  *
- *  未收录的（`file_search` / `computer_use_preview` / `code_interpreter` /
- *  `image_generation` / `mcp` / `tool_search` / `programmatic_tool_calling` /
- *  `custom`）在 CC 侧没有对应能力，仍丢弃并 warn —— 见 README 的映射表。
- *  注意方向：映射后客户端收到的是 CC 的工具名（`local_shell`/`shell` →
- *  `shell_command`），客户端需按 CC 形处理。 */
-const BUILTIN_TOOL_MAP: Record<string, CcBuiltinTool> = {
-  web_search: CC_WEB_SEARCH_TOOL,
-  web_search_preview: CC_WEB_SEARCH_TOOL,
-  local_shell: CC_SHELL_COMMAND_TOOL,
-  shell: CC_SHELL_COMMAND_TOOL,
+ *  未收录的（`computer_use_preview` / `code_interpreter` / `image_generation` /
+ *  `mcp` / `tool_search` / `programmatic_tool_calling` / `custom`）在 CC 侧没有
+ *  对应能力，硬映射会误导模型，仍丢弃并 warn。
+ *  `file_search` 没有向量库语义检索，降级为本地 `grep` + `glob`。 */
+const BUILTIN_TOOL_MAP: Record<string, CcBuiltinTool[]> = {
+  web_search: [CC_WEB_SEARCH_TOOL],
+  web_search_preview: [CC_WEB_SEARCH_TOOL],
+  local_shell: [CC_SHELL_COMMAND_TOOL],
+  shell: [CC_SHELL_COMMAND_TOOL],
+  file_search: [CC_GREP_TOOL, CC_GLOB_TOOL],
 }
 
 /**
- * 把 Responses 内置工具声明映射成 CC function tool。
+ * 把 Responses 内置工具声明映射成要授予的 CC function tool 列表。
  *
  * `web_search` 声明可带 `filters.allowed_domains`（请求期限域）：不能静默丢，
  * 否则调用方以为已限域、模型却能搜全网 —— 落进 schema 的 `items.enum` 与描述。
  */
-function mapBuiltinTool(t: any): CcBuiltinTool | undefined {
-  const mapped = BUILTIN_TOOL_MAP[t?.type]
-  if (!mapped) return undefined
-  if (mapped.name !== 'web_search') return mapped
+function mapBuiltinTools(t: any): CcBuiltinTool[] | undefined {
+  const list = BUILTIN_TOOL_MAP[t?.type]
+  if (!list) return undefined
+  if (t?.type !== 'web_search' && t?.type !== 'web_search_preview') return list
   const allowed = Array.isArray(t?.filters?.allowed_domains)
     ? t.filters.allowed_domains.filter((d: any) => typeof d === 'string' && d)
     : []
-  if (allowed.length === 0) return mapped
-  return {
-    ...mapped,
-    description: `${mapped.description} Restricted to these domains: ${allowed.join(', ')}.`,
+  if (allowed.length === 0) return list
+  return list.map((tool) => ({
+    ...tool,
+    description: `${tool.description} Restricted to these domains: ${allowed.join(', ')}.`,
     parameters: {
-      ...mapped.parameters,
+      ...tool.parameters,
       properties: {
-        ...mapped.parameters.properties,
+        ...tool.parameters.properties,
         allowed_domains: { type: 'array', items: { type: 'string', enum: allowed }, description: 'Only these domains' },
       },
     },
-  }
+  }))
 }
 
 /**
@@ -288,21 +321,25 @@ function mapBuiltinTool(t: any): CcBuiltinTool | undefined {
  * records bare-name → namespace so response translation can restore the
  * `namespace` field codex routes on (see createResponsesSseTranslator /
  * buildResponsesObject). Built-in tools with a CC counterpart are mapped
- * (BUILTIN_TOOL_MAP); the rest are dropped with a warn (never silently).
+ * (BUILTIN_TOOL_MAP), and `builtinNames` records granted CC tool name →
+ * declared Responses type so response translation can send the call back under
+ * the name the client actually declared; the rest are dropped with a warn
+ * (never silently).
  */
-function convertTools(tools: any, namespaces: Record<string, string>): any[] | undefined {
+function convertTools(tools: any, namespaces: Record<string, string>, builtinNames: Record<string, string>): any[] | undefined {
   if (!Array.isArray(tools) || tools.length === 0) return undefined
   const out: any[] = []
   const seen = new Set<string>()
-  const pushFunction = (name: string, description: string, params: any, strict: any, namespace?: string): void => {
+  const pushFunction = (name: string, description: string, params: any, strict: any, namespace?: string): boolean => {
     // 先到先赢：顶层同名 function 工具优先，避免两套 schema 漂移。
-    if (!name || seen.has(name)) return
+    if (!name || seen.has(name)) return false
     seen.add(name)
     if (namespace) namespaces[name] = namespace
     const fn: any = { name, description: description || '' }
     if (params !== undefined) fn.parameters = params
     if (strict !== undefined) fn.strict = strict
     out.push({ type: 'function', function: fn })
+    return true
   }
   for (const t of tools) {
     if (!t || typeof t !== 'object') continue
@@ -317,10 +354,14 @@ function convertTools(tools: any, namespaces: Record<string, string>): any[] | u
       for (const sub of subTools) {
         const subType = sub?.type || 'function'
         if (subType !== 'function') {
-          const mapped = mapBuiltinTool(sub)
-          if (mapped) {
-            log('debug', 'responses namespace built-in sub-tool mapped', { namespace: ns, toolType: subType, ccTool: mapped.name })
-            pushFunction(mapped.name, mapped.description, mapped.parameters, undefined)
+          const mappedList = mapBuiltinTools(sub)
+          if (mappedList) {
+            for (const mapped of mappedList) {
+              if (pushFunction(mapped.name, mapped.description, mapped.parameters, undefined)) {
+                builtinNames[mapped.name] = subType
+                log('debug', 'responses namespace built-in sub-tool mapped', { namespace: ns, toolType: subType, ccTool: mapped.name })
+              }
+            }
             continue
           }
           log('warn', 'responses namespace sub-tool dropped', { namespace: ns, toolType: subType, name: sub?.name || '' })
@@ -338,15 +379,21 @@ function convertTools(tools: any, namespaces: Record<string, string>): any[] | u
       continue
     }
     if (type !== 'function') {
-      // Built-in tool with a CC counterpart (web_search / local_shell / shell):
-      // grant it as a CC function tool instead of dropping it. The rest
-      // (file_search / computer / code_interpreter / image_generation / mcp /
-      // tool_search / programmatic_tool_calling / custom) have no CC
-      // counterpart and are dropped with a warn.
-      const mapped = mapBuiltinTool(t)
-      if (mapped) {
-        log('debug', 'responses built-in tool mapped to CC tool', { toolType: type, ccTool: mapped.name })
-        pushFunction(mapped.name, mapped.description, mapped.parameters, undefined)
+      // Built-in tool with a CC counterpart: grant it as CC function tool(s)
+      // instead of dropping it. The rest (computer / code_interpreter /
+      // image_generation / mcp / tool_search / programmatic_tool_calling /
+      // custom) have no CC counterpart and are dropped with a warn.
+      const mappedList = mapBuiltinTools(t)
+      if (mappedList) {
+        for (const mapped of mappedList) {
+          if (pushFunction(mapped.name, mapped.description, mapped.parameters, undefined)) {
+            builtinNames[mapped.name] = type
+            log('debug', 'responses built-in tool mapped to CC tool', { toolType: type, ccTool: mapped.name })
+          }
+        }
+        if (type === 'file_search') {
+          log('warn', 'responses file_search degraded to local grep/glob (CC has no vector store)', {})
+        }
         continue
       }
       log('warn', 'responses non-function tool dropped', { toolType: type, name: t.name || '' })
@@ -436,7 +483,8 @@ export function convertResponsesToOpenAI(responsesReq: any): any {
   // tools/namespaces 先于 input 解析：function_call 回放需要 namespaces 做名字
   // 归一与空名兜底（见 resolveCallName），否则会向上游发出空名而被 400。
   const namespaces: Record<string, string> = {}
-  const tools = convertTools(req.tools, namespaces)
+  const builtinNames: Record<string, string> = {}
+  const tools = convertTools(req.tools, namespaces, builtinNames)
   const toolChoice = convertToolChoice(req.tool_choice, namespaces)
 
   const instructions = req.instructions
@@ -574,6 +622,10 @@ export function convertResponsesToOpenAI(responsesReq: any): any {
   // 内部透传字段（非标准 OpenAI，仅在 proxy 内部消费，绝不进上游请求体：
   // buildCcRequest 只挑白名单字段，会自然忽略）。
   if (Object.keys(namespaces).length > 0) openaiReq._toolNamespaces = namespaces
+  // 内置工具映射的反向表（CC 工具名 → 客户端声明的内置类型名）：响应侧据此把调用
+  // 名还原成客户端认识的名字，避免下发一个它从未声明过的工具名。内部透传字段，
+  // buildCcRequest 只挑白名单字段，不会进上游请求体。
+  if (Object.keys(builtinNames).length > 0) openaiReq._builtinToolNames = builtinNames
 
   if (req.reasoning && typeof req.reasoning === 'object') {
     if (req.reasoning.effort !== undefined) openaiReq.reasoning_effort = req.reasoning.effort
@@ -644,6 +696,8 @@ export function createResponsesSseTranslator(
   createdAt: number,
   /** 裸子工具名 → 命名空间（来自请求转换 convertTools 的展平）。 */
   toolNamespaces: Record<string, string> = {},
+  /** CC 工具名 → 客户端声明的内置类型名（BUILTIN_TOOL_MAP 的反向还原）。 */
+  builtinToolNames: Record<string, string> = {},
 ) {
   let sequence = 0
   let outputIndex = 0
@@ -764,8 +818,12 @@ export function createResponsesSseTranslator(
     args = ccToolArgsToString(args)
     // 上游按扁平 function 返回；若该名字来自命名空间展平，回放时剥掉可能的
     // `<ns>.` 前缀并还原 namespace 字段（codex-rs 按 (namespace, name) 路由）。
-    const name = normalizeNamespacedName(rawName || '', toolNamespaces)
-    const namespace = toolNamespaces[name] || ''
+    const ccName = normalizeNamespacedName(rawName || '', toolNamespaces)
+    // 内置工具映射的反向还原：模型调的是 CC 工具名（shell_command / grep），而客户端
+    // 声明的是 Responses 内置类型名（local_shell / file_search）——按声明名回发，否则
+    // 客户端拿到一个它从未声明过的工具名（未知工具）。
+    const name = builtinToolNames[ccName] ?? ccName
+    const namespace = toolNamespaces[ccName] || ''
     // Responses SDK / codex 契约要求 function_call 的 name 与 call_id 非空；空 name
     // 会让客户端 ToolStream 抛错（见 cc-types.ccToolName 注释），空 call_id 则无法
     // 配对回放。上游确实缺失时统一兜底。

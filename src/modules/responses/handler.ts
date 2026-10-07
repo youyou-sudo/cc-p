@@ -92,6 +92,8 @@ export async function handleResponsesBody(responsesReq: any, headers: Record<str
       // 命名空间子工具展平映射（convertResponsesToOpenAI 透传，非标准 OpenAI
       // 字段，只在本地消费）：流式/非流式都要用它还原 function_call.namespace。
       toolNamespaces: (openaiReq as any)._toolNamespaces || {},
+      // 内置工具映射的反向表（CC 工具名 → 客户端声明的内置类型名）：还原调用名。
+      builtinToolNames: (openaiReq as any)._builtinToolNames || {},
     }
     if (stream) {
       return handleResponsesStream(deps)
