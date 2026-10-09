@@ -1,6 +1,6 @@
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
-import { isTruncatedStream, mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage, truncatedStreamError } from '../../shared/errors'
+import { anthropicUsage, isTruncatedStream, mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage, truncatedStreamError } from '../../shared/errors'
 import { ccToolArgsToString, ccToolCallId, ccToolName, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { uuid } from '../../shared/util'
@@ -93,16 +93,7 @@ export function buildAnthropicResponse(model: string, fullText: string, toolCall
     content,
     stop_reason: mapAnthropicStopReason(safeMapFinishReason(finishReason || 'stop')),
     stop_sequence: null,
-    usage: (() => {
-      const u = usage || {}
-      normalizeUsage(u)
-      return {
-        input_tokens: toNum(u.inputTokens),
-        output_tokens: toNum(u.outputTokens),
-        cache_creation_input_tokens: toNum(u.inputTokenDetails?.cacheWriteTokens),
-        cache_read_input_tokens: toNum(u.cachedInputTokens),
-      }
-    })(),
+    usage: anthropicUsage(usage),
   }
 }
 

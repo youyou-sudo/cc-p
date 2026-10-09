@@ -134,6 +134,17 @@ Bun.serve({
             { type: 'finish', finishReason: 'tool-calls', totalUsage: { inputTokens: 10, outputTokens: 5, cachedInputTokens: 0 } },
           ]), { headers: { 'content-type': 'application/x-ndjson' } })
         }
+        case 'mock/websearch-loop-forever': {
+          // 永远要求代执行工具、从不收尾：用于验证「轮数用尽」分支的收尾一致性
+          // （调用被代理吞掉后，绝不能把 tool_calls finish 原样下发）。
+          return new Response(ndjson([
+            { type: 'start' },
+            { type: 'text-delta', text: 'searching. ' },
+            { type: 'tool-input-start', toolCallId: `call_f_${Math.random().toString(36).slice(2, 8)}`, toolName: 'web_search' },
+            { type: 'tool-input-end', toolCallId: `call_f_${Math.random().toString(36).slice(2, 8)}`, input: { query: 'cc-p proxy' } },
+            { type: 'finish', finishReason: 'tool-calls', totalUsage: { inputTokens: 10, outputTokens: 5, cachedInputTokens: 0 } },
+          ]), { headers: { 'content-type': 'application/x-ndjson' } })
+        }
         case 'mock/params':
           return new Response(ndjson([
             { type: 'start' },
@@ -420,6 +431,34 @@ console.log('--- models ---')
   check('models alias context_length → context_window', body.data[1]?.context_window === 64000, body.data?.[1])
   check('models static fallback window', body.data[2]?.id === 'claude-sonnet-4-6' && body.data[2]?.context_window === 1048576, body.data?.[2])
   check('models vision default modalities', body.data.every((m: any) => Array.isArray(m.modalities) && m.modalities.includes('image')) && body.data[0]?.supports_vision === true && body.data[0]?.vision === true, body.data?.[0])
+}
+
+console.log('--- models (Anthropic shape, Claude Code gateway discovery) ---')
+{
+  // Claude Code 用 Anthropic SDK 拉 /v1/models?limit=1000 做网关模型发现：
+  // 带 anthropic-version 头 + limit query，读 {data:[{id,display_name,description}],
+  // has_more, first_id, last_id}。同一路径必须能同时服务两种契约。
+  const r = await fetch(BASE + '/v1/models?limit=1000', {
+    headers: { authorization: `Bearer ${KEY}`, 'anthropic-version': '2023-06-01' },
+  })
+  const body = await r.json()
+  check('anthropic models 200 + pagination trio', r.status === 200 && Array.isArray(body.data) && body.has_more === false && typeof body.first_id === 'string' && typeof body.last_id === 'string', body)
+  check('anthropic models no OpenAI envelope', body.object === undefined && body.data.every((m: any) => m.type === 'model' && typeof m.display_name === 'string' && typeof m.created_at === 'string'), body.data)
+  // 只列 Anthropic 系（Claude Code 的发现流程会按 /(claude|anthropic)/i 过滤，
+  // 非 Anthropic id 混进来会在选择器里变成噪声项）。
+  check('anthropic models filtered to claude ids', body.data.length > 0 && body.data.every((m: any) => /claude/i.test(m.id)), body.data.map((m: any) => m.id))
+  // 上游 mock 只给了 id 'claude-sonnet-4-6'：必须归一成 canonical 且带人类可读名。
+  const sonnet = body.data.find((m: any) => m.id === 'claude-sonnet-4-6')
+  check('anthropic models canonical id + fallback display_name', !!sonnet && sonnet.display_name === 'Claude Sonnet 4.6', sonnet)
+  check('anthropic models last_id tracks data tail', body.last_id === body.data[body.data.length - 1].id, body.last_id)
+  // 同路径不带 anthropic-version 时必须仍是 OpenAI 形（既有调用方零回归）。
+  const openai = await (await fetch(BASE + '/v1/models?limit=1000', { headers: { authorization: `Bearer ${KEY}` } })).json()
+  check('same path stays OpenAI shape without anthropic-version', openai.object === 'list' && openai.data.length === 3, openai)
+  // anthropic-version 是唯一开关：无 key 的 Anthropic 式请求也该拿到 Anthropic 形
+  // （模型列表不是机密，与既有 `models without key still lists` 同口径）。
+  const anon = await fetch(BASE + '/v1/models', { headers: { 'anthropic-version': '2023-06-01' } })
+  const anonBody = await anon.json()
+  check('anthropic models shape without key still lists', anon.status === 200 && anonBody.object === undefined && anonBody.has_more === false, anonBody)
 }
 
 console.log('--- billing / credit summary ---')
@@ -852,7 +891,9 @@ console.log('--- anthropic non-stream ---')
   check('anthropic msg id', typeof body.id === 'string' && body.id.startsWith('msg_') && body.type === 'message' && body.role === 'assistant')
   check('anthropic text + tool_use blocks', body.content?.[0]?.type === 'text' && body.content?.[0]?.text === 'Hello world' && body.content?.[1]?.type === 'tool_use' && body.content?.[1]?.input?.city === 'SF', body.content)
   check('anthropic stop_reason tool_use', body.stop_reason === 'tool_use' && body.stop_sequence === null)
-  check('anthropic usage', body.usage?.input_tokens === 100 && body.usage?.output_tokens === 20 && body.usage?.cache_read_input_tokens === 50, body.usage)
+  // Anthropic 契约：input_tokens 不含缓存读写。上游 mock 报 inputTokens:100 /
+  // cachedInputTokens:50（CC 口径的 prompt 总量含缓存），故 input_tokens 落 50。
+  check('anthropic usage splits cache out of input_tokens', body.usage?.input_tokens === 50 && body.usage?.output_tokens === 20 && body.usage?.cache_read_input_tokens === 50 && body.usage?.cache_creation_input_tokens === 0, body.usage)
 
   const s = await statsFetch()
   const b = s.lastGenerateBody
@@ -897,6 +938,51 @@ console.log('--- anthropic stream ---')
   check('anthropic tool_use block', toolStart?.data?.content_block?.name === 'get_weather' && toolJson?.data?.delta?.partial_json === '{"city":"SF"}', toolStart)
   const msgDelta = events.find((e) => e.eventName === 'message_delta')
   check('anthropic message_delta stop_reason + usage', msgDelta?.data?.delta?.stop_reason === 'tool_use' && msgDelta?.data?.usage?.output_tokens === 20, msgDelta)
+}
+
+console.log('--- anthropic cache_touch (Claude Code cache keepalive) ---')
+{
+  // 官方 Claude Code 在 allow_cache_keepalive 下每 30s 调一次；此前未注册路由
+  // → 每周期 404。无副作用 200，绝不向上游发计费请求。
+  const before = await statsFetch()
+  const r = await fetch(BASE + '/v1/messages/cache_touch', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
+    body: JSON.stringify({ request_id: 'msg_abc123' }),
+  })
+  const body = await r.json()
+  check('cache_touch 200 + anthropic shape', r.status === 200 && body.type === 'cache_touch', body)
+  const after = await statsFetch()
+  check('cache_touch never hits upstream generate', after.generate === before.generate, { before: before.generate, after: after.generate })
+  // 无 key（本 harness 未配 CC_API_KEY 兜底）→ 与其它 Anthropic 路由同形的 401，
+  // 不能因为「无副作用」就变成免鉴权的开放端点。
+  const noKey = await fetch(BASE + '/v1/messages/cache_touch', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ request_id: 'msg_x' }),
+  })
+  const noKeyBody = await noKey.json()
+  check('cache_touch without key → anthropic 401', noKey.status === 401 && noKeyBody.type === 'error' && noKeyBody.error?.type === 'authentication_error', noKeyBody)
+}
+
+console.log('--- anthropic server tool (web_search) proxy execution ---')
+{
+  const before = await statsFetch()
+  const r = await fetch(BASE + '/v1/messages', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
+    body: JSON.stringify({
+      model: 'mock/websearch-loop',
+      max_tokens: 100,
+      // provider-executed 服务端工具：没有 input_schema，客户端自己不执行它。
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 8 }],
+      messages: [{ role: 'user', content: 'what is bun' }],
+    }),
+  })
+  const body = await r.json()
+  check('anthropic server tool 200', r.status === 200, body)
+  // 代执行对客户端完全不可见：客户端无法执行的 tool_use 块绝不能下发。
+  check('anthropic server tool call hidden from client', !body.content?.some((b: any) => b.type === 'tool_use'), body.content)
+  check('anthropic server tool rounds spliced into one message', body.content?.some((b: any) => b.type === 'text' && /found the proxy/.test(b.text)), body.content)
+  const s = await statsFetch()
+  check('anthropic server tool executed via /alpha/web-search', s.webSearch === before.webSearch + 1, { before: before.webSearch, after: s.webSearch })
+  check('anthropic server tool granted as CC web_search with schema', s.lastGenerateBody.params.tools?.[0]?.name === 'web_search' && !!s.lastGenerateBody.params.tools?.[0]?.description && !!s.lastGenerateBody.params.tools?.[0]?.input_schema?.properties?.query, s.lastGenerateBody.params.tools)
 }
 
 console.log('--- anthropic zero output / upstream errors ---')
@@ -1106,6 +1192,27 @@ console.log('--- proxy-executed web_search (Responses built-in, client has no im
   const toolRes = msgs.find((m: any) => m?.role === 'tool')
   check('proxy web_search: tool result fed back upstream',
     !!asstCall && !!toolRes && JSON.stringify(toolRes).includes('cc-p proxy'), { asstCall, toolRes })
+}
+
+console.log('--- proxy tool loop round exhaustion (stop_reason must match visible content) ---')
+{
+  // 轮数用尽且这一轮仍有被吞掉的代执行调用时，上游 finish 是 tool-calls。若原样
+  // 下发，客户端拿到 stop_reason=tool_use 却没有任何 tool_use 块 —— 协议自相矛盾。
+  const r = await fetch(BASE + '/v1/messages', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
+    body: JSON.stringify({
+      model: 'mock/websearch-loop-forever',
+      max_tokens: 500,
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 8 }],
+      messages: [{ role: 'user', content: 'loop forever' }],
+    }),
+  })
+  const body = await r.json()
+  check('exhausted loop 200', r.status === 200, body)
+  const hasToolUse = (body.content || []).some((b: any) => b.type === 'tool_use')
+  check('exhausted loop leaks no tool_use block', !hasToolUse, body.content)
+  check('exhausted loop stop_reason is not tool_use', body.stop_reason !== 'tool_use' && body.stop_reason === 'end_turn', body.stop_reason)
+  check('exhausted loop keeps spliced text', (body.content || []).some((b: any) => b.type === 'text' && b.text.includes('searching')), body.content)
 }
 
 console.log('--- responses stream ---')

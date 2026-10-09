@@ -544,5 +544,58 @@ function check(name: string, cond: boolean, extra?: unknown): void {
   check('billing summary garbage → zeros, never throws', empty.total_granted === 0 && empty.total_used === 0 && empty.total_available === 0 && empty.grants.data.length === 1, empty)
 }
 
+// Anthropic usage 口径：input_tokens 契约上不含缓存读写（含则客户端上下文占用
+// 被低估，轮次越多越偏离，最终长会话在真实超限时突然失败）。
+{
+  const { anthropicUsage } = await import('../src/shared/errors')
+
+  const split = anthropicUsage({ inputTokens: 200, outputTokens: 30, inputTokenDetails: { cacheReadTokens: 120, cacheWriteTokens: 40 } })
+  check('anthropic usage subtracts read+write from input_tokens', split.input_tokens === 40 && split.output_tokens === 30 && split.cache_read_input_tokens === 120 && split.cache_creation_input_tokens === 40, split)
+
+  // 旧扁平形（无 inputTokenDetails）同样要能拆：cachedInputTokens 视为缓存读。
+  const flat = anthropicUsage({ inputTokens: 100, outputTokens: 5, cachedInputTokens: 50 })
+  check('anthropic usage tolerates legacy flat cache shape', flat.input_tokens === 50 && flat.cache_read_input_tokens === 50, flat)
+
+  // 无缓存：input_tokens 原样，缓存两项为 0（不是 undefined —— 客户端会读这两个键）。
+  const none = anthropicUsage({ inputTokens: 10, outputTokens: 1 })
+  check('anthropic usage no-cache keeps input intact and zeroes cache fields', none.input_tokens === 10 && none.cache_read_input_tokens === 0 && none.cache_creation_input_tokens === 0, none)
+
+  // 上游漏报 inputTokens 但报了缓存（异常口径）：绝不能产出负数。
+  const clamped = anthropicUsage({ inputTokenDetails: { cacheReadTokens: 80, cacheWriteTokens: 30 } })
+  check('anthropic usage never emits negative input_tokens', clamped.input_tokens === 0, clamped)
+
+  const garbage = anthropicUsage(null)
+  check('anthropic usage garbage → zeros, never throws', garbage.input_tokens === 0 && garbage.output_tokens === 0 && garbage.cache_read_input_tokens === 0, garbage)
+}
+
+// Anthropic 服务端（provider-executed）工具映射：客户端声明 web_search 但自己不执行，
+// 必须映射成 CC 的 web_search 声明交给代理代执行（否则静默失效）。
+{
+  const { mapAnthropicServerTool } = await import('../src/infra/builtin-tools')
+
+  const base = mapAnthropicServerTool({ type: 'web_search_20250305', name: 'web_search' })
+  check('server tool web_search maps to CC web_search', base?.tool.name === 'web_search' && base?.declaredName === 'web_search' && !!base?.tool.parameters?.properties?.query, base)
+
+  // 快照名按前缀匹配：新版本快照名不能落到「无对应能力 → 丢弃」分支。
+  const newer = mapAnthropicServerTool({ type: 'web_search_20260209', name: 'web_search' })
+  check('server tool newer snapshot still maps (prefix match)', newer?.tool.name === 'web_search', newer)
+
+  const preview = mapAnthropicServerTool({ type: 'web_search_preview' })
+  check('server tool preview variant maps + defaults name', preview?.tool.name === 'web_search' && preview?.declaredName === 'web_search', preview)
+
+  // 限域必须落进 schema，绝不静默放宽。
+  const scoped = mapAnthropicServerTool({ type: 'web_search_20250305', name: 'web_search', allowed_domains: ['example.com'] })
+  check('server tool allowed_domains → schema enum', scoped?.tool.parameters?.properties?.allowed_domains?.items?.enum?.[0] === 'example.com', scoped?.tool.parameters)
+  check('server tool allowed_domains → description mentions scope', /example\.com/.test(scoped?.tool.description || ''), scoped?.tool.description)
+
+  // 描述必须非空（上游要求）；else 整轮 400。
+  check('server tool description never empty', (base?.tool.description || '').length > 0 && (scoped?.tool.description || '').length > 0)
+
+  // 无 CC 对应能力的服务端工具不映射（调用方按 type 判定后丢弃并 warn）。
+  check('server tool without CC counterpart → undefined', mapAnthropicServerTool({ type: 'computer_20251124', name: 'computer' }) === undefined)
+  check('server tool code_execution → undefined', mapAnthropicServerTool({ type: 'code_execution_20260120' }) === undefined)
+  check('non-server function tool → undefined', mapAnthropicServerTool({ name: 'get_weather', input_schema: { type: 'object' } }) === undefined)
+}
+
 console.log(`\nUNIT RESULT: ${passed} passed, ${failed} failed`)
 if (failed > 0) process.exit(1)

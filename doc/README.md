@@ -21,7 +21,13 @@
 | POST | `/v1/chat/completions` | `chatController` → `ChatService.handleBody` | OpenAI Chat Completions（SSE / JSON） | `src/modules/chat/handler.ts`（`handleChatCompletionsBody`） |
 | POST | `/v1/responses` | `responsesController` → `ResponsesService.handleBody` | OpenAI Responses（SSE / JSON） | `src/modules/responses/handler.ts`（`handleResponsesBody`） |
 | POST | `/v1/messages` | `messagesController` → `MessagesService.handleBody` | Anthropic Messages（SSE / JSON） | `src/modules/messages/handler.ts`（`handleMessagesBody`） |
+| POST | `/v1/messages/cache_touch` | `messagesController` → `MessagesService.handleCacheTouch` | Anthropic 缓存保活（无副作用 `200`） | `src/modules/messages/cache-touch.ts` |
 | OPTIONS | 任意 | `corsPlugin.onRequest`（204） | CORS 预检 | `src/plugins/cors.ts` |
+
+`GET /v1/models` 同一路径两种形状：不带 `anthropic-version` 走 OpenAI
+`buildOpenAIModelList`，带 `anthropic-version` 走 Anthropic `buildAnthropicModelList`
+（Claude 系过滤 + canonical id 去重 + 分页三件套），分流在
+`src/modules/models/service.ts`（`wantsAnthropicShape`）。
 
 另有 CLI 子命令：`server healthcheck`（`src/index.ts`），供 Docker HEALTHCHECK 使用。
 

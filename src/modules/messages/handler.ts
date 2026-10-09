@@ -3,6 +3,8 @@ import { buildCcRequest } from '../../infra/cc'
 import { sendAnthropicError, sendJSON } from '../../shared/http'
 import { log } from '../../shared/logger'
 import { callUpstream, createUpstreamFlow } from '../../infra/proxy-handler'
+import { wrapUpstreamWithToolLoop } from '../../infra/tool-loop'
+import { executeWebSearch } from '../../infra/web-tools'
 import { getSessionId } from '../../infra/session'
 import { convertAnthropicToOpenAI } from './translator'
 import { anthropicRetryOpts } from './handler-errors'
@@ -71,9 +73,29 @@ export async function handleMessagesBody(anthropicReq: any, headers: Record<stri
       onCcError: (mapped) => sendAnthropicError(mapped.status, mapped.body.error.type, mapped.body.error.message, anthropicRetryOpts(mapped.body)),
     })
     if (!upstream.ok) return upstream.value
-    const ccResponse = upstream.response
+    const ccResponseRaw = upstream.response
     const upstreamRelease = (upstream as unknown as { release?: () => void })?.release
     releaseUpstream = () => { try { upstreamRelease?.() } catch {} }
+
+    // ── 代理侧代执行（Anthropic 服务端工具）────────────────────────────
+    // 客户端声明 `{type:'web_search_20250305', name:'web_search'}` 这类
+    // provider-executed 工具时，它自己不执行：模型若回一个普通 tool-call，客户端
+    // 只当未知工具，搜索静默失效。这里把上游流包一层 NDJSON tool-loop，代理替它
+    // 执行（infra/web-tools.ts 的 /alpha/web-search）再续跑，下游 translator 与
+    // 两个 handler 都不感知（它们看到的仍是一条「正常」上游流）。
+    // 客户端 function 工具不在 executors 里，照旧透传。
+    const serverToolNames: Record<string, string> = (openaiReq as any)._serverToolNames || {}
+    const ccResponse = Object.keys(serverToolNames).length > 0
+      ? wrapUpstreamWithToolLoop(ccResponseRaw, {
+          apiKey,
+          incomingHeaders: headers,
+          ccBody,
+          signal: flow.signal,
+          promptCacheKey: openaiReq.prompt_cache_key,
+          executors: { web_search: executeWebSearch },
+          path: '/v1/messages',
+        })
+      : ccResponseRaw
 
     if (stream) {
       return handleMessagesStream({

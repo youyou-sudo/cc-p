@@ -19,4 +19,10 @@ export abstract class MessagesService {
     const { handleMessagesBody } = await import('./protocol')
     return handleMessagesBody(body, headers, signal)
   }
+
+  /** POST /v1/messages/cache_touch（缓存保活，无副作用 200）。 */
+  static async handleCacheTouch(body: any, headers: Record<string, string | undefined>): Promise<Response> {
+    const { handleCacheTouch } = await import('./cache-touch')
+    return handleCacheTouch(body, headers)
+  }
 }

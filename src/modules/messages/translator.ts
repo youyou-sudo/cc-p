@@ -1,9 +1,10 @@
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
-import { isTruncatedStream, mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage, TRUNCATED_STREAM_MESSAGE } from '../../shared/errors'
+import { anthropicUsage, isTruncatedStream, mapAnthropicStopReason, mapCcEventError, mapFinishReason, normalizeUsage, TRUNCATED_STREAM_MESSAGE } from '../../shared/errors'
 import { ccToolArgsToString, ccToolCallId, ccToolName, createToolCallIdGuard, UNKNOWN_TOOL_NAME } from '../../shared/cc-types'
 import { log } from '../../shared/logger'
 import { shortUrl, redactLargeDataUrls, uuid } from '../../shared/util'
+import { mapAnthropicServerTool } from '../../infra/builtin-tools'
 
 // ---- local helpers (file-local, avoid cycles) ----
 function toNum(v: any): number {
@@ -71,6 +72,26 @@ function anthropicSourceToUrl(source: any): string {
   return ''
 }
 
+/** Anthropic 服务端（provider-executed）工具 type 前缀白名单：这些没有 input_schema，
+ *  必须走服务端工具分支（映射或丢弃），绝不能被当成客户端 function 工具直传 ——
+ *  直传会产出一个 name/描述都不可用的假工具。 */
+const SERVER_TOOL_TYPE_PREFIXES = [
+  'web_search',
+  'web_fetch',
+  'computer_',
+  'text_editor_',
+  'bash_',
+  'code_execution',
+  'memory_',
+  'tool_search',
+  'mcp_toolset',
+]
+
+function isAnthropicServerToolType(type: any): boolean {
+  if (typeof type !== 'string') return false
+  return SERVER_TOOL_TYPE_PREFIXES.some((p) => type === p || type.startsWith(p))
+}
+
 /** tool_result content → text, preserving image placeholders instead of dropping. */
 function toolResultContentToText(content: any): string {
   if (typeof content === 'string') return redactLargeDataUrls(content)
@@ -115,6 +136,9 @@ export function convertAnthropicToOpenAI(anthropicReq: any): any {
   }
 
   const toolNameFromId: Record<string, string> = {}
+  // 服务端工具声明（CC 工具名 → 客户端声明的 name），供 handler 决定是否挂
+  // 代理侧代执行 tool-loop。非标准 OpenAI 字段，只在本地消费。
+  const serverToolNames: Record<string, string> = {}
   const openaiMessages: any[] = []
 
   if (systemPrompt) {
@@ -242,14 +266,50 @@ export function convertAnthropicToOpenAI(anthropicReq: any): any {
   }
 
   if (anthropicReq.tools && anthropicReq.tools.length > 0) {
-    openaiReq.tools = anthropicReq.tools.map((t: any) => ({
-      type: 'function',
-      function: {
-        name: t.name,
-        description: t.description || '',
-        parameters: t.input_schema || { type: 'object', properties: {} },
-      },
-    }))
+    const tools: any[] = []
+    for (const t of anthropicReq.tools) {
+      // Anthropic 服务端工具（provider-executed，如 `{type:'web_search_20250305',
+      // name:'web_search'}`）没有 input_schema：客户端自己不执行它，模型回一个
+      // 普通 tool-call 就是死路（客户端报未知工具）。有 CC 对应能力的由代理代执行
+      // —— 这里映射成 CC 的 web_search 声明并记录声明名，handler 据此挂 tool-loop。
+      const mapped = mapAnthropicServerTool(t)
+      if (mapped) {
+        tools.push({
+          type: 'function',
+          function: {
+            name: mapped.tool.name,
+            description: mapped.tool.description,
+            parameters: mapped.tool.parameters,
+          },
+        })
+        if (mapped.tool.name === 'web_search') {
+          serverToolNames.web_search = mapped.declaredName
+          log('info', 'anthropic server tool mapped for proxy execution', {
+            declaredType: mapped.declaredType,
+            declaredName: mapped.declaredName,
+            tool: mapped.tool.name,
+          })
+        }
+        continue
+      }
+      // 已知服务端工具但没有 CC 对应能力（computer / text_editor / code_execution /
+      // memory / tool_search 等）：丢弃并 warn（与 Responses 侧同口径，不硬映射）。
+      if (isAnthropicServerToolType(t?.type)) {
+        log('warn', 'anthropic server tool dropped (no CC counterpart)', { type: t.type, name: t?.name })
+        continue
+      }
+      // 客户端 function 工具：description 兜底非空 —— 上游要求工具描述非空，
+      // Anthropic 的 description 是可选字段，缺省时直传空串会被上游整轮 400。
+      tools.push({
+        type: 'function',
+        function: {
+          name: t.name,
+          description: t.description || `Tool ${t.name}`,
+          parameters: t.input_schema || { type: 'object', properties: {} },
+        },
+      })
+    }
+    if (tools.length > 0) openaiReq.tools = tools
   }
 
   if (anthropicReq.tool_choice) {
@@ -299,6 +359,11 @@ export function convertAnthropicToOpenAI(anthropicReq: any): any {
       else openaiReq.reasoning_effort = 'low'
     }
   }
+
+  // 服务端工具映射的反向表（CC 工具名 → 客户端声明的 name）：只在声明了服务端
+  // 工具时挂载。下游流式/非流式 handler 看到工具名即代执行（见 tool-loop 的
+  // executors），绝不把 provider-executed 调用透给客户端。
+  if (Object.keys(serverToolNames).length > 0) openaiReq._serverToolNames = serverToolNames
 
   return openaiReq
 }
@@ -646,7 +711,9 @@ export function createAnthropicSseTranslator(
             out.push(`event: message_delta\ndata: ${JSON.stringify({
               type: 'message_delta',
               delta: { stop_reason: stopReason || 'end_turn' },
-              usage: { output_tokens: outTokens, cache_read_input_tokens: cachedInputTokens, cache_creation_input_tokens: cacheWriteTokens || 0, input_tokens: inputTokens },
+              // output_tokens 用零输出守卫修正后的 outTokens（上游缺失时是长度估算），
+              // 其余字段由 anthropicUsage 按 Anthropic 契约拆分缓存口径。
+              usage: anthropicUsage({ inputTokens, outputTokens: outTokens, cachedInputTokens, inputTokenDetails: { cacheWriteTokens, cacheReadTokens: cachedInputTokens } }),
             })}\n\n`)
             out.push(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`)
           }
@@ -687,7 +754,7 @@ export function createAnthropicSseTranslator(
         out.push(`event: message_delta\ndata: ${JSON.stringify({
           type: 'message_delta',
           delta: { stop_reason: stopReason || 'end_turn' },
-          usage: { output_tokens: outTokens, cache_read_input_tokens: cachedInputTokens, cache_creation_input_tokens: cacheWriteTokens || 0, input_tokens: inputTokens },
+          usage: anthropicUsage({ inputTokens, outputTokens: outTokens, cachedInputTokens, inputTokenDetails: { cacheWriteTokens, cacheReadTokens: cachedInputTokens } }),
         })}\n\n`)
 
         out.push(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`)

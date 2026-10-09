@@ -12,7 +12,8 @@ Stack: **Bun + Elysia + TypeScript**. Single-file binary via `bun build --compil
 
 - **Triple protocol**: `POST /v1/chat/completions` (OpenAI) + `POST /v1/responses` (OpenAI Responses) + `POST /v1/messages` (Anthropic)
 - **Streaming & non-streaming**, tool calling, multimodal images, `reasoning_effort` / `thinking`
-- **Dynamic models**: `GET /v1/models` from Provider API (5 min cache) with builtin fallback
+- **Dynamic models**: `GET /v1/models` from Provider API (5 min cache) with builtin fallback. One path serves the OpenAI list and, when `anthropic-version` is sent, the Anthropic list (`display_name` + pagination) that Claude Code's model discovery reads
+- **Claude Code ready**: `ANTHROPIC_BASE_URL` + a `user_*` token is all it takes — Anthropic server tools the client cannot execute (`web_search`) are run by the proxy, `POST /v1/messages/cache_touch` keepalives are accepted as a no-op, and `usage` follows the Anthropic cache contract
 - **Account balance**: `GET /v1/dashboard/billing/credit_grants` returns the monthly allowance as OpenAI `credit_summary`
 - **CLI emulation**: per-key device fingerprint (8h + 2h jitter, official `thumbmark` formula), lifecycle events (`cli_installed` / `cli_session_exists` / `cli_first_message`), per-key session `sess_<16hex>` (12h + 1h jitter) with derived `threadId`, `User-Agent: cli`, `x-command-code-version` from npm (24h refresh), `traceparent`, `x-project-slug`
 - **Resilience**: zero-output → `429` retryable, idle timeout (30s stream / 90s non-stream, overridable via `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS`, defaults unchanged; thinking phase `start`/`start-step`/`reasoning-start`/`reasoning-delta` gets a 120s window via `CC_THINKING_IDLE_MS`) → `429`, disconnect aborts upstream. The Bun transport-layer idle cap is disabled (`idleTimeout: 0`, overriding Elysia's hardcoded 30s) so these budgets are the sole authority.
@@ -92,7 +93,57 @@ resp = client.responses.create(
 )
 ```
 
-Any OpenAI-compatible tool (Claude Code, Cline, Roo, NextChat, etc.) works by pointing `base_url` at `/v1` and using a `user_*` key.
+Any OpenAI-compatible tool (Cline, Roo, NextChat, etc.) works by pointing `base_url` at `/v1` and using a `user_*` key.
+
+### Use with Claude Code
+
+Claude Code speaks the Anthropic Messages protocol, so it talks to the proxy through
+`ANTHROPIC_BASE_URL` — no OpenAI shim involved.
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:3050
+export ANTHROPIC_AUTH_TOKEN=user_xxxxxxxxx   # a CC key, NOT an Anthropic key
+export ANTHROPIC_MODEL=zai-org/GLM-5.2       # any id from GET /v1/models
+claude
+```
+
+Prefer a file? Put the same three keys in `~/.claude/settings.json` under `env`.
+
+What the proxy does for Claude Code specifically:
+
+- **`POST /v1/messages`** — streaming and non-streaming, tool use, `thinking`
+  (`budget_tokens` and `adaptive`), images. Anthropic *server* tools that the client
+  declares but cannot execute (`{type:"web_search_20250305"}`) are **executed here**:
+  the proxy intercepts the model's call, runs it against CC's web-search service, feeds
+  the result back upstream, and splices the rounds into one continuous response. The
+  client never sees a tool call it cannot run. `allowed_domains` / `blocked_domains` are
+  carried into the tool schema and never silently widened.
+- **`POST /v1/messages/cache_touch`** — cache keepalive (Claude Code calls it every ~30s
+  with `allow_cache_keepalive`). Accepted as a no-op `200`: upstream caching is
+  session-scoped and the proxy keeps a stable per-key session, so there is nothing to
+  re-warm and no reason to spend a billable upstream call. Previously a 404 on every cycle.
+- **`GET /v1/models`** — same path serves **two shapes**, picked by request header: with
+  `anthropic-version` (i.e. any Anthropic SDK) you get the Anthropic list
+  `{data:[{type,id,display_name,created_at}], has_more, first_id, last_id}` filtered to
+  Claude-line models; without it you get the OpenAI `{object:"list",…}` list exactly as
+  before. This is what Claude Code's gateway model discovery reads.
+- **Usage accounting** follows the Anthropic contract: `input_tokens` **excludes**
+  `cache_read_input_tokens` / `cache_creation_input_tokens`. (CC reports one
+  cache-inclusive prompt total; reporting it verbatim made Claude Code under-count
+  context occupancy, so long sessions failed abruptly at the real limit.)
+
+Known limits when driving Claude Code through the proxy:
+
+- Gateway model discovery is **opt-in** on the client:
+  `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`. Without it Claude Code uses its own
+  bundled catalog and warns `isn't described by this version's model catalog` for
+  non-Anthropic ids. The first-party provider is still reported over the wire, so a few
+  rollout-gated client features stay off.
+- `user_location` / `max_uses` on web search are accepted but not enforced by the proxy
+  (logged as warnings); `allowed_domains` / `blocked_domains` are enforced.
+- Anthropic server tools with no CC counterpart (`computer`, `text_editor`,
+  `code_execution`, `memory`, `tool_search`, `mcp`) are dropped with a warning rather
+  than silently mis-mapped.
 
 ## API Reference
 
@@ -100,10 +151,11 @@ Any OpenAI-compatible tool (Claude Code, Cline, Roo, NextChat, etc.) works by po
 |--------|------|-------------|
 | `GET` | `/` | `OK` (plain text) |
 | `GET` | `/health` | `{"ok":true}` |
-| `GET` | `/v1/models` | OpenAI-style model list |
+| `GET` | `/v1/models` | OpenAI model list, or the Anthropic list when `anthropic-version` is sent |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
 | `POST` | `/v1/responses` | OpenAI Responses |
 | `POST` | `/v1/messages` | Anthropic Messages |
+| `POST` | `/v1/messages/cache_touch` | Cache keepalive (no-op `200`) |
 
 ### `POST /v1/chat/completions`
 
@@ -121,9 +173,18 @@ Anthropic schema with automatic conversion:
 | `tool_choice: auto / any / tool / none` | → `auto / required / {function} / none` |
 | `thinking.budget_tokens` | → `reasoning_effort` (≥10000 high, ≥5000 medium, ≥2000 low) |
 | `thinking.type: adaptive` | → `reasoning_effort: effort` |
+| `tools[].{type:"web_search_20250305",…}` (server tool, no `input_schema`) | → CC `web_search`, **executed by the proxy** (see [Use with Claude Code](#use-with-claude-code)); `allowed_domains` / `blocked_domains` land in the schema |
+| other server tools (`computer` / `text_editor` / `code_execution` / `memory` / `tool_search` / `mcp`) | dropped with a warning (no CC counterpart) |
+| `tools[].description` (optional upstream) | defaults to a non-empty placeholder — CC rejects empty tool descriptions |
 | CC `finishReason` | → `end_turn / max_tokens / tool_use` |
 
 Streaming emits `message_start / content_block_* / message_delta / message_stop`; `thinking` blocks carry the same empty `signature` the official CLI emits (the field must be present, its content is not validated upstream).
+
+`usage` follows the Anthropic contract: `input_tokens` excludes
+`cache_read_input_tokens` / `cache_creation_input_tokens` (CC reports one cache-inclusive
+prompt total, which is split here). When a proxy-executed tool runs out of rounds while
+calls are still pending, the response ends as `end_turn` rather than `tool_use` — a
+`tool_use` stop reason with no `tool_use` block would be self-contradictory.
 
 ### `POST /v1/responses`
 
@@ -148,6 +209,24 @@ Streaming emits `response.created / response.in_progress / response.output_item.
 ### `GET /v1/models`
 
 Tries `GET {CC_API_BASE}/provider/v1/models` with your key (10s timeout); caches for `CC_MODEL_REFRESH_INTERVAL_MS`. Falls back to the builtin list in `src/modules/models/catalog.ts` on any failure. Set `CC_USE_PROVIDER_MODELS=false` to always use the builtin list.
+
+One path, two shapes, selected by request header (unknown query params such as
+Claude Code's `?limit=1000` / `?beta=true` are tolerated):
+
+| Request | Response |
+|---------|----------|
+| *(no `anthropic-version`)* | OpenAI `{object:"list", data:[{id, object, created, owned_by, display_name, context_window, …}]}` — unchanged, all vision aliases kept |
+| `anthropic-version: 2023-06-01` | Anthropic `{data:[{type:"model", id, display_name, created_at}], has_more, first_id, last_id}`, filtered to Claude-line models and de-duplicated by canonical id (a `-20241022` / `[1M]` alias collapses onto its canonical id instead of showing up twice) |
+
+The Anthropic shape is what Claude Code's gateway model discovery reads — it fetches
+`/v1/models?limit=1000`, validates `{data:[{id, display_name?, description?}]}`, then keeps
+only ids matching `/(claude\|anthropic)/i`. Non-Claude models (GPT / DeepSeek / GLM / …)
+therefore appear only in the OpenAI shape by design; point `ANTHROPIC_MODEL` at one of the
+Claude-line ids the proxy reports, or keep the OpenAI list for OpenAI clients.
+
+`display_name` is taken from the provider when present, else from the builtin table, else
+falls back to the id. `created_at` is the process start time — the provider publishes no
+release timestamp and inventing one would be a lie.
 
 ### `GET /v1/dashboard/billing/credit_grants`
 

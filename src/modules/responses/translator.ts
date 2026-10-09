@@ -23,6 +23,7 @@ import { log } from '../../shared/logger'
 import { CcStreamParser } from '../../infra/cc-events'
 import type { CcEventHooks } from '../../infra/cc-events'
 import { shortUrl, uuid, redactLargeDataUrls } from '../../shared/util'
+import { CC_WEB_SEARCH_TOOL } from '../../infra/builtin-tools'
 
 // ---- local helpers (file-local, avoid cycles) ----
 function toNum(v: any): number {
@@ -193,29 +194,12 @@ function convertContentParts(content: any): any {
   return parts
 }
 
-/** CC 侧普通 function tool 的声明形（name / description / input_schema）。 */
+/** CC 侧普通 function tool 的声明形（name / description / input_schema）。
+ *  与 responses 协议无关的共用声明（含 web_search）见 infra/builtin-tools.ts。 */
 interface CcBuiltinTool {
   name: string
   description: string
   parameters: any
-}
-
-/** CC 侧普通 function tool 的声明：web_search（CC docs/reference/tools）。
- *  CC 的 web 工具是**客户端执行的普通 function tool**（走 CC 自己的服务路由），
- *  不是 provider 内置执行，所以 Responses 的 `web_search` 内置工具可以落到它上面。 */
-const CC_WEB_SEARCH_TOOL: CcBuiltinTool = {
-  name: 'web_search',
-  description: 'Search the web and return ranked results.',
-  parameters: {
-    type: 'object',
-    properties: {
-      query: { type: 'string', description: 'Search query (>= 2 chars)' },
-      numResults: { type: 'number', description: 'Results (default 5, max 10)' },
-      allowed_domains: { type: 'array', items: { type: 'string' }, description: 'Only these domains' },
-      blocked_domains: { type: 'array', items: { type: 'string' }, description: 'Never these domains' },
-    },
-    required: ['query'],
-  },
 }
 
 /** 同上，shell_command（CC shell 工具；`local_shell` / `shell` 都落到它）。 */

@@ -12,6 +12,10 @@ export const messagesController = new Elysia({ name: 'messages', prefix: '/v1' }
   // POST /v1/messages，不影响 health/models。
   .onTransform({ as: 'local' }, createAuthPreCheck(true))
   .post('/messages', ({ body, headers, request }) => MessagesService.handleBody(body, headers, request.signal), { body: 'messages.body' })
+  // 缓存保活：官方 Claude Code 在 allow_cache_keepalive 下每 30s 调一次，此前未注册
+  // 路由 → 每周期 404。无副作用 200（上游缓存按 session 认，见 cache-touch.ts 头注释）。
+  // body 不挂 schema：客户端只发 {request_id}，未知字段一律容忍。
+  .post('/messages/cache_touch', ({ body, headers }) => MessagesService.handleCacheTouch(body, headers))
 
 export { MessagesService } from './service'
 export { messagesBody, messagesModelPlugin as messagesModel } from './model'

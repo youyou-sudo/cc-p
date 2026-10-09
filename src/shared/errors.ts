@@ -281,6 +281,47 @@ export function normalizeUsage(u: any): void {
   return
 }
 
+/**
+ * CC usage → Anthropic 上报 usage，**口径对齐 Anthropic 契约**。
+ *
+ * 为什么必须拆分：Anthropic 的 `input_tokens` 明确**不含** cache_read /
+ * cache_creation（Anthropic 文档与官方 CLI 的 token 汇总都按
+ * `input + cache_read + cache_creation` 才算整段输入）。CC 只报一个**含缓存**的
+ * prompt 总量（`inputTokens`）。直接透传会让 Claude Code 把 `usage.input_tokens`
+ * 当作「不含缓存的输入」参与上下文占用计算 —— 缓存命中越多算出的占用越小
+ * （轮次多了甚至接近 0），上下文百分比与自动压缩阈值全部偏低，长会话会在真实
+ * 超限时突然失败。
+ *
+ * 拆分口径：`inputTokenDetails.cacheReadTokens ?? cachedInputTokens` 为缓存读，
+ * `inputTokenDetails.cacheWriteTokens` 为缓存写；两者都从 `inputTokens` 扣除，
+ * 扣不下时按 0 夹断（客户端对负值不做防御）。
+ *
+ * 放在 shared/errors.ts（而非 messages/aggregator.ts）：translator 与 aggregator
+ * 都要用它，而 aggregator 已从 translator 取 EMPTY_THINKING_SIGNATURE —— 定义在
+ * 任一方的模块里都会造成 messages 内部 import 环（本项目明确禁止）。
+ */
+export function anthropicUsage(u: any): {
+  input_tokens: number
+  output_tokens: number
+  cache_creation_input_tokens: number
+  cache_read_input_tokens: number
+} {
+  normalizeUsage(u)
+  const n = (v: any): number => {
+    const x = Number(v)
+    return Number.isFinite(x) ? x : 0
+  }
+  const totalInput = n(u?.inputTokens)
+  const cacheRead = n(u?.inputTokenDetails?.cacheReadTokens ?? u?.cachedInputTokens)
+  const cacheWrite = n(u?.inputTokenDetails?.cacheWriteTokens)
+  return {
+    input_tokens: Math.max(0, totalInput - cacheRead - cacheWrite),
+    output_tokens: n(u?.outputTokens),
+    cache_creation_input_tokens: cacheWrite,
+    cache_read_input_tokens: cacheRead,
+  }
+}
+
 export function mapAnthropicStopReason(finishReason: string): string {
   switch (finishReason) {
     case 'tool_calls': return 'tool_use'

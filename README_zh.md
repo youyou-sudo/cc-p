@@ -12,7 +12,8 @@
 
 - **三协议**：`POST /v1/chat/completions`（OpenAI）+ `POST /v1/responses`（OpenAI Responses）+ `POST /v1/messages`（Anthropic）
 - **流式 / 非流式**、工具调用、多模态图片、`reasoning_effort` / `thinking`
-- **动态模型**：`GET /v1/models` 从 Provider API 获取（5 分钟缓存），失败回退内置列表
+- **动态模型**：`GET /v1/models` 从 Provider API 获取（5 分钟缓存），失败回退内置列表。同一路径既服务 OpenAI 列表，也在带 `anthropic-version` 时返回 Claude Code 模型发现所读的 Anthropic 列表（`display_name` + 分页三件套）
+- **Claude Code 可直接接入**：只需 `ANTHROPIC_BASE_URL` + `user_*` 令牌 —— 客户端自己执行不了的 Anthropic 服务端工具（`web_search`）由代理代执行，`POST /v1/messages/cache_touch` 保活按无副作用受理，`usage` 遵循 Anthropic 缓存口径
 - **账户余额**：`GET /v1/dashboard/billing/credit_grants` 返回 OpenAI `credit_summary` 格式的月度额度
 - **CLI 仿真**：按 Key 的设备指纹（8h + 2h 抖动，官方 `thumbmark` 公式）、生命周期事件（`cli_installed` / `cli_session_exists` / `cli_first_message`）、按 Key 会话 `sess_<16hex>`（12h + 1h 抖动）及派生的 `threadId`、`User-Agent: cli`、`x-command-code-version` 取自 npm（每天刷新）、`traceparent`、`x-project-slug`
 - **容错**：零输出 → 可重试 `429`，空闲超时（流式 30s / 非流式 90s，可用 `CC_STREAM_IDLE_MS` / `CC_NONSTREAM_IDLE_MS` 覆盖，默认不变；思考期 `start`/`start-step`/`reasoning-start`/`reasoning-delta` 走 120s 宽限 `CC_THINKING_IDLE_MS`）→ `429`，断连立刻中止上游。Bun 传输层空闲上限已关闭（`idleTimeout: 0`，覆盖 Elysia 写死的 30s），上述预算为唯一权威。
@@ -89,8 +90,54 @@ resp = client.responses.create(
 )
 ```
 
-任何 OpenAI 兼容客户端（Claude Code、Cline、Roo、NextChat 等）只要把 `base_url`
+任何 OpenAI 兼容客户端（Cline、Roo、NextChat 等）只要把 `base_url`
 指向 `/v1` 并使用 `user_*` Key 即可。
+
+### 接入 Claude Code
+
+Claude Code 走的是 Anthropic Messages 协议，直接指 `ANTHROPIC_BASE_URL` 即可，
+不需要任何 OpenAI 适配层。
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:3050
+export ANTHROPIC_AUTH_TOKEN=user_xxxxxxxxx   # CC 的 Key，不是 Anthropic 的
+export ANTHROPIC_MODEL=zai-org/GLM-5.2       # API 从 GET /v1/models 里任选
+claude
+```
+
+也可以把同样三个键写进 `~/.claude/settings.json` 的 `env` 块。
+
+代理为 Claude Code 专门做的事：
+
+- **`POST /v1/messages`** —— 流式/非流式、工具调用、`thinking`
+  （`budget_tokens` 与 `adaptive`）、图片全支持。客户端声明但**自己无法执行**的
+  Anthropic 服务端工具（`{type:"web_search_20250305"}`）由**代理代执行**：拦截模型
+  的工具调用 → 打 CC 的 web-search 服务路由 → 把结果回填上游续跑 → 多轮拼成一条
+  连续响应。客户端永远看不到它执行不了的 tool_use。`allowed_domains` /
+  `blocked_domains` 会落进工具 schema，绝不静默放宽。
+- **`POST /v1/messages/cache_touch`** —— 缓存保活（Claude Code 在
+  `allow_cache_keepalive` 下每 ~30s 调一次）。按无副作用 `200` 受理：上游缓存按
+  session 认，代理对每个 Key 维持稳定 session，没有需要重新预热的缓存，也没有理由
+  为此花一次计费的上游请求。此前是每周期一次 404。
+- **`GET /v1/models`** —— 同一路径按请求头**两种形状**：带 `anthropic-version`
+  （即任何 Anthropic SDK）返回 Anthropic 列表
+  `{data:[{type,id,display_name,created_at}], has_more, first_id, last_id}`，并按
+  Claude 系过滤、按 canonical id 去重；不带则返回与原来逐字节一致的 OpenAI
+  `{object:"list",…}`。前者正是 Claude Code 网关模型发现所读的形状。
+- **usage 口径按 Anthropic 契约**：`input_tokens` **不含**
+  `cache_read_input_tokens` / `cache_creation_input_tokens`。CC 只报一个含缓存的
+  prompt 总量，直接透传会让 Claude Code 低估上下文占用，长会话在真实超限时突然失败。
+
+用代理驱动 Claude Code 时的已知限制：
+
+- 网关模型发现是**客户端侧开关**：需 `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`。
+  不开时 Claude Code 用自带目录，遇到非 Anthropic id 会提示
+  `isn't described by this version's model catalog`。走线时 provider 仍是 first-party，
+  少数按发布灰度控制的功能因此不生效。
+- web search 的 `user_location` / `max_uses` 接受但不强制（记 warn）；
+  `allowed_domains` / `blocked_domains` 强制生效。
+- 没有 CC 对应能力的 Anthropic 服务端工具（`computer` / `text_editor` /
+  `code_execution` / `memory` / `tool_search` / `mcp`）丢弃并 warn，不做误导性硬映射。
 
 ## API 参考
 
@@ -98,11 +145,12 @@ resp = client.responses.create(
 |------|------|------|
 | `GET` | `/` | `OK`（纯文本） |
 | `GET` | `/health` | `{"ok":true}` |
-| `GET` | `/v1/models` | OpenAI 风格模型列表 |
+| `GET` | `/v1/models` | OpenAI 模型列表；带 `anthropic-version` 时为 Anthropic 列表 |
 | `GET` | `/v1/dashboard/billing/credit_grants` | 账户余额（OpenAI `credit_summary`） |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
 | `POST` | `/v1/responses` | OpenAI Responses |
 | `POST` | `/v1/messages` | Anthropic Messages |
+| `POST` | `/v1/messages/cache_touch` | 缓存保活（无副作用 `200`） |
 
 ### `POST /v1/chat/completions`
 
@@ -123,10 +171,18 @@ Anthropic 结构，自动转换：
 | `tool_choice: auto / any / tool / none` | → `auto / required / {function} / none` |
 | `thinking.budget_tokens` | → `reasoning_effort`（≥50000 max，≥25000 xhigh，≥10000 high，≥5000 medium，否则 low） |
 | `thinking.type: adaptive` | → `reasoning_effort: effort` |
+| `tools[].{type:"web_search_20250305",…}`（服务端工具，无 `input_schema`） | → CC `web_search`，**由代理代执行**（见[接入 Claude Code](#接入-claude-code)）；`allowed_domains` / `blocked_domains` 落进 schema |
+| 其它服务端工具（`computer` / `text_editor` / `code_execution` / `memory` / `tool_search` / `mcp`） | 丢弃并 warn（CC 无对应能力） |
+| `tools[].description`（Anthropic 侧可选） | 缺省时补非空占位 —— CC 拒收空工具描述 |
 | CC `finishReason` | → `end_turn / max_tokens / tool_use` |
 
 流式输出 `message_start / content_block_* / message_delta / message_stop`；
 `thinking` 块带官方同款空 `signature`（字段必须存在，内容上游不校验）。
+
+`usage` 按 Anthropic 契约：`input_tokens` 不含 `cache_read_input_tokens` /
+`cache_creation_input_tokens`（CC 只报一个含缓存的 prompt 总量，这里做拆分）。
+代执行工具在轮数用尽而仍有未完成调用时，以 `end_turn` 收尾而非 `tool_use`——
+发 `tool_use` 却没有 `tool_use` 块属于自相矛盾的协议。
 
 ### `POST /v1/responses`
 
@@ -158,6 +214,23 @@ response.output_text.delta / response.function_call_arguments.delta / … / resp
 用你的 Key 请求 `GET {CC_API_BASE}/provider/v1/models`（10s 超时），按
 `CC_MODEL_REFRESH_INTERVAL_MS` 缓存。任何失败都回退到 `src/modules/models/catalog.ts` 内置列表。
 `CC_USE_PROVIDER_MODELS=false` 则始终用内置列表。
+
+同一路径、按请求头分两种形状（未知 query 如 Claude Code 的 `?limit=1000` /
+`?beta=true` 一律容忍）：
+
+| 请求 | 响应 |
+|------|------|
+| 不带 `anthropic-version` | OpenAI `{object:"list", data:[{id, object, created, owned_by, display_name, context_window, …}]}` —— 与原来一致，vision 各别名保留 |
+| 带 `anthropic-version: 2023-06-01` | Anthropic `{data:[{type:"model", id, display_name, created_at}], has_more, first_id, last_id}`，按 Claude 系过滤、按 canonical id 去重（`-20241022` / `[1M]` 之类别名归并到 canonical id，不在列表里重复出现） |
+
+Anthropic 形状正是 Claude Code 网关模型发现所读：它请求
+`/v1/models?limit=1000`，校验 `{data:[{id, display_name?, description?}]}`，再按
+`/(claude\|anthropic)/i` 过滤。所以非 Claude 模型（GPT / DeepSeek / GLM …）**按设计**
+只出现在 OpenAI 形状里；`ANTHROPIC_MODEL` 请指向代理报出的 Claude 系 id，或继续用
+OpenAI 列表给 OpenAI 客户端。
+
+`display_name` 优先取上游，其次内置表，最后回落 id。`created_at` 用进程启动时刻
+—— 上游不提供发布时刻，臆造一个就是撒谎。
 
 ### `GET /v1/dashboard/billing/credit_grants`
 

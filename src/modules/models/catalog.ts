@@ -17,6 +17,9 @@ export interface ModelEntry {
   modalities?: string[]
   input_modalities?: string[]
   capabilities?: Record<string, unknown> | string[]
+  /** Anthropic ModelInfo 的 `display_name`（人类可读名）。OpenAI 形不需要，
+   *  但 Anthropic 形 /v1/models 是必需的（客户端用它做模型选择器的标签）。 */
+  display_name?: string
 }
 
 // 为什么默认全系 vision：上游 CC 的 image 分片是通用透传
@@ -161,9 +164,16 @@ function pickMaxOutputTokens(m: any): number | undefined {
   return toOptionalNumber(m.max_output_tokens ?? m.max_tokens)
 }
 
+function pickDisplayName(m: any): string | undefined {
+  const v = m.display_name ?? m.displayName ?? m.name
+  return typeof v === 'string' && v.trim() ? v.trim() : undefined
+}
+
 const STATIC_WINDOW_BY_ID = new Map<string, number>(
   MODELS.filter((m) => m.context_window !== undefined).map((m) => [m.id, m.context_window as number]),
 )
+
+const STATIC_NAME_BY_ID = new Map<string, string>(MODELS.map((m) => [m.id, m.name]))
 
 const STATIC_EFFORTS_BY_ID = new Map<string, readonly string[]>(
   MODELS.filter((m) => m.reasoning_efforts !== undefined)
@@ -225,6 +235,12 @@ async function doFetchModels(apiKey: string | null | undefined): Promise<ModelEn
           // reasoning 档位：静态权威表补充（上游不提供），仅在已知时暴露。
           const staticEfforts = STATIC_EFFORTS_BY_ID.get(m.id)
           if (staticEfforts) entry.reasoning_efforts = [...staticEfforts]
+          // display_name：上游给了就用（如 "Claude Sonnet 5"），否则回落静态表的人类
+          // 可读名，最后才回落 id。Anthropic 形 /v1/models 靠它做选择器标签。
+          const displayName = pickDisplayName(m)
+          const fallbackName = STATIC_NAME_BY_ID.get(m.id)
+          if (displayName) entry.display_name = displayName
+          else if (fallbackName) entry.display_name = fallbackName
           // vision 归一：上游有声明则保留归一，无声明默认 text+image（通用透传）。
           entry.modalities = pickModalities(m)
           entry.input_modalities = [...entry.modalities]
@@ -269,11 +285,58 @@ export async function fetchModels(apiKey?: string | null): Promise<ModelEntry[]>
   return inFlight
 }
 
-export async function handleModels(headers: Record<string, string | undefined>): Promise<Response> {
-  const apiKey = getApiKey(headers)
-  const models = await fetchModels(apiKey)
-  const now = nowUnix()
-  return sendJSON(200, {
+/** 已知 Anthropic 系 id → canonical 名（`[1M]` / 日期后缀的别名也归一）。
+ *
+ *  为什么需要：Claude Code 的模型目录用不带日期后缀的 canonical 名（`claude-sonnet-4-6`、
+ *  `claude-opus-4-8` 等）。上游 provider 可能只给带日期后缀的 id 或额外别名，
+ *  只按 `/(claude|anthropic)/i` 的朴素包含匹配就会把这些别名当独立模型列出来
+ *  （选择器里一堆重复项），并触发客户端的 unrecognized_model 告警。 */
+export const ANTHROPIC_CANONICAL_IDS = [
+  'claude-fable-5-1',
+  'claude-fable-5',
+  'claude-opus-5-5',
+  'claude-opus-5',
+  'claude-opus-4-8',
+  'claude-opus-4-7',
+  'claude-opus-4-6',
+  'claude-sonnet-5-5',
+  'claude-sonnet-5',
+  'claude-sonnet-4-6',
+  'claude-haiku-5-5',
+  'claude-haiku-4-5',
+]
+
+/** Anthropic 形条目：id 归一到 canonical（去 `[1M]` 之类上下文后缀与日期后缀），
+ *  并按 id 去重（保留首次出现）。非 Anthropic 系 id 不参与过滤。 */
+function toAnthropicModelList(models: ModelEntry[]): ModelEntry[] {
+  const out: ModelEntry[] = []
+  const seen = new Set<string>()
+  for (const m of models) {
+    const id = canonicalAnthropicId(m.id)
+    if (!id) continue
+    if (seen.has(id)) continue
+    seen.add(id)
+    out.push({ ...m, id, display_name: m.display_name ?? STATIC_NAME_BY_ID.get(id) ?? id })
+  }
+  return out
+}
+
+/** canonical 归一的两种形态：① `claude-...-[1M]` / `-1m` 这类上下文标；② `-YYYYMMDD`
+ *  日期后缀。都剥掉后若命中已知 canonical 表则用之，否则（未收录的新模型）返回
+ *  剥离后的 id —— 仍要求 id 里带 claude/anthropic，避免把无关模型吸进来。 */
+function canonicalAnthropicId(rawId: string): string | null {
+  if (typeof rawId !== 'string') return null
+  const id = rawId.trim()
+  if (!id) return null
+  const stripped = id.replace(/\[1M\]$/i, '').replace(/-(?:\d{8}|\d{4}-\d{2}-\d{2})$/, '')
+  if (ANTHROPIC_CANONICAL_IDS.includes(id)) return id
+  if (ANTHROPIC_CANONICAL_IDS.includes(stripped)) return stripped
+  return /(claude|anthropic)/i.test(stripped) ? stripped : null
+}
+
+/** OpenAI 形列表：原有形状原样保留（含各 vision 别名与 object/created 字段）。 */
+export function buildOpenAIModelList(models: ModelEntry[], now: number): any {
+  return {
     object: 'list',
     data: models.map((m) => {
       // 响应层统一 vision 声明：entry 自带则用之，否则默认 text+image。
@@ -285,6 +348,7 @@ export async function handleModels(headers: Record<string, string | undefined>):
         object: 'model',
         created: now,
         owned_by: 'command-code',
+        ...(m.display_name !== undefined ? { display_name: m.display_name } : {}),
         ...(m.context_window !== undefined ? { context_window: m.context_window } : {}),
         ...(m.max_output_tokens !== undefined ? { max_output_tokens: m.max_output_tokens } : {}),
         ...(m.reasoning_efforts !== undefined ? { reasoning_efforts: m.reasoning_efforts } : {}),
@@ -297,5 +361,51 @@ export async function handleModels(headers: Record<string, string | undefined>):
         vision: true,
       }
     }),
-  })
+  }
+}
+
+/** Anthropic 形列表：`{data, has_more, first_id, last_id}` + 每条 ModelInfo。
+ *
+ *  为什么必须有分页三件套：官方 SDK 的 `models.list()` 走 `BetaModelInfoPage`
+ *  （getPaginatedItems() 读 `data`，hasNextPage() 读 `has_more`/`last_id`），
+ *  缺字段时 `has_more` 归 `false` 尚可，但 `last_id` 归 `null` 会让任何
+ *  `after_id` 分页请求拿不到游标。Claude Code 的网关模型发现只读 `data[].{id,
+ *  display_name, description}`（zod strip 其余），所以额外字段是无害的。
+ *
+ *  `created_at` 用 ISO8601（Anthropic ModelInfo 契约）；上游不提供真实发布时刻，
+ *  用本进程首次组装时刻，绝不臆造日期。 */
+export function buildAnthropicModelList(models: ModelEntry[], createdAt: string): any {
+  const list = toAnthropicModelList(models)
+  const data = list.map((m) => ({
+    type: 'model',
+    id: m.id,
+    display_name: m.display_name ?? m.name ?? m.id,
+    created_at: createdAt,
+    // 非 Anthropic 契约字段：Anthropic 系客户端会 strip，OpenAI 系客户端可能受益。
+    ...(m.context_window !== undefined ? { context_window: m.context_window } : {}),
+    ...(m.max_output_tokens !== undefined ? { max_output_tokens: m.max_output_tokens } : {}),
+  }))
+  return {
+    data,
+    has_more: false,
+    first_id: data.length > 0 ? data[0].id : null,
+    last_id: data.length > 0 ? data[data.length - 1].id : null,
+  }
+}
+
+export async function handleModels(headers: Record<string, string | undefined>): Promise<Response> {
+  const apiKey = getApiKey(headers)
+  const models = await fetchModels(apiKey)
+  const now = nowUnix()
+  return sendJSON(200, buildOpenAIModelList(models, now))
+}
+
+/** 进程启动时刻：Anthropic ModelInfo 的 created_at 无真实发布时刻可用时的稳定填充。
+ *  固定在模块加载时取一次，避免同一份列表每次请求的时间戳漂移（客户端会据此判缓存）。 */
+const MODELS_CREATED_AT = new Date().toISOString()
+
+export async function handleAnthropicModels(headers: Record<string, string | undefined>): Promise<Response> {
+  const apiKey = getApiKey(headers)
+  const models = await fetchModels(apiKey)
+  return sendJSON(200, buildAnthropicModelList(models, MODELS_CREATED_AT))
 }

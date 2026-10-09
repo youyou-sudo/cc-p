@@ -72,6 +72,28 @@ function randCallId(): string {
   return `call_${Math.random().toString(36).slice(2, 12)}`
 }
 
+/**
+ * 把一条上游 finish 行改写为「非工具」收尾（只动 finishReason / finish_reason）。
+ *
+ * 用在轮数用尽且仍有被吞掉的代执行调用时：留着 `tool-calls` 会让客户端拿到
+ * `stop_reason: tool_use` 却看不到任何 tool_use 块（调用已被代理吞掉），协议自相
+ * 矛盾。只替换该字段，usage 等其余内容逐字保留；解析失败则原样返回（宁可保持
+ * 上游原样，也不篡改无法识别的行）。
+ */
+function rewriteFinishAsStop(line: string): string {
+  const trimmed = line.trim()
+  if (!trimmed) return line
+  try {
+    const ev = JSON.parse(trimmed)
+    if (ev?.type !== 'finish' && ev?.type !== 'finish-step') return line
+    if (ev.finishReason !== undefined) ev.finishReason = 'stop'
+    if (ev.finish_reason !== undefined) ev.finish_reason = 'stop'
+    return `${JSON.stringify(ev)}\n`
+  } catch {
+    return line
+  }
+}
+
 interface PendingCall {
   id: string
   name: string
@@ -198,9 +220,21 @@ export function wrapUpstreamWithToolLoop(first: Response, opts: ToolLoopOptions)
           if (buffer.trim()) handleLine(buffer)
 
           if (calls.length === 0 || round >= maxRounds) {
-            // 无代执行（正常收尾）或轮数用尽：这一轮的 finish 原样交给下游。
             flushPending()
-            for (const l of heldFinish) emit(l)
+            if (calls.length > 0) {
+              // 轮数用尽但这一轮仍有代执行调用：这些调用已被吞掉，若把上游 finish
+              // 原样下发，客户端会拿到 stop_reason=tool_use 却没有任何 tool_use 块
+              // —— 协议自相矛盾（Claude Code 会当未知工具/空调用处理，甚至报错）。
+              // 改成非 tool 的收尾：轮数用尽时上游最后的可见产出（文本/思考）已拼接
+              // 完毕，按 end_turn 收尾才与客户端看到的内容一致。
+              log('warn', 'Proxy tool loop exhausted rounds with pending calls; emitting non-tool finish', {
+                path, round, maxRounds, tools: calls.map((c) => c.name),
+              })
+              for (const l of heldFinish) emit(rewriteFinishAsStop(l))
+            } else {
+              // 无代执行（正常收尾）：这一轮的 finish 原样交给下游。
+              for (const l of heldFinish) emit(l)
+            }
             finish()
             return
           }
