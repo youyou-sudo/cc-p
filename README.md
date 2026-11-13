@@ -1,3 +1,5 @@
+> magpie 已有更好实现，此项目停更
+
 # cc-p — Command Code Proxy
 
 > [中文文档](README_zh.md)
